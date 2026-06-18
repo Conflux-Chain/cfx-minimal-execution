@@ -1,0 +1,4 @@
+[submodule "oracle/conflux-rust"]
+	path = oracle/conflux-rust
+	url = git@github.com:Conflux-Chain/conflux-rust.git
+	branch = minimal-execution-oracle

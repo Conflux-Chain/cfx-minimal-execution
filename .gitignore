@@ -1,0 +1,7 @@
+/target
+/crates/*/target
+/crates/*/fuzz/target
+/crates/*/fuzz/artifacts
+/crates/*/fuzz/coverage
+/crates/*/fuzz/corpus
+/data

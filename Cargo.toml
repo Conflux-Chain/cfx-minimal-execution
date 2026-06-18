@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/minimal-mpt",
+]
+
+exclude = [
+    "crates/minimal-mpt/fuzz",
+    "oracle/conflux-rust",
+]

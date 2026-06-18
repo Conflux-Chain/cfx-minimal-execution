@@ -1,0 +1,36 @@
+[package]
+name = "cfx-minimal-mpt-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+arbitrary = { version = "1.4", features = ["derive"] }
+cfx-minimal-mpt = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "state_ops"
+path = "fuzz_targets/state_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layered_state_ops"
+path = "fuzz_targets/layered_state_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "large_trie_ops"
+path = "fuzz_targets/large_trie_ops.rs"
+test = false
+doc = false
+bench = false
