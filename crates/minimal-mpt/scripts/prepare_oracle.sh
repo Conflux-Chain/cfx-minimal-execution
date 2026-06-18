@@ -11,12 +11,17 @@ MOD_FILE="$ORACLE_DIR/crates/dbs/storage/src/tests/mod.rs"
 
 if [[ ! -e "$ORACLE_DIR/.git" ]]; then
   cd "$WORKSPACE_ROOT"
+  git config submodule.oracle/conflux-rust.url https://github.com/Conflux-Chain/conflux-rust.git
+  git submodule sync oracle/conflux-rust
   git submodule update --init oracle/conflux-rust
 fi
 
 if ! git -C "$ORACLE_DIR" rev-parse --verify "$ORACLE_BRANCH" >/dev/null 2>&1; then
-  echo "missing oracle branch: $ORACLE_BRANCH" >&2
-  exit 1
+  if git -C "$ORACLE_DIR" rev-parse --verify "origin/$ORACLE_BRANCH" >/dev/null 2>&1; then
+    git -C "$ORACLE_DIR" branch "$ORACLE_BRANCH" "origin/$ORACLE_BRANCH" >/dev/null
+  else
+    git -C "$ORACLE_DIR" fetch origin "$ORACLE_BRANCH:$ORACLE_BRANCH"
+  fi
 fi
 
 git -C "$ORACLE_DIR" checkout -q "$ORACLE_BRANCH"
