@@ -2,9 +2,11 @@
 resolver = "2"
 members = [
     "crates/minimal-mpt",
+    "crates/replay-data-executor",
 ]
 
 exclude = [
     "crates/minimal-mpt/fuzz",
+    "crates/replay-data-executor/fuzz",
     "oracle/conflux-rust",
 ]

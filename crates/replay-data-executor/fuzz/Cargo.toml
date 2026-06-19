@@ -1,0 +1,28 @@
+[package]
+name = "cfx-replay-data-executor-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cfx-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+cfx-replay-data-executor = { path = ".." }
+primitives = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+
+[[bin]]
+name = "raw_packet"
+path = "fuzz_targets/raw_packet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_decode"
+path = "fuzz_targets/encode_decode.rs"
+test = false
+doc = false
