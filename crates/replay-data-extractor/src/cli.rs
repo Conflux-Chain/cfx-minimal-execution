@@ -7,7 +7,7 @@ use crate::{
         DEFAULT_PACK_TARGET_BYTES,
     },
     raw::encode_raw_data,
-    replay::validate_replay_packet,
+    validate::validate_replay_packet,
     verify::verify_packet,
 };
 use anyhow::{Context, Result};
@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "cfx-replay-data-executor")]
+#[command(name = "cfx-replay-data-extractor")]
 #[command(about = "Extract and verify Conflux execution-layer replay data packets")]
 struct Cli {
     #[command(subcommand)]

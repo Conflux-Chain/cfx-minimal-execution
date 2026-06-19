@@ -456,7 +456,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfx-replay-data-executor"
+name = "cfx-replay-data-extractor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -475,10 +475,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfx-replay-data-executor-fuzz"
+name = "cfx-replay-data-extractor-fuzz"
 version = "0.0.0"
 dependencies = [
- "cfx-replay-data-executor",
+ "cfx-replay-data-extractor",
  "cfx-types",
  "libfuzzer-sys",
  "primitives",

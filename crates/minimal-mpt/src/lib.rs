@@ -1,3 +1,4 @@
+mod incremental;
 mod key_codec;
 mod state;
 mod store;
@@ -9,5 +10,7 @@ pub use state::{State, StateManager, StateTrait};
 pub use store::{FileStore, MemoryStore, MptValueDisk, PersistedState, StateStore};
 pub use types::{CommitRoot, Error, MptKeyValue, Result, Space, H256, MERKLE_NULL_NODE};
 
+#[cfg(fuzzing)]
+pub use incremental::IncrementalTrie;
 #[cfg(fuzzing)]
 pub use trie::{trie_root, MptValue};

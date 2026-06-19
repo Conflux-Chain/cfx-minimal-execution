@@ -214,7 +214,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "shlex 1.3.0",
  "syn 1.0.109",
 ]
@@ -461,6 +461,7 @@ dependencies = [
  "arbitrary",
  "bincode",
  "rayon",
+ "rustc-hash 2.1.2",
  "serde",
  "tiny-keccak",
 ]
@@ -479,7 +480,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfx-replay-data-executor"
+name = "cfx-replay-data-extractor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2180,6 +2181,12 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustc-hex"

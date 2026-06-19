@@ -1,5 +1,5 @@
 [package]
-name = "cfx-replay-data-executor"
+name = "cfx-replay-data-extractor"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -25,5 +25,5 @@ primitives = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = 
 tempfile = "3"
 
 [[bin]]
-name = "cfx-replay-data-executor"
+name = "cfx-replay-data-extractor"
 path = "src/main.rs"

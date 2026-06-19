@@ -31,6 +31,10 @@ pub struct State {
     height: u64,
     snapshot_epoch_count: u32,
     last_root: Option<CommitRoot>,
+    // Memoized delta-trie root: writers mark dirty keys here so `commit` only
+    // re-hashes changed subtrees instead of the whole delta (see
+    // `crate::incremental`). Holds no data, just cached subtree hashes.
+    delta_inc: crate::incremental::IncrementalTrie,
 }
 
 impl Default for State {
@@ -52,6 +56,7 @@ impl State {
             height: 0,
             snapshot_epoch_count: DEFAULT_SNAPSHOT_EPOCH_COUNT,
             last_root: None,
+            delta_inc: crate::incremental::IncrementalTrie::default(),
         }
     }
 
@@ -99,6 +104,9 @@ impl State {
         let intermediate_root = trie_root(&intermediate);
         let intermediate_padding = DeltaMptKeyPadding(state.intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(state.delta_mpt_key_padding);
+        // Seed the incremental trie with the loaded delta (one nibble pass);
+        // built before `delta` is moved into the struct.
+        let delta_inc = crate::incremental::IncrementalTrie::from_delta(&delta);
         Self {
             snapshot: state.snapshot,
             intermediate,
@@ -114,6 +122,7 @@ impl State {
             } else {
                 state.snapshot_epoch_count
             },
+            delta_inc,
         }
     }
 
@@ -180,6 +189,9 @@ impl State {
                 .collect(),
         );
         self.intermediate = std::mem::take(&mut self.delta);
+        // Delta is now empty (and the padding below changes the key space), so
+        // the cached subtree hashes no longer apply.
+        self.delta_inc.clear();
         self.intermediate_root = delta_root;
         self.intermediate_padding = self.delta_padding.clone();
         self.delta_padding =
@@ -240,6 +252,7 @@ impl State {
         let mut delta_kvs = Vec::with_capacity(delta_keys.len());
         for raw_key in delta_keys {
             if let Some(value) = self.delta.remove(&raw_key) {
+                self.delta_inc.remove(&raw_key);
                 delta_kvs.push((raw_key, value));
             }
         }
@@ -319,6 +332,7 @@ impl StateTrait for State {
         } else {
             MptValue::Some(value)
         };
+        self.delta_inc.insert(&raw, value.clone());
         self.delta.insert(raw, value);
         Ok(())
     }
@@ -337,7 +351,18 @@ impl StateTrait for State {
     }
 
     fn commit(&mut self) -> Result<CommitRoot> {
-        let delta_root = trie_root(&self.delta);
+        let delta_root = self.delta_inc.root();
+        // Cross-check against the stateless oracle, but only under tests / the
+        // `verify-incremental` feature (fuzzing). NOT `debug_assert!`: this
+        // workspace builds release with `debug-assertions = true`, so a
+        // debug_assert here would run the full O(N) `trie_root` every commit in
+        // the replay and erase the incremental speedup.
+        #[cfg(any(test, feature = "verify-incremental"))]
+        assert_eq!(
+            delta_root,
+            trie_root(&self.delta),
+            "incremental delta root diverged from stateless trie_root"
+        );
         let root = CommitRoot::new(
             self.snapshot_root,
             self.intermediate_root,

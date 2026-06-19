@@ -481,7 +481,7 @@ fn index_u256(values: &[U256]) -> HashMap<U256, usize> {
 mod tests {
     use super::*;
     use crate::{
-        decode::decode_packet, raw::encode_raw_data, replay::validate_replay_packet,
+        decode::decode_packet, raw::encode_raw_data, validate::validate_replay_packet,
         verify::verify_packet,
     };
     use cfx_types::AddressSpaceUtil;

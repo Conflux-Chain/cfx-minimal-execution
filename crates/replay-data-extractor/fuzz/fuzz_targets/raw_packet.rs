@@ -1,9 +1,9 @@
 #![no_main]
 
-use cfx_replay_data_executor::{
+use cfx_replay_data_extractor::{
     packet::{BlockInput, PacketInput, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT},
     raw::encode_raw_data,
-    replay::validate_replay_packet,
+    validate::validate_replay_packet,
     verify::verify_packet,
 };
 use cfx_types::{Address, H256, U256};

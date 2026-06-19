@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use tiny_keccak::{Hasher, Keccak};
 
-const CHILDREN: usize = 16;
+pub(crate) const CHILDREN: usize = 16;
 const PARALLEL_HASH_THRESHOLD: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,7 +20,7 @@ impl MptValue {
         }
     }
 
-    fn merkle_value(&self) -> &[u8] {
+    pub(crate) fn merkle_value(&self) -> &[u8] {
         match self {
             Self::Some(v) => v,
             Self::Tombstone => &[],
@@ -147,7 +147,7 @@ fn common_prefix_len(entries: &[(Vec<u8>, &MptValue)], depth: usize) -> usize {
     len
 }
 
-fn compute_node_merkle(
+pub(crate) fn compute_node_merkle(
     children_merkles: Option<&[H256; CHILDREN]>,
     maybe_value: Option<&[u8]>,
 ) -> H256 {
@@ -165,7 +165,9 @@ fn compute_node_merkle(
     keccak(&buffer)
 }
 
-fn compute_path_merkle(path_nibbles: &[u8], start_depth: usize, node_merkle: H256) -> H256 {
+pub(crate) fn compute_path_merkle(
+    path_nibbles: &[u8], start_depth: usize, node_merkle: H256,
+) -> H256 {
     if path_nibbles.is_empty() {
         return node_merkle;
     }
@@ -179,7 +181,7 @@ fn compute_path_merkle(path_nibbles: &[u8], start_depth: usize, node_merkle: H25
     keccak(&buffer)
 }
 
-fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push(b >> 4);

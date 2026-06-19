@@ -1,5 +1,5 @@
 [package]
-name = "cfx-replay-data-executor-fuzz"
+name = "cfx-replay-data-extractor-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -12,7 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 cfx-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
-cfx-replay-data-executor = { path = ".." }
+cfx-replay-data-extractor = { path = ".." }
 primitives = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
 
 [[bin]]

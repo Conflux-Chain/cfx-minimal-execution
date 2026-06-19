@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 arbitrary = { version = "1.4", features = ["derive"] }
-cfx-minimal-mpt = { path = ".." }
+cfx-minimal-mpt = { path = "..", features = ["verify-incremental"] }
 libfuzzer-sys = "0.4"
 
 [[bin]]
@@ -31,6 +31,13 @@ bench = false
 [[bin]]
 name = "large_trie_ops"
 path = "fuzz_targets/large_trie_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "incremental_trie"
+path = "fuzz_targets/incremental_trie.rs"
 test = false
 doc = false
 bench = false
