@@ -29,6 +29,7 @@ pub(super) struct EpochExecutionContext {
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct BlockRewardResult {
     pub(super) base_reward: cfx_types::U256,
+    pub(super) total_reward: cfx_types::U256,
 }
 
 #[derive(Debug)]
@@ -259,7 +260,11 @@ pub(super) fn read_reward(pow: &PowDb, hash: &H256) -> Result<Option<BlockReward
     };
     let tuple = Rlp::new(&bytes);
     let reward = tuple.at(1).context("decode block reward tuple value")?;
+    // BlockRewardResult is RLP-encoded as [total_reward, base_reward, tx_fee].
     Ok(Some(BlockRewardResult {
+        total_reward: reward
+            .val_at(0)
+            .context("decode block reward total_reward")?,
         base_reward: reward
             .val_at(1)
             .context("decode block reward base_reward")?,

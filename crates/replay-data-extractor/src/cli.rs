@@ -3,8 +3,8 @@ use crate::{
     decode::decode_packet,
     extract::extract_shards_to_dir,
     extract::{
-        extract_packed_to_dir, extract_raw_data, extract_to_file, ExtractConfig,
-        DEFAULT_PACK_TARGET_BYTES,
+        add_total_reward_flag, extract_packed_to_dir, extract_raw_data, extract_to_file,
+        ExtractConfig, DEFAULT_PACK_TARGET_BYTES,
     },
     raw::encode_raw_data,
     validate::validate_replay_packet,
@@ -122,6 +122,28 @@ enum Command {
         input_dir: PathBuf,
         #[arg(long, default_value_t = 1)]
         jobs: usize,
+    },
+    /// Scan an existing `.cfxpack` archive and set `FLAG_ZERO_TOTAL_REWARD`
+    /// in place on every block whose on-chain `total_reward` is zero. Only the
+    /// files that actually contain such a block are rewritten.
+    AddTotalRewardFlag {
+        #[arg(long)]
+        input_dir: PathBuf,
+        #[arg(long, default_value = "data/blockchain_data")]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 16)]
+        jobs: usize,
+        /// Scan and report only; do not rewrite any file.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Only process files whose start epoch is below this height
+        /// (ascending epoch order). Omit to process the whole archive.
+        #[arg(long)]
+        max_epoch: Option<u64>,
+        /// Only process files whose start epoch is at or above this height.
+        /// Use to resume a run that already covered the lower epochs.
+        #[arg(long)]
+        min_epoch: Option<u64>,
     },
 }
 
@@ -400,6 +422,36 @@ pub fn run() -> Result<()> {
                 report.decode_ms,
                 report.total_epochs as f64 / decode_sec,
                 report.total_blocks as f64 / decode_sec
+            );
+        }
+        Command::AddTotalRewardFlag {
+            input_dir,
+            data_dir,
+            jobs,
+            dry_run,
+            max_epoch,
+            min_epoch,
+        } => {
+            let config = ExtractConfig {
+                data_dir,
+                ..ExtractConfig::default()
+            };
+            let summary = add_total_reward_flag(
+                &config, &input_dir, jobs, dry_run, max_epoch, min_epoch,
+            )?;
+            println!(
+                "total-reward-flag {} ok, files_scanned={}, files_changed={}, blocks_total={}, blocks_flagged={} ({:.4}%), bytes_rewritten={}",
+                if dry_run { "dry-run" } else { "patch" },
+                summary.files_scanned,
+                summary.files_changed,
+                summary.blocks_total,
+                summary.blocks_flagged,
+                if summary.blocks_total > 0 {
+                    summary.blocks_flagged as f64 / summary.blocks_total as f64 * 100.0
+                } else {
+                    0.0
+                },
+                summary.bytes_rewritten,
             );
         }
     }

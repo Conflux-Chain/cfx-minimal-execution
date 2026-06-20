@@ -1,7 +1,7 @@
 use crate::{
     packet::{
         BlockInput, PacketInput, PosLookupEntry, SenderBaseNonce, FLAG_ADAPTIVE, FLAG_ESPACE,
-        FLAG_PIVOT, FLAG_SKIPPED_EXECUTION,
+        FLAG_PIVOT, FLAG_SKIPPED_EXECUTION, FLAG_ZERO_TOTAL_REWARD,
     },
     raw::{encode_raw_data, RawExecutionData},
 };
@@ -17,8 +17,11 @@ use std::{
 };
 
 mod db;
+mod flagpatch;
 mod pack;
 mod shards;
+
+pub use flagpatch::{add_total_reward_flag, FlagPatchSummary};
 
 use db::{
     load_epoch, open_databases, read_body, read_epoch_context, read_epoch_hashes, read_header,
@@ -281,6 +284,10 @@ fn extract_raw_data_with_timing(
             }
             if skipped.contains(&hash) {
                 flags |= FLAG_SKIPPED_EXECUTION;
+            }
+            // Corner-case marker: the block's full settled reward is zero.
+            if reward.total_reward.is_zero() {
+                flags |= FLAG_ZERO_TOTAL_REWARD;
             }
             block_inputs.push(RawBlock {
                 epoch: epoch.number,

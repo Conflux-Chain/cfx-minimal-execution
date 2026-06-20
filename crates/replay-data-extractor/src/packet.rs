@@ -19,6 +19,9 @@ pub const FLAG_ESPACE: u8 = 1 << 2;
 pub const FLAG_HAS_TRANSACTIONS: u8 = 1 << 3;
 pub const FLAG_TX_COMPRESSED: u8 = 1 << 4;
 pub const FLAG_SKIPPED_EXECUTION: u8 = 1 << 5;
+/// Set when the block's `total_reward` (the full settled reward — distinct from
+/// `base_reward`) is zero. A corner-case marker; bit 7 stays reserved.
+pub const FLAG_ZERO_TOTAL_REWARD: u8 = 1 << 6;
 
 #[derive(Debug, Clone)]
 pub struct PacketInput {
@@ -226,8 +229,8 @@ fn validate_input(input: &PacketInput) -> Result<()> {
                 "block index is not sequential"
             );
             ensure!(
-                block.flags & 0b1100_0000 == 0,
-                "reserved block flag bits must be zero"
+                block.flags & 0b1000_0000 == 0,
+                "reserved block flag bit (bit 7) must be zero"
             );
             ensure!(
                 block.epoch == epoch,

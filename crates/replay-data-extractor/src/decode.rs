@@ -499,6 +499,41 @@ fn h256_prefix(prefix: &[u8]) -> H256 {
     H256::from(bytes)
 }
 
+/// Return, for every block in the packet, the absolute byte offset of its
+/// 1-byte `flags` field together with the block hash. Both the hash (record
+/// bytes 0..32) and the flags byte (record byte 44) live in the fixed-size
+/// prefix area (`block_prefix_size` is at least 64), so they can be located
+/// without decoding the variable-length record body or the transaction segment.
+/// Used by the in-place flag patcher.
+pub fn block_flag_sites(data: &[u8]) -> Result<Vec<(usize, H256)>> {
+    ensure!(data.len() >= HEADER_LEN, "packet shorter than header");
+    let block_prefix_size = data[92] as usize;
+    ensure!(
+        matches!(block_prefix_size, 64 | 72 | 80 | 88 | 96),
+        "invalid block_prefix_size"
+    );
+    let offsets = read_offsets(data)?;
+    ensure_offsets(&offsets, data.len())?;
+    let block_header_offset = offsets[5];
+    let block_body_offset = offsets[6];
+    let tx_segment_offset = offsets[7];
+    let block_count = read_u32_le(data, block_header_offset)? as usize;
+    let prefix_total = block_count
+        .checked_mul(block_prefix_size)
+        .context("block prefix size overflow")?;
+    ensure!(
+        block_body_offset + prefix_total <= tx_segment_offset,
+        "block prefix area exceeds tx segment"
+    );
+    let mut sites = Vec::with_capacity(block_count);
+    for index in 0..block_count {
+        let record = block_body_offset + index * block_prefix_size;
+        let hash = H256::from_slice(&data[record..record + 32]);
+        sites.push((record + 44, hash));
+    }
+    Ok(sites)
+}
+
 fn read_offsets(data: &[u8]) -> Result<[usize; HEADER_OFFSET_COUNT]> {
     let mut offsets = [0usize; HEADER_OFFSET_COUNT];
     for (i, item) in offsets.iter_mut().enumerate() {
