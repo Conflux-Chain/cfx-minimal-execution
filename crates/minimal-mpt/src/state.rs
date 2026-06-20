@@ -8,6 +8,17 @@ use std::collections::{BTreeMap, HashSet};
 
 pub const DEFAULT_SNAPSHOT_EPOCH_COUNT: u32 = 2000;
 
+/// Env-gated (`MMPT_DELTA_TIMING=1`) accumulator for time spent in the
+/// incremental delta-root call, so a replay run can report real per-commit delta
+/// cost in isolation from the snapshot merge. Zero overhead when disabled.
+static DELTA_ROOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DELTA_ROOT_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn delta_timing_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MMPT_DELTA_TIMING").is_some())
+}
+
 pub trait StateTrait {
     fn get(&self, key: StorageKeyWithSpace) -> Result<Option<Box<[u8]>>>;
     fn set(&mut self, key: StorageKeyWithSpace, value: Box<[u8]>) -> Result<()>;
@@ -19,9 +30,14 @@ pub trait StateTrait {
     fn commit(&mut self) -> Result<CommitRoot>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct State {
-    snapshot: BTreeMap<Vec<u8>, Box<[u8]>>,
+    /// The snapshot as a single `IncrementalTrie`: it serves snapshot reads and
+    /// owns the persistent subtree-hash cache, so the boundary merge re-roots it
+    /// incrementally **in place**. Read-only during a period; only
+    /// `advance_after_commit` mutates it, at boundaries. No clone, no double
+    /// buffer: the incremental root is cheap enough to do synchronously.
+    snapshot: crate::incremental::IncrementalTrie,
     intermediate: BTreeMap<Vec<u8>, MptValue>,
     delta: BTreeMap<Vec<u8>, MptValue>,
     snapshot_root: H256,
@@ -35,6 +51,13 @@ pub struct State {
     // re-hashes changed subtrees instead of the whole delta (see
     // `crate::incremental`). Holds no data, just cached subtree hashes.
     delta_inc: crate::incremental::IncrementalTrie,
+    /// Per-period caches of `new_account_key` derivations (the hot keccak in
+    /// `to_delta_mpt_key_bytes`), one per active padding. `RefCell` so `get` can
+    /// fill them behind `&self`; padding-stamped so they self-invalidate, and
+    /// rotated at the boundary — `intermediate(k)`'s padding equals `delta(k-1)`'s,
+    /// so the old delta cache is exactly the new intermediate one.
+    delta_account_cache: std::cell::RefCell<crate::key_codec::AccountKeyCache>,
+    intermediate_account_cache: std::cell::RefCell<crate::key_codec::AccountKeyCache>,
 }
 
 impl Default for State {
@@ -46,7 +69,7 @@ impl Default for State {
 impl State {
     pub fn new() -> Self {
         Self {
-            snapshot: BTreeMap::new(),
+            snapshot: crate::incremental::IncrementalTrie::default(),
             intermediate: BTreeMap::new(),
             delta: BTreeMap::new(),
             snapshot_root: MERKLE_NULL_NODE,
@@ -57,6 +80,8 @@ impl State {
             snapshot_epoch_count: DEFAULT_SNAPSHOT_EPOCH_COUNT,
             last_root: None,
             delta_inc: crate::incremental::IncrementalTrie::default(),
+            delta_account_cache: Default::default(),
+            intermediate_account_cache: Default::default(),
         }
     }
 
@@ -68,15 +93,11 @@ impl State {
     }
 
     pub fn from_snapshot(snapshot: BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
-        let snapshot_root = trie_root(
-            &snapshot
-                .iter()
-                .map(|(k, v)| (k.clone(), MptValue::Some(v.clone())))
-                .collect(),
-        );
+        let mut snapshot_inc = crate::incremental::IncrementalTrie::from_snapshot(&snapshot);
+        let snapshot_root = snapshot_inc.root();
         let delta_padding = DeltaMptKeyPadding::from_roots(snapshot_root, MERKLE_NULL_NODE);
         Self {
-            snapshot,
+            snapshot: snapshot_inc,
             snapshot_root,
             delta_padding,
             ..Self::new()
@@ -94,13 +115,8 @@ impl State {
             .into_iter()
             .map(|(k, v)| (k, MptValue::from(v)))
             .collect();
-        let snapshot_root = trie_root(
-            &state
-                .snapshot
-                .iter()
-                .map(|(k, v)| (k.clone(), MptValue::Some(v.clone())))
-                .collect(),
-        );
+        let mut snapshot_inc = crate::incremental::IncrementalTrie::from_snapshot(&state.snapshot);
+        let snapshot_root = snapshot_inc.root();
         let intermediate_root = trie_root(&intermediate);
         let intermediate_padding = DeltaMptKeyPadding(state.intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(state.delta_mpt_key_padding);
@@ -108,7 +124,7 @@ impl State {
         // built before `delta` is moved into the struct.
         let delta_inc = crate::incremental::IncrementalTrie::from_delta(&delta);
         Self {
-            snapshot: state.snapshot,
+            snapshot: snapshot_inc,
             intermediate,
             delta,
             snapshot_root,
@@ -123,12 +139,14 @@ impl State {
                 state.snapshot_epoch_count
             },
             delta_inc,
+            delta_account_cache: Default::default(),
+            intermediate_account_cache: Default::default(),
         }
     }
 
     pub fn persisted(&self) -> PersistedState {
         PersistedState {
-            snapshot: self.snapshot.clone(),
+            snapshot: self.snapshot.to_canonical_map(),
             intermediate: self
                 .intermediate
                 .clone()
@@ -169,40 +187,59 @@ impl State {
             return Ok(());
         }
 
+        // Merge snapshot(N+1) = merge(snapshot(N), intermediate(N)) IN PLACE on
+        // this (the only) thread: absorb the intermediate (re-keyed delta-mpt →
+        // canonical) into the snapshot trie, then take the incremental root —
+        // which only re-hashes the frontier the intermediate touched. No clone,
+        // no background thread: the incremental root is cheap enough (~tens of
+        // ms) to fold straight into the boundary. `take` empties intermediate so
+        // the snapshot can be mutated without aliasing it.
+        let timing = timing_on();
+        let t0 = std::time::Instant::now();
         for (raw_key, value) in std::mem::take(&mut self.intermediate) {
             let canonical = StorageKeyWithSpace::from_delta_mpt_key(&raw_key)?.to_key_bytes()?;
             match value {
-                MptValue::Some(value) => {
-                    self.snapshot.insert(canonical, value);
-                }
-                MptValue::Tombstone => {
-                    self.snapshot.remove(&canonical);
-                }
+                MptValue::Some(value) => self.snapshot.insert(&canonical, MptValue::Some(value)),
+                MptValue::Tombstone => self.snapshot.remove(&canonical),
             }
         }
+        let apply_ms = t0.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        self.snapshot_root = self.snapshot.root();
+        let hash_ms = t1.elapsed().as_millis();
+        if timing {
+            eprintln!(
+                "[merge] h={} N={} apply={}ms hash={}ms merge_total={}ms",
+                self.height,
+                self.snapshot.len(),
+                apply_ms,
+                hash_ms,
+                apply_ms + hash_ms,
+            );
+        }
 
-        self.snapshot_root = trie_root(
-            &self
-                .snapshot
-                .iter()
-                .map(|(k, v)| (k.clone(), MptValue::Some(v.clone())))
-                .collect(),
-        );
+        // Rotate: the just-finished delta becomes the new intermediate. Delta is
+        // now empty (and the padding below changes the key space), so the cached
+        // delta subtree hashes no longer apply.
         self.intermediate = std::mem::take(&mut self.delta);
-        // Delta is now empty (and the padding below changes the key space), so
-        // the cached subtree hashes no longer apply.
         self.delta_inc.clear();
         self.intermediate_root = delta_root;
         self.intermediate_padding = self.delta_padding.clone();
         self.delta_padding =
             DeltaMptKeyPadding::from_roots(self.snapshot_root, self.intermediate_root);
+        // Rotate the account-key caches to match the padding rotation above: the
+        // new intermediate padding equals the old delta padding, so the old delta
+        // cache is exactly valid as the new intermediate cache (and the padding
+        // stamp would otherwise discard it). Delta starts fresh.
+        *self.intermediate_account_cache.get_mut() =
+            std::mem::take(self.delta_account_cache.get_mut());
         Ok(())
     }
 
     fn read_prefix(&self, prefix: StorageKeyWithSpace) -> Result<Vec<MptKeyValue>> {
         let canonical_prefix = prefix.to_key_bytes()?;
-        let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding)?;
-        let intermediate_prefix = prefix.to_delta_mpt_key_bytes(&self.intermediate_padding)?;
+        let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding, None)?;
+        let intermediate_prefix = prefix.to_delta_mpt_key_bytes(&self.intermediate_padding, None)?;
         let address_prefix = address_prefix_filter(&prefix);
 
         let mut result = Vec::new();
@@ -231,9 +268,9 @@ impl State {
             }
         }
 
-        for (key, value) in scan_prefix_plain(&self.snapshot, &canonical_prefix) {
+        for (key, value) in self.snapshot.snapshot_scan_prefix(&canonical_prefix) {
             if seen.insert(key.clone()) {
-                result.push((key.clone(), value.clone()));
+                result.push((key, value));
             }
         }
 
@@ -242,8 +279,8 @@ impl State {
 
     fn delete_prefix(&mut self, prefix: StorageKeyWithSpace) -> Result<Vec<MptKeyValue>> {
         let canonical_prefix = prefix.to_key_bytes()?;
-        let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding)?;
-        let intermediate_prefix = prefix.to_delta_mpt_key_bytes(&self.intermediate_padding)?;
+        let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding, None)?;
+        let intermediate_prefix = prefix.to_delta_mpt_key_bytes(&self.intermediate_padding, None)?;
         let address_prefix = address_prefix_filter(&prefix).map(Vec::from);
 
         let delta_keys: Vec<_> = scan_prefix(&self.delta, &delta_prefix)
@@ -260,9 +297,7 @@ impl State {
         let intermediate_kvs: Vec<_> = scan_prefix(&self.intermediate, &intermediate_prefix)
             .map(|(raw_key, value)| (raw_key.clone(), value.clone()))
             .collect();
-        let snapshot_kvs: Vec<_> = scan_prefix_plain(&self.snapshot, &canonical_prefix)
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        let snapshot_kvs: Vec<_> = self.snapshot.snapshot_scan_prefix(&canonical_prefix);
 
         let mut result = Vec::new();
         let mut seen = HashSet::new();
@@ -314,19 +349,26 @@ impl State {
 
 impl StateTrait for State {
     fn get(&self, key: StorageKeyWithSpace) -> Result<Option<Box<[u8]>>> {
-        let delta_key = key.to_delta_mpt_key_bytes(&self.delta_padding)?;
+        let delta_key = {
+            let mut cache = self.delta_account_cache.borrow_mut();
+            key.to_delta_mpt_key_bytes(&self.delta_padding, Some(&mut *cache))?
+        };
         if let Some(value) = self.delta.get(&delta_key) {
             return Ok(value.visible_value().map(Box::from));
         }
-        let intermediate_key = key.to_delta_mpt_key_bytes(&self.intermediate_padding)?;
+        let intermediate_key = {
+            let mut cache = self.intermediate_account_cache.borrow_mut();
+            key.to_delta_mpt_key_bytes(&self.intermediate_padding, Some(&mut *cache))?
+        };
         if let Some(value) = self.intermediate.get(&intermediate_key) {
             return Ok(value.visible_value().map(Box::from));
         }
-        Ok(self.snapshot.get(&key.to_key_bytes()?).cloned())
+        Ok(self.snapshot.snapshot_get(&key.to_key_bytes()?).map(Box::from))
     }
 
     fn set(&mut self, key: StorageKeyWithSpace, value: Box<[u8]>) -> Result<()> {
-        let raw = key.to_delta_mpt_key_bytes(&self.delta_padding)?;
+        let raw = key
+            .to_delta_mpt_key_bytes(&self.delta_padding, Some(self.delta_account_cache.get_mut()))?;
         let value = if value.is_empty() {
             MptValue::Tombstone
         } else {
@@ -351,7 +393,26 @@ impl StateTrait for State {
     }
 
     fn commit(&mut self) -> Result<CommitRoot> {
-        let delta_root = self.delta_inc.root();
+        let delta_root = if delta_timing_on() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let t = std::time::Instant::now();
+            let r = self.delta_inc.root();
+            let ns = t.elapsed().as_nanos() as u64;
+            let sum = DELTA_ROOT_NS.fetch_add(ns, Relaxed) + ns;
+            let cnt = DELTA_ROOT_CNT.fetch_add(1, Relaxed) + 1;
+            if cnt % 20_000 == 0 {
+                eprintln!(
+                    "[delta-root] commits={cnt} avg={}us total={}ms last={}us N={}",
+                    sum / cnt / 1000,
+                    sum / 1_000_000,
+                    ns / 1000,
+                    self.delta.len(),
+                );
+            }
+            r
+        } else {
+            self.delta_inc.root()
+        };
         // Cross-check against the stateless oracle, but only under tests / the
         // `verify-incremental` feature (fuzzing). NOT `debug_assert!`: this
         // workspace builds release with `debug-assertions = true`, so a
@@ -444,12 +505,11 @@ fn scan_prefix<'a>(
         .take_while(move |(key, _)| key.starts_with(prefix))
 }
 
-fn scan_prefix_plain<'a>(
-    map: &'a BTreeMap<Vec<u8>, Box<[u8]>>,
-    prefix: &'a [u8],
-) -> impl Iterator<Item = (&'a Vec<u8>, &'a Box<[u8]>)> {
-    map.range(prefix.to_vec()..)
-        .take_while(move |(key, _)| key.starts_with(prefix))
+/// Env-gated (`MMPT_MERGE_TIMING=1`) switch for the in-place `[merge]`
+/// instrumentation in `advance_after_commit`. Cached; zero overhead when unset.
+static MMPT_TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn timing_on() -> bool {
+    *MMPT_TIMING.get_or_init(|| std::env::var_os("MMPT_MERGE_TIMING").is_some())
 }
 
 fn address_prefix_filter(prefix: &StorageKeyWithSpace) -> Option<&[u8]> {

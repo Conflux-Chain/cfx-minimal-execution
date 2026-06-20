@@ -49,7 +49,7 @@ pub fn trie_root(kv: &BTreeMap<Vec<u8>, MptValue>) -> H256 {
     root_for_entries(&entries)
 }
 
-fn root_for_entries(entries: &[(Vec<u8>, &MptValue)]) -> H256 {
+pub(crate) fn root_for_entries(entries: &[(Vec<u8>, &MptValue)]) -> H256 {
     if entries.is_empty() {
         return MERKLE_NULL_NODE;
     }

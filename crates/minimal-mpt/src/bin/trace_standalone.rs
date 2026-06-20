@@ -455,7 +455,7 @@ fn dump_step_10_raw_keys() {
         let id = trace_id(step);
         let key = account_key(id);
         let raw = key
-            .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+            .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
             .unwrap();
         eprintln!("RAW {step} {id} {}", hex(&raw));
     }

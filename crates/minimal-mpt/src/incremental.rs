@@ -123,91 +123,187 @@ impl IncrementalTrie {
         }
         self.dirty.clear();
 
-        let entries: Vec<Entry> =
-            self.entries.iter().map(|(k, v)| (k.as_slice(), v)).collect();
-        memo_node(&entries, 0, false, &mut self.cache)
+        let result = memo_node(&self.entries, &[], false, &mut self.cache);
+        #[cfg(feature = "verify-incremental")]
+        {
+            // Cross-check the cached/incremental root against a from-scratch
+            // stateless `trie_root` over the SAME entries. This catches any cache
+            // or prefix-eviction bug (a stale cached subtree hash surviving when
+            // it should have been evicted) — the one failure mode the incremental
+            // walk has that the stateless one cannot. Covers BOTH the delta and
+            // snapshot incremental tries. O(N) per call: verify builds only.
+            let oracle: Vec<(Vec<u8>, &MptValue)> =
+                self.entries.iter().map(|(k, v)| (k.clone(), v)).collect();
+            assert_eq!(
+                result,
+                crate::trie::root_for_entries(&oracle),
+                "incremental root diverged from stateless trie_root over identical entries"
+            );
+        }
+        result
+    }
+
+    /// Build from a canonical snapshot map (all live values, no tombstones):
+    /// one nibble conversion per entry. Used to represent the snapshot trie,
+    /// which is read-only during a period and re-merged at boundaries. The cache
+    /// starts empty, so the first `root` is a full recompute that populates it;
+    /// later (incremental) merges clone that warm cache.
+    pub fn from_snapshot(snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
+        let entries = snapshot
+            .iter()
+            .map(|(k, v)| (bytes_to_nibbles(k), MptValue::Some(v.clone())))
+            .collect();
+        Self {
+            entries,
+            cache: Cache::default(),
+            dirty: BTreeSet::new(),
+        }
+    }
+
+    /// Point lookup by canonical byte key (snapshot read path). Returns the live
+    /// value bytes, or `None` if absent.
+    pub fn snapshot_get(&self, canonical: &[u8]) -> Option<&[u8]> {
+        self.entries
+            .get(&bytes_to_nibbles(canonical))
+            .and_then(|v| v.visible_value())
+    }
+
+    /// All `(canonical key, value)` pairs whose canonical key starts with
+    /// `canonical_prefix` (snapshot prefix scan). Keys are converted back from
+    /// nibble form; snapshot keys are byte-aligned so nibble length is even.
+    pub fn snapshot_scan_prefix(&self, canonical_prefix: &[u8]) -> Vec<(Vec<u8>, Box<[u8]>)> {
+        let nibble_prefix = bytes_to_nibbles(canonical_prefix);
+        let upper = prefix_upper(&nibble_prefix);
+        self.entries
+            .range(nibble_prefix..upper)
+            .filter_map(|(nibbles, value)| {
+                value
+                    .visible_value()
+                    .map(|v| (nibbles_to_bytes(nibbles), Box::from(v)))
+            })
+            .collect()
+    }
+
+    /// Flatten back to a canonical byte-keyed map (for checkpoint persistence).
+    pub fn to_canonical_map(&self) -> BTreeMap<Vec<u8>, Box<[u8]>> {
+        self.entries
+            .iter()
+            .filter_map(|(nibbles, value)| {
+                value
+                    .visible_value()
+                    .map(|v| (nibbles_to_bytes(nibbles), Box::from(v)))
+            })
+            .collect()
+    }
+
+    /// Number of stored entries (used by merge instrumentation).
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
-/// `(nibble key, value)` references into the persistent entry map.
-type Entry<'a> = (&'a [u8], &'a MptValue);
+/// Inverse of [`bytes_to_nibbles`] for byte-aligned (even-length) nibble keys:
+/// pairs of nibbles recombine into bytes. Snapshot keys are always byte-aligned.
+fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
+    nibbles.chunks_exact(2).map(|p| (p[0] << 4) | p[1]).collect()
+}
 
-/// Mirror of [`crate::trie`]'s `merkle_for_node`, plus a cache keyed by the
-/// node's routing prefix `entries[0].0[0..depth]`. A hit is always valid because
-/// `root` evicted any prefix touched by a dirty key. Serial only (the cache is
-/// `&mut`); the incremental path visits few nodes so the stateless version's
-/// rayon parallelism is not needed here.
+/// Exclusive upper bound for the BTreeMap range covering all keys with routing
+/// prefix `rp`: `rp` followed by `CHILDREN` (`16`), which is strictly greater
+/// than every real nibble (`0..16`). So the half-open range `[rp, rp++[16])` is
+/// exactly the keys prefixed by `rp`.
+fn prefix_upper(rp: &[u8]) -> Vec<u8> {
+    let mut upper = Vec::with_capacity(rp.len() + 1);
+    upper.extend_from_slice(rp);
+    upper.push(CHILDREN as u8);
+    upper
+}
+
+/// Range-driven mirror of [`crate::trie`]'s `merkle_for_node`, plus a cache keyed
+/// by the node's routing prefix `rp`. Instead of materialising the whole delta
+/// into a slice and scanning it, the node's key block is addressed directly on
+/// the sorted `entries` map via `range` queries, and clean children short-circuit
+/// on a cache hit without ever touching `entries`. A hit is always valid because
+/// `root` evicted any prefix touched by a dirty key (see module docs).
+///
+/// Cost is `O(visited nodes × CHILDREN × log N)` — proportional to the dirty
+/// frontier, not the delta size: the old slice version paid `O(N)` per call just
+/// to flatten the map and re-partition the root level (always dirty). Serial only
+/// (the cache is `&mut`).
 fn memo_node(
-    entries: &[Entry],
-    depth: usize,
+    entries: &BTreeMap<Vec<u8>, MptValue>,
+    rp: &[u8],
     allow_path_compression: bool,
     cache: &mut Cache,
 ) -> H256 {
-    let prefix = &entries[0].0[0..depth];
-    if let Some(hash) = cache.get(prefix) {
+    if let Some(hash) = cache.get(rp) {
         return *hash;
     }
+    let depth = rp.len();
+    let upper = prefix_upper(rp);
 
-    // --- structure identical to trie::merkle_for_node ---
+    // The node's key block is the contiguous range `[rp, rp++[16])`. It is
+    // non-empty: the root is non-empty and `root`/this fn only descend into
+    // children proven to exist. The first key carries the routing/compression
+    // nibbles; with path compression the node absorbs the longest prefix shared
+    // by the whole block, which — the block being sorted — is the common prefix
+    // of just its first (min) and last (max) key.
+    let first_key = entries
+        .range(rp.to_vec()..upper.clone())
+        .next()
+        .expect("non-empty node")
+        .0;
     let common = if allow_path_compression {
-        common_prefix_len(entries, depth)
+        let last_key = entries
+            .range(rp.to_vec()..upper)
+            .next_back()
+            .expect("non-empty node")
+            .0;
+        common_prefix_len(first_key, last_key, depth)
     } else {
         0
     };
     let node_depth = depth + common;
+    let full_prefix = &first_key[0..node_depth];
 
-    let maybe_value = entries
-        .iter()
-        .find(|(nibbles, _)| nibbles.len() == node_depth)
-        .map(|(_, value)| value.merkle_value());
-
-    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < entries.len() {
-        if entries[i].0.len() == node_depth {
-            i += 1;
-            continue;
-        }
-        let child = entries[i].0[node_depth] as usize;
-        let start = i;
-        i += 1;
-        while i < entries.len()
-            && entries[i].0.len() > node_depth
-            && entries[i].0[node_depth] as usize == child
-        {
-            i += 1;
-        }
-        ranges.push((child, start, i));
-    }
+    // A key ending exactly at this node can only be `full_prefix` itself.
+    let maybe_value = entries.get(full_prefix).map(|value| value.merkle_value());
 
     let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
-    for (child, start, end) in ranges {
-        children[child] =
-            memo_node(&entries[start..end], node_depth + 1, true, cache);
+    for (c, slot) in children.iter_mut().enumerate() {
+        let mut child_rp = Vec::with_capacity(node_depth + 1);
+        child_rp.extend_from_slice(full_prefix);
+        child_rp.push(c as u8);
+        if let Some(hash) = cache.get(&child_rp) {
+            // Clean subtree: reuse the cached hash without touching `entries`.
+            *slot = *hash;
+            continue;
+        }
+        // Cache miss: the child is either dirty (present) or absent. One range
+        // probe decides; only present children are recomputed.
+        let child_upper = prefix_upper(&child_rp);
+        if entries.range(child_rp.clone()..child_upper).next().is_some() {
+            *slot = memo_node(entries, &child_rp, true, cache);
+        }
     }
 
     let has_children = children.iter().any(|h| *h != MERKLE_NULL_NODE);
     let node_hash = compute_node_merkle(has_children.then_some(&children), maybe_value);
-    let hash = compute_path_merkle(&entries[0].0[depth..node_depth], depth, node_hash);
+    let hash = compute_path_merkle(&first_key[depth..node_depth], depth, node_hash);
 
-    cache.insert(entries[0].0[0..depth].to_vec(), hash);
+    cache.insert(rp.to_vec(), hash);
     hash
 }
 
-/// Mirror of `trie::common_prefix_len` over the `(nibbles, value)` tuple.
-fn common_prefix_len(entries: &[Entry], depth: usize) -> usize {
-    let first = &entries[0].0;
+/// Longest common nibble prefix of the sorted block beyond `depth`. The block's
+/// LCP equals the LCP of its endpoints `first` (min) and `last` (max), so only
+/// the two boundary keys are compared.
+fn common_prefix_len(first: &[u8], last: &[u8], depth: usize) -> usize {
     let mut len = 0;
-    'outer: loop {
+    loop {
         let idx = depth + len;
-        if idx >= first.len() {
+        if idx >= first.len() || idx >= last.len() || first[idx] != last[idx] {
             break;
-        }
-        let nibble = first[idx];
-        for (key, _) in entries.iter().skip(1) {
-            if idx >= key.len() || key[idx] != nibble {
-                break 'outer;
-            }
         }
         len += 1;
     }

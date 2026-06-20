@@ -2,6 +2,7 @@ use crate::{
     trie::keccak,
     types::{Error, Result, Space, H256, MERKLE_NULL_NODE},
 };
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 const ACCOUNT_BYTES: usize = 20;
@@ -115,16 +116,20 @@ impl StorageKeyWithSpace {
         Ok(add_space_to_snapshot_key(key, self.space))
     }
 
-    pub fn to_delta_mpt_key_bytes(&self, padding: &DeltaMptKeyPadding) -> Result<Vec<u8>> {
+    pub fn to_delta_mpt_key_bytes(
+        &self,
+        padding: &DeltaMptKeyPadding,
+        cache: Option<&mut AccountKeyCache>,
+    ) -> Result<Vec<u8>> {
         let key = match &self.key {
             StorageKey::Account(address) => {
                 if address.len() < ACCOUNT_BYTES {
                     return Ok(address.clone());
                 }
-                new_account_key(checked_address(address)?, padding)
+                new_account_key(checked_address(address)?, padding, cache)
             }
             StorageKey::StorageRoot(address) => {
-                let mut key = new_account_key(checked_address(address)?, padding);
+                let mut key = new_account_key(checked_address(address)?, padding, cache);
                 key.extend_from_slice(STORAGE_PREFIX);
                 key
             }
@@ -132,7 +137,7 @@ impl StorageKeyWithSpace {
                 address,
                 storage_key,
             } => {
-                let mut key = new_account_key(checked_address(address)?, padding);
+                let mut key = new_account_key(checked_address(address)?, padding, cache);
                 key.extend_from_slice(STORAGE_PREFIX);
                 key.extend_from_slice(
                     &storage_key_padding(storage_key, padding).0[STORAGE_PREFIX.len()..],
@@ -141,23 +146,23 @@ impl StorageKeyWithSpace {
                 key
             }
             StorageKey::CodeRoot(address) => {
-                let mut key = new_account_key(checked_address(address)?, padding);
+                let mut key = new_account_key(checked_address(address)?, padding, cache);
                 key.extend_from_slice(CODE_HASH_PREFIX);
                 key
             }
             StorageKey::Code { address, code_hash } => {
-                let mut key = new_account_key(checked_address(address)?, padding);
+                let mut key = new_account_key(checked_address(address)?, padding, cache);
                 key.extend_from_slice(CODE_HASH_PREFIX);
                 key.extend_from_slice(code_hash);
                 key
             }
             StorageKey::DepositList(address) => {
-                let mut key = new_account_key(checked_address(address)?, padding);
+                let mut key = new_account_key(checked_address(address)?, padding, cache);
                 key.extend_from_slice(DEPOSIT_LIST_PREFIX);
                 key
             }
             StorageKey::VoteList(address) => {
-                let mut key = new_account_key(checked_address(address)?, padding);
+                let mut key = new_account_key(checked_address(address)?, padding, cache);
                 key.extend_from_slice(VOTE_LIST_PREFIX);
                 key
             }
@@ -310,7 +315,20 @@ fn add_space_to_delta_key(mut key: Vec<u8>, space: Space) -> Vec<u8> {
     key
 }
 
-fn new_account_key(address: &[u8], padding: &DeltaMptKeyPadding) -> Vec<u8> {
+/// Per-period cache of [`new_account_key`] results, keyed by account address.
+/// The `new_account_key` keccak is the hottest derivation in replay (every state
+/// read/write that touches an account/its storage/code re-hashes the same address
+/// with the period's fixed padding). Stamped with the padding it was built for: a
+/// request with a different padding clears it, so the cache auto-invalidates when
+/// `padding` rotates at a period boundary — no reliance on an external `clear`.
+/// One instance per active padding (delta, intermediate).
+#[derive(Debug, Default)]
+pub struct AccountKeyCache {
+    built_for: DeltaMptKeyPadding,
+    map: FxHashMap<Vec<u8>, Vec<u8>>,
+}
+
+fn account_key_uncached(address: &[u8], padding: &DeltaMptKeyPadding) -> Vec<u8> {
     let mut padded = [0u8; ACCOUNT_KEYPART_BYTES];
     padded[..ACCOUNT_PADDING_BYTES].copy_from_slice(&padding.0[..ACCOUNT_PADDING_BYTES]);
     padded[ACCOUNT_PADDING_BYTES..].copy_from_slice(address);
@@ -319,6 +337,27 @@ fn new_account_key(address: &[u8], padding: &DeltaMptKeyPadding) -> Vec<u8> {
     let mut key = Vec::with_capacity(ACCOUNT_KEYPART_BYTES);
     key.extend_from_slice(&hash.0[..ACCOUNT_PADDING_BYTES]);
     key.extend_from_slice(address);
+    key
+}
+
+fn new_account_key(
+    address: &[u8],
+    padding: &DeltaMptKeyPadding,
+    cache: Option<&mut AccountKeyCache>,
+) -> Vec<u8> {
+    let Some(cache) = cache else {
+        return account_key_uncached(address, padding);
+    };
+    // Padding stamp: if it changed (period boundary), the old entries are stale.
+    if cache.built_for != *padding {
+        cache.map.clear();
+        cache.built_for = padding.clone();
+    }
+    if let Some(hit) = cache.map.get(address) {
+        return hit.clone();
+    }
+    let key = account_key_uncached(address, padding);
+    cache.map.insert(address.to_vec(), key.clone());
     key
 }
 
@@ -338,7 +377,7 @@ mod tests {
         let key = StorageKeyWithSpace::ethereum(StorageKey::Account(vec![7; 20]));
         assert_eq!(key.to_key_bytes().unwrap()[20], EVM_SPACE_TYPE);
         assert_eq!(
-            key.to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+            key.to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
                 .unwrap()[32],
             EVM_SPACE_TYPE
         );
@@ -351,7 +390,7 @@ mod tests {
             storage_key: vec![2; 32],
         });
         let raw = key
-            .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+            .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
             .unwrap();
         assert_eq!(StorageKeyWithSpace::from_delta_mpt_key(&raw).unwrap(), key);
     }

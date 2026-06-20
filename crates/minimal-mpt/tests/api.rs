@@ -151,7 +151,7 @@ fn key_codec_roundtrips_all_shapes_and_short_test_keys() {
             assert_eq!(StorageKeyWithSpace::from_key_bytes(&snapshot).unwrap(), key);
 
             let delta = key
-                .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+                .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
                 .unwrap();
             assert_eq!(
                 StorageKeyWithSpace::from_delta_mpt_key(&delta).unwrap(),
@@ -167,7 +167,7 @@ fn key_codec_roundtrips_all_shapes_and_short_test_keys() {
     assert_eq!(short.to_key_bytes().unwrap(), vec![1, 2, 3]);
     assert_eq!(
         short
-            .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+            .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
             .unwrap(),
         vec![1, 2, 3]
     );
@@ -185,7 +185,7 @@ fn key_codec_rejects_malformed_keys() {
     };
     assert!(bad_address.to_key_bytes().is_err());
     assert!(bad_address
-        .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+        .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
         .is_err());
 
     let mut bad_snapshot = vec![7; 20];
@@ -312,7 +312,7 @@ fn set_order_does_not_change_committed_root() {
 fn layered_precedence_matches_delta_intermediate_snapshot_order() {
     let key = account(0x77, Space::Native);
     let raw = key
-        .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+        .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
         .unwrap();
     let canonical = key.to_key_bytes().unwrap();
     let mut persisted = PersistedState::default();
