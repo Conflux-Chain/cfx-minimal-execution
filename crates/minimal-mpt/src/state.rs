@@ -183,7 +183,7 @@ impl State {
     }
 
     fn advance_after_commit(&mut self, delta_root: H256) -> Result<()> {
-        if self.height == 0 || self.height % self.snapshot_epoch_count as u64 != 0 {
+        if self.height == 0 || !self.height.is_multiple_of(self.snapshot_epoch_count as u64) {
             return Ok(());
         }
 
@@ -239,7 +239,8 @@ impl State {
     fn read_prefix(&self, prefix: StorageKeyWithSpace) -> Result<Vec<MptKeyValue>> {
         let canonical_prefix = prefix.to_key_bytes()?;
         let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding, None)?;
-        let intermediate_prefix = prefix.to_delta_mpt_key_bytes(&self.intermediate_padding, None)?;
+        let intermediate_prefix =
+            prefix.to_delta_mpt_key_bytes(&self.intermediate_padding, None)?;
         let address_prefix = address_prefix_filter(&prefix);
 
         let mut result = Vec::new();
@@ -280,7 +281,8 @@ impl State {
     fn delete_prefix(&mut self, prefix: StorageKeyWithSpace) -> Result<Vec<MptKeyValue>> {
         let canonical_prefix = prefix.to_key_bytes()?;
         let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding, None)?;
-        let intermediate_prefix = prefix.to_delta_mpt_key_bytes(&self.intermediate_padding, None)?;
+        let intermediate_prefix =
+            prefix.to_delta_mpt_key_bytes(&self.intermediate_padding, None)?;
         let address_prefix = address_prefix_filter(&prefix).map(Vec::from);
 
         let delta_keys: Vec<_> = scan_prefix(&self.delta, &delta_prefix)
@@ -363,12 +365,17 @@ impl StateTrait for State {
         if let Some(value) = self.intermediate.get(&intermediate_key) {
             return Ok(value.visible_value().map(Box::from));
         }
-        Ok(self.snapshot.snapshot_get(&key.to_key_bytes()?).map(Box::from))
+        Ok(self
+            .snapshot
+            .snapshot_get(&key.to_key_bytes()?)
+            .map(Box::from))
     }
 
     fn set(&mut self, key: StorageKeyWithSpace, value: Box<[u8]>) -> Result<()> {
-        let raw = key
-            .to_delta_mpt_key_bytes(&self.delta_padding, Some(self.delta_account_cache.get_mut()))?;
+        let raw = key.to_delta_mpt_key_bytes(
+            &self.delta_padding,
+            Some(self.delta_account_cache.get_mut()),
+        )?;
         let value = if value.is_empty() {
             MptValue::Tombstone
         } else {
@@ -400,7 +407,7 @@ impl StateTrait for State {
             let ns = t.elapsed().as_nanos() as u64;
             let sum = DELTA_ROOT_NS.fetch_add(ns, Relaxed) + ns;
             let cnt = DELTA_ROOT_CNT.fetch_add(1, Relaxed) + 1;
-            if cnt % 20_000 == 0 {
+            if cnt.is_multiple_of(20_000) {
                 eprintln!(
                     "[delta-root] commits={cnt} avg={}us total={}ms last={}us N={}",
                     sum / cnt / 1000,
@@ -634,7 +641,7 @@ mod tests {
                     state.set(key(id), Box::new([])).unwrap();
                     expected.insert(id, None);
                 }
-                1 | 2 | 3 => {
+                1..=3 => {
                     let value = vec![id, i as u8, (i >> 8) as u8];
                     state
                         .set(key(id), value.clone().into_boxed_slice())

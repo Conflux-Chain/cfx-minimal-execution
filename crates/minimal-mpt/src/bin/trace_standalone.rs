@@ -14,7 +14,7 @@ fn main() {
                 state.set(key, Box::new([])).unwrap();
                 println!("D {step} {id}");
             }
-            1 | 2 | 3 | 4 | 5 | 6 | 7 => {
+            1..=7 => {
                 let value = value_for(step, id);
                 state.set(key, value.clone().into_boxed_slice()).unwrap();
                 println!("S {step} {id} {}", hex(&value));
@@ -418,7 +418,7 @@ fn trace_id(step: u32) -> u8 {
 fn account_key(id: u8) -> StorageKeyWithSpace {
     StorageKeyWithSpace {
         key: StorageKey::Account(vec![id; 20]),
-        space: if id % 3 == 0 {
+        space: if id.is_multiple_of(3) {
             Space::Ethereum
         } else {
             Space::Native
@@ -469,7 +469,9 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn format_prefix_result(values: Option<Vec<(Vec<u8>, Box<[u8]>)>>) -> String {
+type PrefixResult = Option<Vec<(Vec<u8>, Box<[u8]>)>>;
+
+fn format_prefix_result(values: PrefixResult) -> String {
     let Some(mut values) = values else {
         return "-".to_string();
     };

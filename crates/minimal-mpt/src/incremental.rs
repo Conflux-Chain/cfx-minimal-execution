@@ -38,9 +38,7 @@
 //! always means "content unchanged since cached" — no per-node dirty check is
 //! needed during the walk.
 
-use crate::trie::{
-    bytes_to_nibbles, compute_node_merkle, compute_path_merkle, MptValue, CHILDREN,
-};
+use crate::trie::{bytes_to_nibbles, compute_node_merkle, compute_path_merkle, MptValue, CHILDREN};
 use crate::types::{H256, MERKLE_NULL_NODE};
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -205,7 +203,10 @@ impl IncrementalTrie {
 /// Inverse of [`bytes_to_nibbles`] for byte-aligned (even-length) nibble keys:
 /// pairs of nibbles recombine into bytes. Snapshot keys are always byte-aligned.
 fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
-    nibbles.chunks_exact(2).map(|p| (p[0] << 4) | p[1]).collect()
+    nibbles
+        .chunks_exact(2)
+        .map(|p| (p[0] << 4) | p[1])
+        .collect()
 }
 
 /// Exclusive upper bound for the BTreeMap range covering all keys with routing
@@ -282,7 +283,11 @@ fn memo_node(
         // Cache miss: the child is either dirty (present) or absent. One range
         // probe decides; only present children are recomputed.
         let child_upper = prefix_upper(&child_rp);
-        if entries.range(child_rp.clone()..child_upper).next().is_some() {
+        if entries
+            .range(child_rp.clone()..child_upper)
+            .next()
+            .is_some()
+        {
             *slot = memo_node(entries, &child_rp, true, cache);
         }
     }
@@ -299,15 +304,12 @@ fn memo_node(
 /// LCP equals the LCP of its endpoints `first` (min) and `last` (max), so only
 /// the two boundary keys are compared.
 fn common_prefix_len(first: &[u8], last: &[u8], depth: usize) -> usize {
-    let mut len = 0;
-    loop {
-        let idx = depth + len;
-        if idx >= first.len() || idx >= last.len() || first[idx] != last[idx] {
-            break;
-        }
-        len += 1;
-    }
-    len
+    first
+        .iter()
+        .zip(last)
+        .skip(depth)
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 #[cfg(test)]
@@ -351,8 +353,8 @@ mod tests {
                 inc.remove(&key);
                 "remove"
             } else {
-                map.insert(key.clone(), val(v as u8));
-                inc.insert(&key, val(v as u8));
+                map.insert(key.clone(), val(v));
+                inc.insert(&key, val(v));
                 "insert"
             };
 
@@ -439,8 +441,7 @@ mod tests {
             let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
             let mut inc = IncrementalTrie::default();
             for _ in 0..n {
-                let key: Vec<u8> =
-                    (0..40).map(|_| (lcg(&mut seed) & 0xff) as u8).collect();
+                let key: Vec<u8> = (0..40).map(|_| (lcg(&mut seed) & 0xff) as u8).collect();
                 inc.insert(&key, MptValue::Some(Box::from([1u8])));
                 map.insert(key.clone(), MptValue::Some(Box::from([1u8])));
                 keys.push(key);

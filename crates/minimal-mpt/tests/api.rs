@@ -315,9 +315,11 @@ fn layered_precedence_matches_delta_intermediate_snapshot_order() {
         .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
         .unwrap();
     let canonical = key.to_key_bytes().unwrap();
-    let mut persisted = PersistedState::default();
-    persisted.intermediate_mpt_key_padding = DeltaMptKeyPadding::genesis().0;
-    persisted.delta_mpt_key_padding = DeltaMptKeyPadding::genesis().0;
+    let mut persisted = PersistedState {
+        intermediate_mpt_key_padding: DeltaMptKeyPadding::genesis().0,
+        delta_mpt_key_padding: DeltaMptKeyPadding::genesis().0,
+        ..PersistedState::default()
+    };
     persisted
         .snapshot
         .insert(canonical.clone(), Box::from([1u8]) as Box<[u8]>);

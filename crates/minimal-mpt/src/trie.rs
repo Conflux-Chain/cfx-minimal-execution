@@ -75,22 +75,18 @@ fn merkle_for_node(
         .map(|(_, value)| value.merkle_value());
 
     let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < entries.len() {
-        if entries[i].0.len() == node_depth {
-            i += 1;
+    let mut iter = entries.iter().enumerate().peekable();
+    while let Some((start, (key, _))) = iter.next() {
+        if key.len() == node_depth {
             continue;
         }
-        let child = entries[i].0[node_depth] as usize;
-        let start = i;
-        i += 1;
-        while i < entries.len()
-            && entries[i].0.len() > node_depth
-            && entries[i].0[node_depth] as usize == child
-        {
-            i += 1;
-        }
-        ranges.push((child, start, i));
+        let child = key[node_depth] as usize;
+        while iter
+            .next_if(|(_, (key, _))| key.len() > node_depth && key[node_depth] as usize == child)
+            .is_some()
+        {}
+        let end = iter.peek().map_or(entries.len(), |(idx, _)| *idx);
+        ranges.push((child, start, end));
     }
 
     let child_hashes: Vec<(usize, H256)> = if parallel && entries.len() >= PARALLEL_HASH_THRESHOLD {
@@ -130,21 +126,20 @@ fn common_prefix_len(entries: &[(Vec<u8>, &MptValue)], depth: usize) -> usize {
         return 0;
     }
     let first = &entries[0].0;
-    let mut len = 0;
-    'outer: loop {
-        let idx = depth + len;
-        if idx >= first.len() {
-            break;
-        }
-        let nibble = first[idx];
-        for (key, _) in entries.iter().skip(1) {
-            if idx >= key.len() || key[idx] != nibble {
-                break 'outer;
-            }
-        }
-        len += 1;
-    }
-    len
+    let Some(slice) = first.get(depth..) else {
+        return 0;
+    };
+    slice
+        .iter()
+        .enumerate()
+        .take_while(|(offset, nibble)| {
+            let idx = depth + offset;
+            entries
+                .iter()
+                .skip(1)
+                .all(|(key, _)| key.get(idx) == Some(nibble))
+        })
+        .count()
 }
 
 pub(crate) fn compute_node_merkle(
@@ -166,7 +161,9 @@ pub(crate) fn compute_node_merkle(
 }
 
 pub(crate) fn compute_path_merkle(
-    path_nibbles: &[u8], start_depth: usize, node_merkle: H256,
+    path_nibbles: &[u8],
+    start_depth: usize,
+    node_merkle: H256,
 ) -> H256 {
     if path_nibbles.is_empty() {
         return node_merkle;
@@ -191,21 +188,21 @@ pub(crate) fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn compress_nibbles(nibbles: &[u8], without_first_nibble: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity((nibbles.len() + 1) / 2);
-    let mut i = 0;
-    if without_first_nibble {
-        out.push(nibbles[0]);
-        i = 1;
+    let (first, rest) = if without_first_nibble {
+        let (first, rest) = nibbles.split_first().expect("non-empty path");
+        (Some(*first), rest)
+    } else {
+        (None, nibbles)
+    };
+
+    let mut out = Vec::with_capacity(first.map_or(0, |_| 1) + rest.len().div_ceil(2));
+    if let Some(first) = first {
+        out.push(first);
     }
-    while i < nibbles.len() {
-        let hi = nibbles[i] << 4;
-        let lo = if i + 1 < nibbles.len() {
-            nibbles[i + 1]
-        } else {
-            0
-        };
+    for pair in rest.chunks(2) {
+        let hi = pair[0] << 4;
+        let lo = pair.get(1).copied().unwrap_or(0);
         out.push(hi | lo);
-        i += 2;
     }
     out
 }
