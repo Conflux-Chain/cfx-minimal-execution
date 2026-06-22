@@ -1,6 +1,4 @@
-use super::db::{PosDb, PowDb};
-use super::extract_packet_with_report;
-use super::ExtractConfig;
+use super::{Databases, ExtractConfig};
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::{
@@ -15,12 +13,9 @@ use std::{
 /// Default container target: ~100 MiB of packet payload per `.cfxpack` file.
 pub const DEFAULT_PACK_TARGET_BYTES: u64 = 100 * 1024 * 1024;
 
-const MAGIC: &[u8; 8] = b"CFXPACK1";
-const FORMAT_VERSION: u32 = 1;
-/// magic(8) + version(4) + group_count(4) + shard_epochs(4) + reserved(4)
-const HEADER_LEN: u64 = 24;
-/// start_epoch(8) + epoch_count(8) + offset(8) + length(8)
-const DIR_ENTRY_LEN: u64 = 32;
+// The container layout itself is owned by the shared `cfxpack::container`,
+// so the writer here and the replayer's reader cannot disagree.
+use cfxpack::container::{DIR_ENTRY_LEN, FORMAT_VERSION, HEADER_LEN, MAGIC};
 
 #[derive(Debug, Default)]
 pub struct PackSummary {
@@ -40,8 +35,7 @@ pub(super) fn run_packed(
     jobs: usize,
     target_bytes: u64,
     prefix: &str,
-    pow: &PowDb,
-    pos: &PosDb,
+    dbs: &Databases,
 ) -> Result<PackSummary> {
     let tasks = build_pack_tasks(config, shard_epochs);
     let group_count = tasks.len();
@@ -71,7 +65,7 @@ pub(super) fn run_packed(
             let task_rx = task_rx.clone();
             let result_tx = result_tx.clone();
             let base_config = config.clone();
-            handles.push(scope.spawn(move || run_worker(&base_config, pow, pos, task_rx, result_tx)));
+            handles.push(scope.spawn(move || run_worker(&base_config, dbs, task_rx, result_tx)));
         }
         drop(result_tx);
 
@@ -112,8 +106,7 @@ fn build_pack_tasks(config: &ExtractConfig, shard_epochs: u64) -> Vec<PackTask> 
 
 fn run_worker(
     base_config: &ExtractConfig,
-    pow: &PowDb,
-    pos: &PosDb,
+    dbs: &Databases,
     task_rx: Receiver<PackTask>,
     result_tx: Sender<PacketOut>,
 ) -> Result<()> {
@@ -122,15 +115,13 @@ fn run_worker(
         shard_config.start_epoch = task.start_epoch;
         shard_config.epoch_count = task.epoch_count;
 
-        let (packet, report) = extract_packet_with_report(&shard_config, pow, pos).with_context(
-            || {
-                format!(
-                    "extract group {}..={}",
-                    task.start_epoch,
-                    task.start_epoch + task.epoch_count - 1
-                )
-            },
-        )?;
+        let (packet, report) = dbs.encoded(&shard_config).with_context(|| {
+            format!(
+                "extract group {}..={}",
+                task.start_epoch,
+                task.start_epoch + task.epoch_count - 1
+            )
+        })?;
 
         let out = PacketOut {
             group_index: task.group_index,
@@ -177,7 +168,11 @@ fn write_containers(
         if last_log.elapsed() >= Duration::from_secs(5) {
             eprintln!(
                 "extract-packed progress groups={}/{} files={} bytes={} buffered={}",
-                next_group, group_count, summary.file_count, summary.total_bytes, pending.len()
+                next_group,
+                group_count,
+                summary.file_count,
+                summary.total_bytes,
+                pending.len()
             );
             last_log = Instant::now();
         }
@@ -196,7 +191,9 @@ fn flush_container(
     shard_epochs: u64,
     summary: &mut PackSummary,
 ) -> Result<()> {
-    let start_epoch = builder.start_epoch.expect("non-empty container has a start");
+    let start_epoch = builder
+        .start_epoch
+        .expect("non-empty container has a start");
     let end_epoch = builder.end_epoch;
     let path = output_dir.join(format!("{prefix}_{start_epoch}_{end_epoch}.cfxpack"));
 

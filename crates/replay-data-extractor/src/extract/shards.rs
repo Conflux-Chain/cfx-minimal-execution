@@ -1,5 +1,4 @@
-use super::db::{PosDb, PowDb};
-use super::{extract_to_file_with_dbs, ExtractConfig, ExtractReport};
+use super::{Databases, ExtractConfig, ExtractReport};
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use std::{
@@ -13,8 +12,7 @@ pub(super) fn run_shards(
     output_dir: &Path,
     shard_epochs: u64,
     jobs: usize,
-    pow: &PowDb,
-    pos: &PosDb,
+    dbs: &Databases,
 ) -> Result<Vec<ExtractReport>> {
     let tasks = build_shard_tasks(config, output_dir, shard_epochs);
     let task_count = tasks.len();
@@ -36,9 +34,9 @@ pub(super) fn run_shards(
             let task_rx = task_rx.clone();
             let progress_tx = progress_tx.clone();
             let base_config = config.clone();
-            handles.push(scope.spawn(move || {
-                run_worker(worker_id, &base_config, pow, pos, task_rx, progress_tx)
-            }));
+            handles.push(
+                scope.spawn(move || run_worker(worker_id, &base_config, dbs, task_rx, progress_tx)),
+            );
         }
         drop(progress_tx);
 
@@ -72,8 +70,7 @@ fn build_shard_tasks(
 fn run_worker(
     worker_id: usize,
     base_config: &ExtractConfig,
-    pow: &PowDb,
-    pos: &PosDb,
+    dbs: &Databases,
     task_rx: Receiver<ShardTask>,
     progress_tx: Sender<ProgressEvent>,
 ) -> Result<Vec<ExtractReport>> {
@@ -82,8 +79,7 @@ fn run_worker(
         reports.push(run_shard_task(
             worker_id,
             base_config,
-            pow,
-            pos,
+            dbs,
             task,
             &progress_tx,
         )?);
@@ -94,8 +90,7 @@ fn run_worker(
 fn run_shard_task(
     worker_id: usize,
     base_config: &ExtractConfig,
-    pow: &PowDb,
-    pos: &PosDb,
+    dbs: &Databases,
     task: ShardTask,
     progress_tx: &Sender<ProgressEvent>,
 ) -> Result<ExtractReport> {
@@ -112,7 +107,7 @@ fn run_shard_task(
     shard_config.start_epoch = task.start_epoch;
     shard_config.epoch_count = task.epoch_count;
 
-    match extract_to_file_with_dbs(&shard_config, &task.output, pow, pos) {
+    match dbs.to_file(&shard_config, &task.output) {
         Ok(report) => {
             log_shard_done(worker_id, &report, started);
             let _ = progress_tx.send(ProgressEvent::Done { worker_id });

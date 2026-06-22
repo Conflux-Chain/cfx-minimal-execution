@@ -16,6 +16,9 @@ rocksdb = { git = "https://github.com/Conflux-Chain/rust-rocksdb.git", rev = "67
 snap = "1.1"
 thiserror = "2.0"
 
+# The shared `.cfxpack` wire-format layer. Pins the same conflux git rev as the
+# deps below, so its `primitives`/`cfx-types` unify with this crate's.
+cfxpack = { path = "../cfxpack" }
 cfx-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
 diem-crypto = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
 diem-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }

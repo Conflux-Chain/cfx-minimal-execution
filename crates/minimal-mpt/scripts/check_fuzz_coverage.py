@@ -7,15 +7,25 @@ ROOT = Path(__file__).resolve().parents[1]
 LCOV = ROOT / "fuzz/coverage/layered_state_ops/lcov.info"
 
 
+# State was split out of the former monolithic `src/state.rs`: the boundary
+# rotation moved to `src/state/rotation.rs` and the prefix read/delete paths to
+# `src/state/prefix.rs`. The line groups below track the same semantic branches
+# in their new homes; each picks lines on the branch-taken side (e.g. the
+# `continue` skips, the tombstone `remove`) so the gate keeps proving the corpus
+# exercises those paths rather than merely entering the function.
 REQUIRED_LINES = {
-    "src/state.rs": {
-        "commit rollover materializes old intermediate": [163, 164, 166, 167, 169, 170],
-        "commit rollover promotes delta and updates padding": [175, 182, 183, 184, 185],
-        "delta address-prefix read skip": [199, 201, 202],
-        "intermediate address-prefix read skip": [210, 212, 213],
-        "delta address-prefix delete skip": [257, 259, 263],
-        "intermediate address-prefix delete skip": [271, 274, 278],
-        "intermediate tombstone/result handling": [280, 283],
+    "src/state/rotation.rs": {
+        # absorb intermediate into snapshot: both Some(insert) and Tombstone(remove)
+        "commit rollover materializes old intermediate": [38, 39, 41, 42],
+        # rotate delta -> intermediate and re-derive the delta padding
+        "commit rollover promotes delta and updates padding": [63, 65, 66, 67, 73],
+    },
+    "src/state/prefix.rs": {
+        "delta address-prefix read skip": [29, 30],
+        "intermediate address-prefix read skip": [40, 41],
+        "delta address-prefix delete skip": [90, 92, 94],
+        "intermediate address-prefix delete skip": [105, 107, 109],
+        "intermediate tombstone/result handling": [111, 112, 114, 115],
     },
 }
 

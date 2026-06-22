@@ -487,6 +487,7 @@ dependencies = [
  "bcs",
  "byteorder",
  "cfx-types",
+ "cfxpack",
  "clap",
  "crossbeam-channel",
  "diem-crypto",
@@ -541,6 +542,18 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "zeroize",
+]
+
+[[package]]
+name = "cfxpack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cfx-types",
+ "primitives",
+ "rlp",
+ "serde",
+ "snap",
 ]
 
 [[package]]

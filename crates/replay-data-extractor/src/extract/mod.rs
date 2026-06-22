@@ -1,14 +1,11 @@
-use crate::{
-    packet::{
-        BlockInput, PacketInput, PosLookupEntry, SenderBaseNonce, FLAG_ADAPTIVE, FLAG_ESPACE,
-        FLAG_PIVOT, FLAG_SKIPPED_EXECUTION, FLAG_ZERO_TOTAL_REWARD,
-    },
-    raw::{encode_raw_data, RawExecutionData},
-};
 use anyhow::{anyhow, ensure, Context, Result};
-use cfx_types::{Address, Space, H256, U256};
+use cfx_types::{Space, H256};
+use cfxpack::packet::{
+    encode_packet, Block, Packet, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT, FLAG_SKIPPED_EXECUTION,
+    FLAG_ZERO_TOTAL_REWARD,
+};
 use diem_types::committed_block::CommittedBlock;
-use primitives::{block_header::CIP112_TRANSITION_HEIGHT, Action, BlockHeader, SignedTransaction};
+use primitives::{block_header::CIP112_TRANSITION_HEIGHT, BlockHeader, SignedTransaction};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -20,16 +17,18 @@ mod db;
 mod flagpatch;
 mod pack;
 mod shards;
+mod tables;
 
 pub use flagpatch::{add_total_reward_flag, FlagPatchSummary};
 
 use db::{
     load_epoch, open_databases, read_body, read_epoch_context, read_epoch_hashes, read_header,
-    read_reward, BlockRewardResult, PosDb, PowDb, EPOCH_EXECUTED_BLOCK_SET_SUFFIX,
+    read_reward, BlockRewardResult, EpochBlocks, PosDb, PowDb, EPOCH_EXECUTED_BLOCK_SET_SUFFIX,
 };
-pub use pack::{PackSummary, DEFAULT_PACK_TARGET_BYTES};
 use pack::run_packed;
+pub use pack::{PackSummary, DEFAULT_PACK_TARGET_BYTES};
 use shards::run_shards;
+use tables::build_tables;
 
 #[derive(Debug, Clone)]
 pub struct ExtractConfig {
@@ -79,8 +78,7 @@ pub struct ExtractTiming {
 }
 
 pub fn extract_to_file(config: &ExtractConfig, output: impl AsRef<Path>) -> Result<ExtractReport> {
-    let (pow, pos) = open_databases(config)?;
-    extract_to_file_with_dbs(config, output, &pow, &pos)
+    Databases::open(config)?.to_file(config, output)
 }
 
 pub fn extract_shards_to_dir(
@@ -97,9 +95,9 @@ pub fn extract_shards_to_dir(
     let output_dir = output_dir.as_ref().to_path_buf();
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("create {}", output_dir.display()))?;
-    let (pow, pos) = open_databases(config)?;
+    let dbs = Databases::open(config)?;
 
-    let mut reports = run_shards(config, &output_dir, shard_epochs, jobs, &pow, &pos)?;
+    let mut reports = run_shards(config, &output_dir, shard_epochs, jobs, &dbs)?;
     reports.sort_by_key(|report| report.start_epoch);
     Ok(reports)
 }
@@ -125,7 +123,7 @@ pub fn extract_packed_to_dir(
     let output_dir = output_dir.as_ref().to_path_buf();
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("create {}", output_dir.display()))?;
-    let (pow, pos) = open_databases(config)?;
+    let dbs = Databases::open(config)?;
 
     run_packed(
         config,
@@ -134,96 +132,167 @@ pub fn extract_packed_to_dir(
         jobs,
         target_bytes,
         prefix,
-        &pow,
-        &pos,
+        &dbs,
     )
 }
 
-fn extract_to_file_with_dbs(
-    config: &ExtractConfig,
-    output: impl AsRef<Path>,
-    pow: &PowDb,
-    pos: &PosDb,
-) -> Result<ExtractReport> {
-    let (packet, mut report) = extract_packet_with_report(config, pow, pos)?;
-
-    let output = output.as_ref().to_path_buf();
-    let started = Instant::now();
-    std::fs::write(&output, &packet)
-        .with_context(|| format!("write packet {}", output.display()))?;
-    report.timing.write_ms = started.elapsed().as_millis();
-    report.output = output;
-    Ok(report)
-}
-
-/// Extract a single 2000-epoch group, returning the exact packet bytes and a
-/// report. The packet byte layout is the unchanged 2000-epoch group spec; this
-/// path only differs from `extract_to_file_with_dbs` in not touching the disk.
-fn extract_packet_with_report(
-    config: &ExtractConfig,
-    pow: &PowDb,
-    pos: &PosDb,
-) -> Result<(Vec<u8>, ExtractReport)> {
-    let (raw, mut timing) = extract_raw_data_with_timing(config, pow, pos)?;
-    let started = Instant::now();
-    let packet = encode_raw_data(&raw)?;
-    timing.encode_ms = started.elapsed().as_millis();
-
-    let started = Instant::now();
-    let verify = crate::verify::verify_packet(&packet)?;
-    timing.verify_ms = started.elapsed().as_millis();
-
-    let report = ExtractReport {
-        start_epoch: config.start_epoch,
-        epoch_count: config.epoch_count,
-        block_count: verify.block_count as usize,
-        transaction_count: verify.transaction_items as usize,
-        packet_bytes: packet.len(),
-        output: PathBuf::new(),
-        timing,
-    };
-    Ok((packet, report))
-}
-
 pub fn extract_packet(config: &ExtractConfig) -> Result<Vec<u8>> {
-    let (pow, pos) = open_databases(config)?;
-    extract_packet_with_dbs(config, &pow, &pos)
+    let (packet, _) = Databases::open(config)?.encoded(config)?;
+    Ok(packet)
 }
 
-fn extract_packet_with_dbs(config: &ExtractConfig, pow: &PowDb, pos: &PosDb) -> Result<Vec<u8>> {
-    let raw = extract_raw_data_with_dbs(config, pow, pos)?;
-    encode_raw_data(&raw)
+pub fn extract_raw_data(config: &ExtractConfig) -> Result<Packet> {
+    let (raw, _) = Databases::open(config)?.raw(config)?;
+    Ok(raw)
 }
 
-pub fn extract_raw_data(config: &ExtractConfig) -> Result<RawExecutionData> {
-    let (pow, pos) = open_databases(config)?;
-    extract_raw_data_with_dbs(config, &pow, &pos)
+/// The node's PoW + PoS databases, opened once and reused across an extraction.
+/// Holding them in a handle keeps the entry points free of the "open vs. inject
+/// the databases" distinction that used to leak into helper names.
+pub(super) struct Databases {
+    pow: PowDb,
+    pos: PosDb,
 }
 
-fn extract_raw_data_with_dbs(
+impl Databases {
+    pub(super) fn open(config: &ExtractConfig) -> Result<Self> {
+        let (pow, pos) = open_databases(config)?;
+        Ok(Self { pow, pos })
+    }
+
+    /// Extract one 2000-epoch group and write its packet to `output`.
+    pub(super) fn to_file(
+        &self,
+        config: &ExtractConfig,
+        output: impl AsRef<Path>,
+    ) -> Result<ExtractReport> {
+        let (packet, mut report) = self.encoded(config)?;
+        let output = output.as_ref().to_path_buf();
+        let started = Instant::now();
+        std::fs::write(&output, &packet)
+            .with_context(|| format!("write packet {}", output.display()))?;
+        report.timing.write_ms = started.elapsed().as_millis();
+        report.output = output;
+        Ok(report)
+    }
+
+    /// Extract one 2000-epoch group, returning the encoded packet bytes and a
+    /// report, without touching the disk.
+    pub(super) fn encoded(&self, config: &ExtractConfig) -> Result<(Vec<u8>, ExtractReport)> {
+        let (raw, mut timing) = self.raw(config)?;
+        let started = Instant::now();
+        let packet = encode_packet(&raw)?;
+        timing.encode_ms = started.elapsed().as_millis();
+
+        let started = Instant::now();
+        let verify = cfxpack::verify::verify_packet(&packet)?;
+        timing.verify_ms = started.elapsed().as_millis();
+
+        let report = ExtractReport {
+            start_epoch: config.start_epoch,
+            epoch_count: config.epoch_count,
+            block_count: verify.block_count as usize,
+            transaction_count: verify.transaction_items as usize,
+            packet_bytes: packet.len(),
+            output: PathBuf::new(),
+            timing,
+        };
+        Ok((packet, report))
+    }
+
+    /// Read one 2000-epoch group from the node DB into the in-memory [`Packet`],
+    /// alongside a per-phase timing breakdown.
+    fn raw(&self, config: &ExtractConfig) -> Result<(Packet, ExtractTiming)> {
+        extract_raw(config, &self.pow, &self.pos)
+    }
+}
+
+fn extract_raw(
     config: &ExtractConfig,
     pow: &PowDb,
     pos: &PosDb,
-) -> Result<RawExecutionData> {
-    extract_raw_data_with_timing(config, pow, pos).map(|(raw, _)| raw)
-}
-
-fn extract_raw_data_with_timing(
-    config: &ExtractConfig,
-    pow: &PowDb,
-    pos: &PosDb,
-) -> Result<(RawExecutionData, ExtractTiming)> {
+) -> Result<(Packet, ExtractTiming)> {
     ensure!(config.epoch_count > 0, "epoch_count must be positive");
     let _ = CIP112_TRANSITION_HEIGHT.set(config.cip112_transition_height);
     let mut timing = ExtractTiming::default();
 
+    let epochs = time(&mut timing.load_epochs_ms, || load_epochs(pow, config))?;
+    let boundary = read_prev_boundary(pow, config, &epochs)?;
+
+    let CollectedBlocks {
+        block_inputs,
+        min_timestamp,
+        min_height,
+        min_pos_height,
+        pos_blocks,
+    } = time(&mut timing.read_blocks_ms, || {
+        collect_blocks(config, pow, pos, &epochs)
+    })?;
+
+    let tables = time(&mut timing.build_tables_ms, || {
+        build_tables(
+            &block_inputs,
+            &pos_blocks,
+            min_pos_height,
+            config.pos_reference_enable_height,
+        )
+    })?;
+
+    let blocks = time(&mut timing.build_blocks_ms, || {
+        build_block_inputs(config, pow, &pos_blocks, block_inputs)
+    })?;
+
+    Ok((
+        Packet {
+            prev_last_hash: boundary.prev_last_hash,
+            prev_last_deferred_state_root: boundary.prev_last_deferred_state_root,
+            first_block_number: boundary.first_block_number,
+            min_timestamp,
+            min_height,
+            min_pos_height,
+            addresses: tables.addresses,
+            pos_entries: tables.pos_entries,
+            difficulties: tables.difficulties,
+            sender_base_nonces: tables.sender_base_nonces,
+            gas_prices: tables.gas_prices,
+            blocks,
+        },
+        timing,
+    ))
+}
+
+/// Run `f`, recording its wall-clock duration (ms) into `slot`. Lets the
+/// orchestration above stay a flat list of phases instead of interleaving
+/// `Instant::now()` bookkeeping with the work.
+fn time<T>(slot: &mut u128, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let started = Instant::now();
+    let out = f()?;
+    *slot = started.elapsed().as_millis();
+    Ok(out)
+}
+
+/// Phase 1: read the executed/skipped block sets for every epoch in range.
+fn load_epochs(pow: &PowDb, config: &ExtractConfig) -> Result<Vec<EpochBlocks>> {
     let mut epochs = Vec::new();
     for epoch in config.start_epoch..config.start_epoch + config.epoch_count {
         epochs.push(load_epoch(pow, epoch)?);
     }
-    timing.load_epochs_ms = started.elapsed().as_millis();
+    Ok(epochs)
+}
 
+/// The cross-group boundary: the prior epoch's pivot anchors this group's first
+/// state root, and its executed block set fixes the starting block number.
+struct PrevBoundary {
+    prev_last_hash: H256,
+    prev_last_deferred_state_root: H256,
+    first_block_number: u64,
+}
+
+fn read_prev_boundary(
+    pow: &PowDb,
+    config: &ExtractConfig,
+    epochs: &[EpochBlocks],
+) -> Result<PrevBoundary> {
     let prev_epoch = config.start_epoch.saturating_sub(1);
     let prev_hashes = read_epoch_hashes(pow, prev_epoch, EPOCH_EXECUTED_BLOCK_SET_SUFFIX)?
         .ok_or_else(|| anyhow!("missing previous epoch {} executed block set", prev_epoch))?;
@@ -240,14 +309,38 @@ fn extract_raw_data_with_timing(
         .with_context(|| format!("read first epoch context for {first_pivot:?}"))?
         .start_block_number;
 
+    Ok(PrevBoundary {
+        prev_last_hash,
+        prev_last_deferred_state_root: *prev_last_header.deferred_state_root(),
+        first_block_number,
+    })
+}
+
+/// Output of the read-blocks phase: the per-block raw inputs plus the range
+/// minimums and PoS-block cache the later phases need.
+struct CollectedBlocks {
+    block_inputs: Vec<RawBlock>,
+    min_timestamp: u64,
+    min_height: u64,
+    min_pos_height: u64,
+    pos_blocks: HashMap<H256, CommittedBlock>,
+}
+
+/// Phase 2: read every block's header/body/reward, derive its flags, and cache
+/// the PoS committed blocks referenced along the way.
+fn collect_blocks(
+    config: &ExtractConfig,
+    pow: &PowDb,
+    pos: &PosDb,
+    epochs: &[EpochBlocks],
+) -> Result<CollectedBlocks> {
     let mut block_inputs = Vec::new();
     let mut min_timestamp = u64::MAX;
     let mut min_height = u64::MAX;
     let mut min_pos_height = u64::MAX;
     let mut pos_blocks = HashMap::<H256, CommittedBlock>::new();
 
-    let started = Instant::now();
-    for epoch in &epochs {
+    for epoch in epochs {
         let skipped = epoch.skipped.iter().copied().collect::<HashSet<_>>();
         let pivot_hash = epoch
             .executed
@@ -271,24 +364,14 @@ fn extract_raw_data_with_timing(
                 min_pos_height = min_pos_height.min(committed.view);
                 pos_blocks.insert(*pos_ref, committed);
             }
-            let pivot = hash == pivot_hash;
-            let mut flags = 0u8;
-            if header.adaptive() {
-                flags |= FLAG_ADAPTIVE;
-            }
-            if pivot {
-                flags |= FLAG_PIVOT;
-            }
-            if pivot && header.height() % config.evm_transaction_block_ratio == 0 {
-                flags |= FLAG_ESPACE;
-            }
-            if skipped.contains(&hash) {
-                flags |= FLAG_SKIPPED_EXECUTION;
-            }
-            // Corner-case marker: the block's full settled reward is zero.
-            if reward.total_reward.is_zero() {
-                flags |= FLAG_ZERO_TOTAL_REWARD;
-            }
+            let flags = block_flags(
+                config,
+                &header,
+                &reward,
+                hash == pivot_hash,
+                &skipped,
+                &hash,
+            );
             block_inputs.push(RawBlock {
                 epoch: epoch.number,
                 hash,
@@ -299,42 +382,66 @@ fn extract_raw_data_with_timing(
             });
         }
     }
-    timing.read_blocks_ms = started.elapsed().as_millis();
     if min_pos_height == u64::MAX {
         min_pos_height = 0;
     }
 
-    let started = Instant::now();
-    let addresses = build_address_table(&block_inputs);
-    let address_index = addresses
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, address)| (address, i))
-        .collect::<HashMap<_, _>>();
-    let difficulties = build_difficulty_table(&block_inputs);
-    let gas_prices = build_gas_price_table(&block_inputs);
-    let sender_base_nonces = build_sender_base_nonce_table(&block_inputs, &address_index);
-    let pos_entries = build_pos_lookup(
-        &block_inputs,
-        &pos_blocks,
+    Ok(CollectedBlocks {
+        block_inputs,
+        min_timestamp,
+        min_height,
         min_pos_height,
-        config.pos_reference_enable_height,
-    )?;
-    timing.build_tables_ms = started.elapsed().as_millis();
+        pos_blocks,
+    })
+}
 
-    let started = Instant::now();
+fn block_flags(
+    config: &ExtractConfig,
+    header: &BlockHeader,
+    reward: &BlockRewardResult,
+    pivot: bool,
+    skipped: &HashSet<H256>,
+    hash: &H256,
+) -> u8 {
+    let mut flags = 0u8;
+    if header.adaptive() {
+        flags |= FLAG_ADAPTIVE;
+    }
+    if pivot {
+        flags |= FLAG_PIVOT;
+    }
+    if pivot && header.height() % config.evm_transaction_block_ratio == 0 {
+        flags |= FLAG_ESPACE;
+    }
+    if skipped.contains(hash) {
+        flags |= FLAG_SKIPPED_EXECUTION;
+    }
+    // Corner-case marker: the block's full settled reward is zero.
+    if reward.total_reward.is_zero() {
+        flags |= FLAG_ZERO_TOTAL_REWARD;
+    }
+    flags
+}
+
+/// Phase 4: lower each [`RawBlock`] into the packet's [`Block`], resolving
+/// the PoS-derived finalized-epoch offset per block.
+fn build_block_inputs(
+    config: &ExtractConfig,
+    pow: &PowDb,
+    pos_blocks: &HashMap<H256, CommittedBlock>,
+    block_inputs: Vec<RawBlock>,
+) -> Result<Vec<Block>> {
     let mut blocks = Vec::with_capacity(block_inputs.len());
     for (index, raw) in block_inputs.into_iter().enumerate() {
         let base_prices = raw.header.base_price();
         let finalized_epoch = finalized_epoch_offset(
             pow,
-            &pos_blocks,
+            pos_blocks,
             &raw,
             config.pos_pivot_decision_defer_epoch_count,
             config.pos_reference_enable_height,
         )?;
-        blocks.push(BlockInput {
+        blocks.push(Block {
             epoch: raw.epoch,
             index,
             hash: raw.hash,
@@ -360,147 +467,20 @@ fn extract_raw_data_with_timing(
             transaction_refs: Vec::new(),
         });
     }
-    timing.build_blocks_ms = started.elapsed().as_millis();
-
-    Ok((
-        PacketInput {
-            prev_last_hash,
-            prev_last_deferred_state_root: *prev_last_header.deferred_state_root(),
-            first_block_number,
-            min_timestamp,
-            min_height,
-            min_pos_height,
-            addresses,
-            pos_entries,
-            difficulties,
-            sender_base_nonces,
-            gas_prices,
-            blocks,
-        },
-        timing,
-    ))
+    Ok(blocks)
 }
 
+/// Per-block raw inputs read straight from the node DB, before lowering into the
+/// packet's [`Block`]. Shared by the table builders in [`tables`].
 #[derive(Debug)]
-struct RawBlock {
+pub(super) struct RawBlock {
     epoch: u64,
     hash: H256,
-    header: BlockHeader,
-    body: Vec<Arc<SignedTransaction>>,
+    // Read by the table builders in `tables`; the rest stay module-private.
+    pub(super) header: BlockHeader,
+    pub(super) body: Vec<Arc<SignedTransaction>>,
     reward: BlockRewardResult,
     flags: u8,
-}
-
-fn build_address_table(blocks: &[RawBlock]) -> Vec<Address> {
-    let mut stats = Frequency::<Address>::default();
-    for block in blocks {
-        stats.add(*block.header.author());
-        for tx in &block.body {
-            stats.add(tx.sender);
-            if let Action::Call(address) = tx.action() {
-                stats.add(address);
-            }
-        }
-    }
-    stats.into_sorted()
-}
-
-fn build_difficulty_table(blocks: &[RawBlock]) -> Vec<U256> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for block in blocks {
-        let value = *block.header.difficulty();
-        if seen.insert(value) {
-            out.push(value);
-        }
-    }
-    out
-}
-
-fn build_gas_price_table(blocks: &[RawBlock]) -> Vec<U256> {
-    let mut stats = Frequency::<U256>::default();
-    for block in blocks {
-        if let Some(base) = block.header.base_price() {
-            stats.add(*base.in_space(Space::Native));
-            stats.add(*base.in_space(Space::Ethereum));
-        }
-        for tx in &block.body {
-            stats.add(*tx.gas_price());
-            stats.add(*tx.max_priority_gas_price());
-        }
-    }
-    stats
-        .into_sorted_with_counts()
-        .into_iter()
-        .filter(|(_, count)| *count > 3)
-        .take(16)
-        .map(|(value, _)| value)
-        .collect()
-}
-
-fn build_sender_base_nonce_table(
-    blocks: &[RawBlock],
-    address_index: &HashMap<Address, usize>,
-) -> Vec<SenderBaseNonce> {
-    let mut nonces = HashMap::<usize, Vec<u64>>::new();
-    for block in blocks {
-        for tx in &block.body {
-            if let Some(sender_index) = address_index.get(&tx.sender) {
-                nonces
-                    .entry(*sender_index)
-                    .or_default()
-                    .push(tx.nonce().low_u64());
-            }
-        }
-    }
-    let mut out = Vec::new();
-    for (sender_index, values) in nonces {
-        let base_nonce = values.iter().copied().min().unwrap_or(0);
-        let saving: isize = values
-            .iter()
-            .map(|nonce| {
-                crate::codec::uleb128_len(*nonce) as isize
-                    - crate::codec::uleb128_len(nonce.saturating_sub(base_nonce)) as isize
-            })
-            .sum();
-        if saving >= 16 {
-            out.push(SenderBaseNonce {
-                sender_index,
-                base_nonce,
-            });
-        }
-    }
-    out.sort_by_key(|entry| entry.sender_index);
-    out
-}
-
-fn build_pos_lookup(
-    blocks: &[RawBlock],
-    pos_blocks: &HashMap<H256, CommittedBlock>,
-    min_pos_height: u64,
-    pos_reference_enable_height: u64,
-) -> Result<Vec<PosLookupEntry>> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for block in blocks {
-        if let Some(pos_ref) = effective_pos_reference(&block.header, pos_reference_enable_height) {
-            if seen.insert(*pos_ref) {
-                let committed = pos_blocks
-                    .get(pos_ref)
-                    .ok_or_else(|| anyhow!("missing cached committed block"))?;
-                let height_offset = committed
-                    .view
-                    .checked_sub(min_pos_height)
-                    .ok_or_else(|| anyhow!("PoS view below min_pos_height"))?;
-                out.push(PosLookupEntry {
-                    hash: *pos_ref,
-                    height_offset: u16::try_from(height_offset)
-                        .context("PoS height offset exceeds u16")?,
-                });
-            }
-        }
-    }
-    Ok(out)
 }
 
 fn finalized_epoch_offset(
@@ -522,7 +502,7 @@ fn finalized_epoch_offset(
     Ok(block.epoch.saturating_sub(finalized_height))
 }
 
-fn effective_pos_reference(
+pub(super) fn effective_pos_reference(
     header: &BlockHeader,
     pos_reference_enable_height: u64,
 ) -> Option<&H256> {
@@ -530,47 +510,5 @@ fn effective_pos_reference(
         None
     } else {
         header.pos_reference().as_ref()
-    }
-}
-
-#[derive(Default)]
-struct Frequency<T> {
-    counts: HashMap<T, (usize, usize)>,
-    next_order: usize,
-}
-
-impl<T> Frequency<T>
-where
-    T: Eq + std::hash::Hash + Copy,
-{
-    fn add(&mut self, value: T) {
-        let order = self.next_order;
-        self.counts
-            .entry(value)
-            .and_modify(|entry| entry.0 += 1)
-            .or_insert_with(|| {
-                self.next_order += 1;
-                (1, order)
-            });
-    }
-
-    fn into_sorted(self) -> Vec<T> {
-        self.into_sorted_with_counts()
-            .into_iter()
-            .map(|(value, _)| value)
-            .collect()
-    }
-
-    fn into_sorted_with_counts(self) -> Vec<(T, usize)> {
-        let mut values = self
-            .counts
-            .into_iter()
-            .map(|(value, (count, order))| (value, count, order))
-            .collect::<Vec<_>>();
-        values.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
-        values
-            .into_iter()
-            .map(|(value, count, _)| (value, count))
-            .collect()
     }
 }

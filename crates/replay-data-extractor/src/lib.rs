@@ -1,14 +1,10 @@
+// The `.cfxpack` wire format (packet/codec/decode/verify) lives in the shared
+// `cfxpack` crate, used directly at each call site.
 pub mod bench;
 pub mod cli;
-pub mod codec;
-pub mod decode;
 pub mod extract;
-pub mod packet;
-pub mod raw;
 pub mod validate;
-pub mod verify;
 
+pub use cfxpack::verify::VerifyReport;
 pub use extract::{ExtractConfig, ExtractReport};
-pub use raw::RawExecutionData;
 pub use validate::{ReplayReport, ReplayValidationReport};
-pub use verify::VerifyReport;

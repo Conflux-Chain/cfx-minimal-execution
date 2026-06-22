@@ -1,0 +1,235 @@
+//! The `.cfxpack` packet header types, flag constants, and the encoder entry
+//! point. The byte-level encoding lives in [`encode`]; decoding is in
+//! [`crate::decode`], structural verification in [`crate::verify`].
+
+use cfx_types::{Address, H256, U256};
+use primitives::SignedTransaction;
+use serde::{Deserialize, Serialize};
+
+mod encode;
+pub use encode::encode_packet;
+
+pub const PACKET_EPOCHS: u64 = 2000;
+pub const HEADER_FIXED_LEN: usize = 93;
+pub const HEADER_OFFSET_COUNT: usize = 8;
+pub const HEADER_LEN: usize = HEADER_FIXED_LEN + HEADER_OFFSET_COUNT * 4;
+pub const FLAG_ADAPTIVE: u8 = 1 << 0;
+pub const FLAG_PIVOT: u8 = 1 << 1;
+pub const FLAG_ESPACE: u8 = 1 << 2;
+pub const FLAG_HAS_TRANSACTIONS: u8 = 1 << 3;
+pub const FLAG_TX_COMPRESSED: u8 = 1 << 4;
+pub const FLAG_SKIPPED_EXECUTION: u8 = 1 << 5;
+/// Set when the block's `total_reward` (the full settled reward — distinct from
+/// `base_reward`) is zero. A corner-case marker; bit 7 stays reserved.
+pub const FLAG_ZERO_TOTAL_REWARD: u8 = 1 << 6;
+
+#[derive(Debug, Clone)]
+pub struct Packet {
+    pub prev_last_hash: H256,
+    pub prev_last_deferred_state_root: H256,
+    pub first_block_number: u64,
+    pub min_timestamp: u64,
+    pub min_height: u64,
+    pub min_pos_height: u64,
+    pub addresses: Vec<Address>,
+    pub pos_entries: Vec<PosLookupEntry>,
+    pub difficulties: Vec<U256>,
+    pub sender_base_nonces: Vec<SenderBaseNonce>,
+    pub gas_prices: Vec<U256>,
+    pub blocks: Vec<Block>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PosLookupEntry {
+    pub hash: H256,
+    pub height_offset: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct SenderBaseNonce {
+    pub sender_index: usize,
+    pub base_nonce: u64,
+}
+
+// `Serialize`/`Deserialize` are required by the executor's resume checkpoint
+// (which persists `Vec<Block>`); harmless to the extractor, which never
+// serializes it. `primitives` derives serde on the transaction types, so this
+// derives cleanly under both consumers' dependency sources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Block {
+    pub epoch: u64,
+    pub index: usize,
+    pub hash: H256,
+    pub deferred_state_root: H256,
+    pub deferred_receipts_root: H256,
+    pub deferred_logs_bloom_hash: H256,
+    pub flags: u8,
+    pub author: Address,
+    pub timestamp: u64,
+    pub difficulty: U256,
+    pub gas_limit: U256,
+    pub base_price_core: U256,
+    pub base_price_espace: U256,
+    pub height: u64,
+    pub blame: u64,
+    pub finalized_epoch: u64,
+    pub base_reward: U256,
+    pub transactions: Vec<SignedTransaction>,
+    pub transaction_refs: Vec<Option<(usize, usize)>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{decode::decode_packet, verify::verify_packet};
+    use cfx_types::AddressSpaceUtil;
+    use primitives::transaction::NativeTransaction;
+
+    #[test]
+    fn raw_to_packet_roundtrip_minimal_blocks() {
+        let author = Address::from_low_u64_be(1);
+        let raw = Packet {
+            prev_last_hash: H256::from_low_u64_be(9),
+            prev_last_deferred_state_root: H256::from_low_u64_be(10),
+            first_block_number: 100,
+            min_timestamp: 1_700_000_000,
+            min_height: 42,
+            min_pos_height: 0,
+            addresses: vec![author],
+            pos_entries: Vec::new(),
+            difficulties: vec![U256::from(1000)],
+            sender_base_nonces: Vec::new(),
+            gas_prices: Vec::new(),
+            blocks: vec![
+                Block {
+                    epoch: 45,
+                    index: 0,
+                    hash: H256::from_low_u64_be(11),
+                    deferred_state_root: H256::from_low_u64_be(12),
+                    deferred_receipts_root: H256::from_low_u64_be(13),
+                    deferred_logs_bloom_hash: H256::from_low_u64_be(14),
+                    flags: FLAG_ADAPTIVE,
+                    author,
+                    timestamp: 1_700_000_000,
+                    difficulty: U256::from(1000),
+                    gas_limit: U256::from(30_000_000),
+                    base_price_core: U256::zero(),
+                    base_price_espace: U256::zero(),
+                    height: 42,
+                    blame: 0,
+                    finalized_epoch: 0,
+                    base_reward: U256::from(1),
+                    transactions: Vec::new(),
+                    transaction_refs: Vec::new(),
+                },
+                Block {
+                    epoch: 45,
+                    index: 1,
+                    hash: H256::from_low_u64_be(15),
+                    deferred_state_root: H256::from_low_u64_be(16),
+                    deferred_receipts_root: H256::from_low_u64_be(17),
+                    deferred_logs_bloom_hash: H256::from_low_u64_be(18),
+                    flags: FLAG_PIVOT | FLAG_ESPACE,
+                    author,
+                    timestamp: 1_700_000_005,
+                    difficulty: U256::from(1000),
+                    gas_limit: U256::from(60_000_000),
+                    base_price_core: U256::from(1_000_000_000),
+                    base_price_espace: U256::from(20_000_000_000u64),
+                    height: 45,
+                    blame: 1,
+                    finalized_epoch: 5,
+                    base_reward: U256::from(2),
+                    transactions: Vec::new(),
+                    transaction_refs: Vec::new(),
+                },
+            ],
+        };
+
+        let packet = encode_packet(&raw).expect("encode raw packet");
+        let report = verify_packet(&packet).expect("verify packet");
+        assert_eq!(report.block_count, 2);
+        assert_eq!(report.transaction_blocks, 0);
+        assert_eq!(report.first_block_number, 100);
+        assert!(matches!(report.block_prefix_size, 64 | 72 | 80 | 88 | 96));
+
+        let decoded = decode_packet(&packet).expect("decode packet");
+        assert_eq!(decoded.blocks[0].height, 42);
+        assert_eq!(decoded.blocks[0].epoch, 45);
+        assert_eq!(decoded.blocks[1].height, 45);
+        assert_eq!(decoded.blocks[1].epoch, 45);
+        let reencoded = encode_packet(&decoded).expect("reencode decoded packet");
+        assert_eq!(reencoded, packet);
+        let reencoded_report = verify_packet(&reencoded).expect("verify reencoded packet");
+        assert_eq!(reencoded_report.block_count, report.block_count);
+        assert_eq!(reencoded_report.transaction_items, report.transaction_items);
+    }
+
+    #[test]
+    fn raw_to_packet_roundtrip_with_transaction_payload() {
+        let author = Address::from_low_u64_be(1);
+        let sender = Address::from_low_u64_be(2);
+        let receiver = Address::from_low_u64_be(3);
+        let tx = NativeTransaction {
+            nonce: U256::from(7),
+            gas_price: U256::from(1_000_000_000u64),
+            gas: U256::from(21_000),
+            action: primitives::Action::Call(receiver),
+            value: U256::from(42),
+            storage_limit: 0,
+            epoch_height: 1000,
+            chain_id: 1029,
+            data: Vec::new().into(),
+        }
+        .fake_sign(sender.with_native_space());
+
+        let raw = Packet {
+            prev_last_hash: H256::from_low_u64_be(9),
+            prev_last_deferred_state_root: H256::from_low_u64_be(10),
+            first_block_number: 1000,
+            min_timestamp: 1_700_000_000,
+            min_height: 1000,
+            min_pos_height: 0,
+            addresses: vec![author, sender, receiver],
+            pos_entries: Vec::new(),
+            difficulties: vec![U256::from(1000)],
+            sender_base_nonces: Vec::new(),
+            gas_prices: vec![U256::from(1_000_000_000u64)],
+            blocks: vec![Block {
+                epoch: 1000,
+                index: 0,
+                hash: H256::from_low_u64_be(11),
+                deferred_state_root: H256::from_low_u64_be(12),
+                deferred_receipts_root: H256::from_low_u64_be(13),
+                deferred_logs_bloom_hash: H256::from_low_u64_be(14),
+                flags: FLAG_PIVOT,
+                author,
+                timestamp: 1_700_000_000,
+                difficulty: U256::from(1000),
+                gas_limit: U256::from(30_000_000),
+                base_price_core: U256::from(1_000_000_000u64),
+                base_price_espace: U256::zero(),
+                height: 1000,
+                blame: 0,
+                finalized_epoch: 0,
+                base_reward: U256::from(1),
+                transactions: vec![tx],
+                transaction_refs: Vec::new(),
+            }],
+        };
+
+        let packet = encode_packet(&raw).expect("encode tx packet");
+        let report = verify_packet(&packet).expect("verify tx packet");
+        assert_eq!(report.block_count, 1);
+        assert_eq!(report.transaction_blocks, 1);
+        assert_eq!(report.transaction_items, 1);
+
+        let decoded = decode_packet(&packet).expect("decode tx packet");
+        assert_eq!(decoded.blocks[0].transactions.len(), 1);
+        let reencoded = encode_packet(&decoded).expect("reencode tx packet");
+        assert_eq!(reencoded, packet);
+        let reencoded_report = verify_packet(&reencoded).expect("verify reencoded tx packet");
+        assert_eq!(reencoded_report.transaction_blocks, 1);
+        assert_eq!(reencoded_report.transaction_items, 1);
+    }
+}

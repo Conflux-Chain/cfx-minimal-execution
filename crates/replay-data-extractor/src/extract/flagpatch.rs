@@ -19,10 +19,10 @@
 
 use super::db::{open_databases, read_reward, PowDb};
 use super::ExtractConfig;
-use crate::decode::block_flag_sites;
-use crate::packet::FLAG_ZERO_TOTAL_REWARD;
 use anyhow::{ensure, Context, Result};
 use cfx_types::H256;
+use cfxpack::decode::block_flag_sites;
+use cfxpack::packet::FLAG_ZERO_TOTAL_REWARD;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,18 +63,13 @@ fn parse_container(data: &[u8]) -> Result<Vec<(usize, usize)>> {
         data.len() >= CONTAINER_HEADER_LEN && &data[0..8] == MAGIC,
         "not a cfxpack container"
     );
-    let group_count =
-        u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+    let group_count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
     let mut entries = Vec::with_capacity(group_count);
     let mut pos = CONTAINER_HEADER_LEN;
     for _ in 0..group_count {
         ensure!(pos + DIR_ENTRY_LEN <= data.len(), "truncated directory");
-        let offset =
-            u64::from_le_bytes(data[pos + 16..pos + 24].try_into().unwrap())
-                as usize;
-        let length =
-            u64::from_le_bytes(data[pos + 24..pos + 32].try_into().unwrap())
-                as usize;
+        let offset = u64::from_le_bytes(data[pos + 16..pos + 24].try_into().unwrap()) as usize;
+        let length = u64::from_le_bytes(data[pos + 24..pos + 32].try_into().unwrap()) as usize;
         ensure!(offset + length <= data.len(), "payload out of bounds");
         entries.push((offset, length));
         pos += DIR_ENTRY_LEN;
@@ -85,7 +80,10 @@ fn parse_container(data: &[u8]) -> Result<Vec<(usize, usize)>> {
 /// Patch one container's bytes in memory, fanning the per-block reward reads
 /// across `jobs` threads. Returns `(blocks_seen, blocks_flagged, changed)`.
 fn patch_container_bytes(
-    data: &mut [u8], pow: &PowDb, jobs: usize, progress: &AtomicU64,
+    data: &mut [u8],
+    pow: &PowDb,
+    jobs: usize,
+    progress: &AtomicU64,
 ) -> Result<(u64, u64, bool)> {
     let entries = parse_container(data)?;
 
@@ -94,9 +92,7 @@ fn patch_container_bytes(
     //    here and we are free to mutate the flag bytes afterwards.
     let mut sites: Vec<(usize, H256)> = Vec::new();
     for (offset, length) in entries {
-        for (rel_flags_offset, hash) in
-            block_flag_sites(&data[offset..offset + length])?
-        {
+        for (rel_flags_offset, hash) in block_flag_sites(&data[offset..offset + length])? {
             sites.push((offset + rel_flags_offset, hash));
         }
     }
@@ -125,8 +121,7 @@ fn patch_container_bytes(
                     let (abs, hash) = &sites_ref[i];
                     match read_reward(pow, hash) {
                         Ok(reward) => {
-                            if reward.unwrap_or_default().total_reward.is_zero()
-                            {
+                            if reward.unwrap_or_default().total_reward.is_zero() {
                                 local.push(*abs);
                             }
                         }
@@ -167,31 +162,16 @@ fn patch_container_bytes(
 /// on blocks whose `total_reward` is zero, and rewrite only the files that
 /// changed. `max_epoch` (if set) limits the run to files starting below it.
 pub fn add_total_reward_flag(
-    config: &ExtractConfig, input_dir: &Path, jobs: usize, dry_run: bool,
-    max_epoch: Option<u64>, min_epoch: Option<u64>,
+    config: &ExtractConfig,
+    input_dir: &Path,
+    jobs: usize,
+    dry_run: bool,
+    max_epoch: Option<u64>,
+    min_epoch: Option<u64>,
 ) -> Result<FlagPatchSummary> {
     let (pow, _pos) = open_databases(config)?;
 
-    let mut files: Vec<PathBuf> = fs::read_dir(input_dir)
-        .with_context(|| format!("read dir {}", input_dir.display()))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.extension().map(|ext| ext == "cfxpack").unwrap_or(false)
-        })
-        .collect();
-    // Process in ascending on-chain epoch order, NOT lexicographic filename
-    // order (`epochs_1000…` sorts before `epochs_1008…` byte-wise, scattering
-    // the chain). Sorting by the numeric start epoch makes the patch advance
-    // monotonically by height.
-    files.sort_by_key(|p| start_epoch(p));
-    if let Some(limit) = max_epoch {
-        files.retain(|p| start_epoch(p) < limit);
-    }
-    if let Some(floor) = min_epoch {
-        // Skip files already handled by an earlier run (resume to chain tip).
-        files.retain(|p| start_epoch(p) >= floor);
-    }
-    ensure!(!files.is_empty(), "no .cfxpack files in {}", input_dir.display());
+    let files = collect_sorted_pack_files(input_dir, max_epoch, min_epoch)?;
     let total_files = files.len();
     eprintln!(
         "flag-patch start files={} jobs={} epoch_range=[{}, {}){}",
@@ -246,24 +226,11 @@ pub fn add_total_reward_flag(
         // Files are processed one at a time in ascending epoch order; the
         // parallelism is inside patch_container_bytes (per-block reward reads).
         for path in &files {
-            let mut data = fs::read(path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let (seen, flagged, changed) =
-                patch_container_bytes(&mut data, &pow, jobs, &progress)
-                    .with_context(|| format!("patch {}", path.display()))?;
+            let mut data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            let (seen, flagged, changed) = patch_container_bytes(&mut data, &pow, jobs, &progress)
+                .with_context(|| format!("patch {}", path.display()))?;
             if changed && !dry_run {
-                let mut tmp = path.clone().into_os_string();
-                tmp.push(".tmp");
-                let tmp = PathBuf::from(tmp);
-                {
-                    let mut f = fs::File::create(&tmp)
-                        .with_context(|| format!("create {}", tmp.display()))?;
-                    f.write_all(&data)?;
-                    f.sync_all()?;
-                }
-                fs::rename(&tmp, path).with_context(|| {
-                    format!("rename into {}", path.display())
-                })?;
+                write_patched_file(path, &data)?;
             }
             summary.files_scanned += 1;
             summary.blocks_total += seen;
@@ -294,4 +261,51 @@ pub fn add_total_reward_flag(
 
     summary.changed_files.sort();
     Ok(summary)
+}
+
+/// The `.cfxpack` files under `input_dir`, in ascending on-chain epoch order
+/// (NOT lexicographic filename order, which scatters the chain), optionally
+/// limited to `[min_epoch, max_epoch)` so a run can resume to the chain tip.
+fn collect_sorted_pack_files(
+    input_dir: &Path,
+    max_epoch: Option<u64>,
+    min_epoch: Option<u64>,
+) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = fs::read_dir(input_dir)
+        .with_context(|| format!("read dir {}", input_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.extension()
+                .map(|ext| ext == "cfxpack")
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort_by_key(|p| start_epoch(p));
+    if let Some(limit) = max_epoch {
+        files.retain(|p| start_epoch(p) < limit);
+    }
+    if let Some(floor) = min_epoch {
+        files.retain(|p| start_epoch(p) >= floor);
+    }
+    ensure!(
+        !files.is_empty(),
+        "no .cfxpack files in {}",
+        input_dir.display()
+    );
+    Ok(files)
+}
+
+/// Atomically replace `path` with `data` (write to a sibling `.tmp`, fsync,
+/// rename) so a crash mid-write never leaves a torn container behind.
+fn write_patched_file(path: &Path, data: &[u8]) -> Result<()> {
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    Ok(())
 }

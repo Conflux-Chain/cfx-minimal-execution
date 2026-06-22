@@ -1,10 +1,10 @@
-use crate::{
-    decode::decode_packet,
-    packet::{BlockInput, PacketInput, FLAG_HAS_TRANSACTIONS, FLAG_PIVOT},
-    verify::{verify_packet, VerifyReport},
-};
 use anyhow::{ensure, Result};
 use cfx_types::{Space, H256};
+use cfxpack::{
+    decode::decode_packet,
+    packet::{Block, Packet, FLAG_HAS_TRANSACTIONS, FLAG_PIVOT},
+    verify::{verify_packet, VerifyReport},
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub fn validate_replay_packet(data: &[u8]) -> Result<ReplayReport> {
     validate_replay_input(&input, &verify)
 }
 
-pub fn validate_replay_input(input: &PacketInput, verify: &VerifyReport) -> Result<ReplayReport> {
+pub fn validate_replay_input(input: &Packet, verify: &VerifyReport) -> Result<ReplayReport> {
     ensure!(!input.blocks.is_empty(), "replay packet has no blocks");
     ensure!(
         input.blocks.len() == verify.block_count as usize,
@@ -111,7 +111,7 @@ pub fn validate_replay_input(input: &PacketInput, verify: &VerifyReport) -> Resu
 }
 
 fn validate_block_transactions(
-    block: &BlockInput,
+    block: &Block,
     _block_number: u64,
     tx_count: &mut usize,
     native_tx_count: &mut usize,

@@ -1,10 +1,9 @@
 #![no_main]
 
-use cfx_replay_data_extractor::{
+use cfx_replay_data_extractor::validate::validate_replay_packet;
+use cfxpack::{
     decode::decode_packet,
-    packet::{BlockInput, PacketInput, FLAG_PIVOT},
-    raw::encode_raw_data,
-    validate::validate_replay_packet,
+    packet::{encode_packet, Block, Packet, FLAG_PIVOT},
     verify::verify_packet,
 };
 use cfx_types::{Address, AddressSpaceUtil, H256, U256};
@@ -21,13 +20,13 @@ fuzz_target!(|data: &[u8]| {
     let Some(raw) = raw_from_bytes(data) else {
         return;
     };
-    let Ok(packet) = encode_raw_data(&raw) else {
+    let Ok(packet) = encode_packet(&raw) else {
         return;
     };
     let Ok(decoded) = decode_packet(&packet) else {
         panic!("decode failed for encoded packet");
     };
-    let Ok(reencoded) = encode_raw_data(&decoded) else {
+    let Ok(reencoded) = encode_packet(&decoded) else {
         panic!("reencode failed for decoded packet");
     };
     assert_eq!(packet, reencoded);
@@ -39,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(first_replay, second_replay);
 });
 
-fn raw_from_bytes(data: &[u8]) -> Option<PacketInput> {
+fn raw_from_bytes(data: &[u8]) -> Option<Packet> {
     if data.len() < 8 {
         return None;
     }
@@ -61,13 +60,22 @@ fn raw_from_bytes(data: &[u8]) -> Option<PacketInput> {
         let height = 1_000 + i as u64;
         let timestamp = 1_700_000_000 + next_u16(data, &mut cursor) as u64;
         let mut transactions = Vec::new();
+        // Real blocks never carry two transactions with the same hash (distinct
+        // signed txs hash differently, and a tx is packed at most once per
+        // block), so enforce per-block hash uniqueness here. The dedup that the
+        // codec performs is *cross-block* tx reuse (legal in Conflux, exercised
+        // by `duplicate_txs` below) — an intra-block self-reference, which only
+        // arises from `fake_sign` hash collisions, is not a real input.
+        let mut block_tx_hashes = std::collections::HashSet::new();
         if with_txs && (data.get(cursor).copied().unwrap_or(0) as usize + i) % 3 != 0 {
             let tx_count = (data.get(cursor).copied().unwrap_or(0) as usize % 3) + 1;
             cursor = cursor.saturating_add(1);
             for tx_index in 0..tx_count {
                 if duplicate_txs && i > 0 && tx_index == 0 {
                     if let Some(tx) = &first_tx {
-                        transactions.push(tx.clone());
+                        if block_tx_hashes.insert(tx.hash()) {
+                            transactions.push(tx.clone());
+                        }
                         continue;
                     }
                 }
@@ -81,10 +89,12 @@ fn raw_from_bytes(data: &[u8]) -> Option<PacketInput> {
                 if first_tx.is_none() {
                     first_tx = Some(tx.clone());
                 }
-                transactions.push(tx);
+                if block_tx_hashes.insert(tx.hash()) {
+                    transactions.push(tx);
+                }
             }
         }
-        blocks.push(BlockInput {
+        blocks.push(Block {
             epoch,
             index: i,
             hash: H256::from_low_u64_be(10_000 + i as u64),
@@ -119,7 +129,7 @@ fn raw_from_bytes(data: &[u8]) -> Option<PacketInput> {
             difficulties.push(block.difficulty);
         }
     }
-    Some(PacketInput {
+    Some(Packet {
         prev_last_hash: H256::from_low_u64_be(1),
         prev_last_deferred_state_root: H256::from_low_u64_be(2),
         first_block_number: 1_000,

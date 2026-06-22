@@ -14,6 +14,7 @@ Conflux 存储特点
 
 replay 查 bug 约束（对于跑了很久的bug）
 不要一上来猜原因 + 追代码，先看，相关高度触发了哪些 corner case（合约销毁？（涉及 get all 和 delete all）异常共识区块 reward？（涉及 reward 分钱）特定 PoS 事件？特定 CIP 激活节点？era / snapshot 切换点？特殊 storage 读写 pattern（涉及 mpt 核心）？罕见 OPCODE？（涉及 env 上下文参数正确与否））等，然后再有选择地追核心。
+很多问题需要在代码中临时加日志查看运行时状态，才能准确回答。
 
 工作约束
 1. Monitor 不可以使用 &

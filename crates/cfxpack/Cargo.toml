@@ -1,0 +1,18 @@
+[package]
+name = "cfxpack"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The conflux types are pinned to the same git rev as the extractor, so an
+# extractor build unifies them with no patch. The executor's workspace
+# `[patch]`es this git source to its own path crates, so an executor build
+# unifies them there instead. Each consumer builds independently.
+[dependencies]
+anyhow = "1.0"
+rlp = "0.6"
+serde = { version = "1", features = ["derive"] }
+snap = "1.1"
+
+cfx-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+primitives = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }

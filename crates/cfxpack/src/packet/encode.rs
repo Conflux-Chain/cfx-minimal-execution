@@ -1,3 +1,11 @@
+//! `.cfxpack` encoder: lower a [`Packet`] into the packet byte layout —
+//! interned tables, fixed-size block prefix records with an overflow area, and
+//! a compressed transaction segment.
+
+use super::{
+    Block, Packet, FLAG_HAS_TRANSACTIONS, FLAG_PIVOT, FLAG_TX_COMPRESSED, HEADER_FIXED_LEN,
+    HEADER_LEN, HEADER_OFFSET_COUNT, PACKET_EPOCHS,
+};
 use crate::codec::{
     align_to, put_qc5e, put_qc8, put_u32_le, put_uleb128, qc5e_base_price_enum,
     qc5e_gas_limit_enum, u256_to_be,
@@ -9,72 +17,7 @@ use rlp::RlpStream;
 use snap::raw::Encoder as SnapEncoder;
 use std::collections::HashMap;
 
-pub const PACKET_EPOCHS: u64 = 2000;
-pub const HEADER_FIXED_LEN: usize = 93;
-pub const HEADER_OFFSET_COUNT: usize = 8;
-pub const HEADER_LEN: usize = HEADER_FIXED_LEN + HEADER_OFFSET_COUNT * 4;
-pub const FLAG_ADAPTIVE: u8 = 1 << 0;
-pub const FLAG_PIVOT: u8 = 1 << 1;
-pub const FLAG_ESPACE: u8 = 1 << 2;
-pub const FLAG_HAS_TRANSACTIONS: u8 = 1 << 3;
-pub const FLAG_TX_COMPRESSED: u8 = 1 << 4;
-pub const FLAG_SKIPPED_EXECUTION: u8 = 1 << 5;
-/// Set when the block's `total_reward` (the full settled reward — distinct from
-/// `base_reward`) is zero. A corner-case marker; bit 7 stays reserved.
-pub const FLAG_ZERO_TOTAL_REWARD: u8 = 1 << 6;
-
-#[derive(Debug, Clone)]
-pub struct PacketInput {
-    pub prev_last_hash: H256,
-    pub prev_last_deferred_state_root: H256,
-    pub first_block_number: u64,
-    pub min_timestamp: u64,
-    pub min_height: u64,
-    pub min_pos_height: u64,
-    pub addresses: Vec<Address>,
-    pub pos_entries: Vec<PosLookupEntry>,
-    pub difficulties: Vec<U256>,
-    pub sender_base_nonces: Vec<SenderBaseNonce>,
-    pub gas_prices: Vec<U256>,
-    pub blocks: Vec<BlockInput>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PosLookupEntry {
-    pub hash: H256,
-    pub height_offset: u16,
-}
-
-#[derive(Debug, Clone)]
-pub struct SenderBaseNonce {
-    pub sender_index: usize,
-    pub base_nonce: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct BlockInput {
-    pub epoch: u64,
-    pub index: usize,
-    pub hash: H256,
-    pub deferred_state_root: H256,
-    pub deferred_receipts_root: H256,
-    pub deferred_logs_bloom_hash: H256,
-    pub flags: u8,
-    pub author: Address,
-    pub timestamp: u64,
-    pub difficulty: U256,
-    pub gas_limit: U256,
-    pub base_price_core: U256,
-    pub base_price_espace: U256,
-    pub height: u64,
-    pub blame: u64,
-    pub finalized_epoch: u64,
-    pub base_reward: U256,
-    pub transactions: Vec<SignedTransaction>,
-    pub transaction_refs: Vec<Option<(usize, usize)>>,
-}
-
-pub fn encode_packet(input: &PacketInput) -> Result<Vec<u8>> {
+pub fn encode_packet(input: &Packet) -> Result<Vec<u8>> {
     validate_input(input)?;
 
     let address_index = index_addresses(&input.addresses);
@@ -86,17 +29,44 @@ pub fn encode_packet(input: &PacketInput) -> Result<Vec<u8>> {
         .map(|x| (x.sender_index, x.base_nonce))
         .collect::<HashMap<_, _>>();
 
+    let (block_records, tx_segment) = encode_blocks(
+        input,
+        &address_index,
+        &gas_price_index,
+        &sender_nonce_index,
+        &difficulty_index,
+    )?;
+    let prefix_size = choose_prefix_size(&block_records);
+    let (block_body, extension_bitmap) = pack_block_body(&block_records, prefix_size);
+    assemble_packet(
+        input,
+        prefix_size,
+        block_records.len(),
+        &extension_bitmap,
+        &block_body,
+        &tx_segment,
+    )
+}
+
+/// Encode every block into its fixed-size prefix record and append its
+/// (optionally snappy-compressed) transaction payload to the shared tx segment.
+fn encode_blocks(
+    input: &Packet,
+    address_index: &HashMap<Address, usize>,
+    gas_price_index: &HashMap<U256, usize>,
+    sender_nonce_index: &HashMap<usize, u64>,
+    difficulty_index: &HashMap<U256, usize>,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
     let mut tx_payloads = Vec::with_capacity(input.blocks.len());
     let mut seen_txs = HashMap::<H256, (usize, usize)>::new();
     for block in &input.blocks {
-        let payload = encode_tx_payload(
+        tx_payloads.push(encode_tx_payload(
             block,
-            &address_index,
-            &gas_price_index,
-            &sender_nonce_index,
+            address_index,
+            gas_price_index,
+            sender_nonce_index,
             &mut seen_txs,
-        )?;
-        tx_payloads.push(payload);
+        )?);
     }
 
     let mut block_records = Vec::with_capacity(input.blocks.len());
@@ -126,12 +96,17 @@ pub fn encode_packet(input: &PacketInput) -> Result<Vec<u8>> {
             flags,
             tx_segment_offset,
             input,
-            &address_index,
-            &difficulty_index,
+            address_index,
+            difficulty_index,
         )?);
     }
+    Ok((block_records, tx_segment))
+}
 
-    let prefix_size = choose_prefix_size(&block_records);
+/// Lay the block records into the fixed-size prefix area, spilling the bytes
+/// past `prefix_size` into an overflow tail and recording which records
+/// overflowed in the returned extension bitmap.
+fn pack_block_body(block_records: &[Vec<u8>], prefix_size: usize) -> (Vec<u8>, Vec<u8>) {
     let block_count = block_records.len();
     let mut extension_bitmap = vec![0u8; (block_count + 7) / 8];
     let mut block_body = Vec::with_capacity(block_count * prefix_size);
@@ -150,7 +125,19 @@ pub fn encode_packet(input: &PacketInput) -> Result<Vec<u8>> {
         }
     }
     block_body.extend_from_slice(&overflow);
+    (block_body, extension_bitmap)
+}
 
+/// Write the fixed header, the interned tables, the block body, and the tx
+/// segment into the final buffer, then backfill the section offset table.
+fn assemble_packet(
+    input: &Packet,
+    prefix_size: usize,
+    block_count: usize,
+    extension_bitmap: &[u8],
+    block_body: &[u8],
+    tx_segment: &[u8],
+) -> Result<Vec<u8>> {
     let mut out = vec![0u8; HEADER_LEN];
     out[0..32].copy_from_slice(input.prev_last_hash.as_bytes());
     out[32..64].copy_from_slice(input.prev_last_deferred_state_root.as_bytes());
@@ -186,13 +173,13 @@ pub fn encode_packet(input: &PacketInput) -> Result<Vec<u8>> {
     align_to(&mut out, 32);
     offsets.push(out.len());
     put_u32_le(&mut out, block_count as u32);
-    out.extend_from_slice(&extension_bitmap);
+    out.extend_from_slice(extension_bitmap);
     align_to(&mut out, 32);
     offsets.push(out.len());
-    out.extend_from_slice(&block_body);
+    out.extend_from_slice(block_body);
     align_to(&mut out, 64);
     offsets.push(out.len());
-    out.extend_from_slice(&tx_segment);
+    out.extend_from_slice(tx_segment);
 
     ensure!(
         offsets.len() == HEADER_OFFSET_COUNT,
@@ -206,7 +193,7 @@ pub fn encode_packet(input: &PacketInput) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn validate_input(input: &PacketInput) -> Result<()> {
+fn validate_input(input: &Packet) -> Result<()> {
     ensure!(!input.blocks.is_empty(), "packet has no blocks");
     ensure!(
         matches!(input.blocks.first().map(|b| b.epoch), Some(e) if e + PACKET_EPOCHS >= e),
@@ -244,10 +231,10 @@ fn validate_input(input: &PacketInput) -> Result<()> {
 }
 
 fn encode_block_record(
-    block: &BlockInput,
+    block: &Block,
     flags: u8,
     tx_segment_offset: u64,
-    input: &PacketInput,
+    input: &Packet,
     address_index: &HashMap<Address, usize>,
     difficulty_index: &HashMap<U256, usize>,
 ) -> Result<Vec<u8>> {
@@ -306,7 +293,7 @@ fn encode_block_record(
 }
 
 fn encode_tx_payload(
-    block: &BlockInput,
+    block: &Block,
     address_index: &HashMap<Address, usize>,
     gas_price_index: &HashMap<U256, usize>,
     sender_nonce_index: &HashMap<usize, u64>,
@@ -478,172 +465,4 @@ fn index_u256(values: &[U256]) -> HashMap<U256, usize> {
         .enumerate()
         .map(|(i, v)| (v, i))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        decode::decode_packet, raw::encode_raw_data, validate::validate_replay_packet,
-        verify::verify_packet,
-    };
-    use cfx_types::AddressSpaceUtil;
-    use primitives::transaction::NativeTransaction;
-
-    #[test]
-    fn raw_to_packet_roundtrip_minimal_blocks() {
-        let author = Address::from_low_u64_be(1);
-        let raw = PacketInput {
-            prev_last_hash: H256::from_low_u64_be(9),
-            prev_last_deferred_state_root: H256::from_low_u64_be(10),
-            first_block_number: 100,
-            min_timestamp: 1_700_000_000,
-            min_height: 42,
-            min_pos_height: 0,
-            addresses: vec![author],
-            pos_entries: Vec::new(),
-            difficulties: vec![U256::from(1000)],
-            sender_base_nonces: Vec::new(),
-            gas_prices: Vec::new(),
-            blocks: vec![
-                BlockInput {
-                    epoch: 45,
-                    index: 0,
-                    hash: H256::from_low_u64_be(11),
-                    deferred_state_root: H256::from_low_u64_be(12),
-                    deferred_receipts_root: H256::from_low_u64_be(13),
-                    deferred_logs_bloom_hash: H256::from_low_u64_be(14),
-                    flags: FLAG_ADAPTIVE,
-                    author,
-                    timestamp: 1_700_000_000,
-                    difficulty: U256::from(1000),
-                    gas_limit: U256::from(30_000_000),
-                    base_price_core: U256::zero(),
-                    base_price_espace: U256::zero(),
-                    height: 42,
-                    blame: 0,
-                    finalized_epoch: 0,
-                    base_reward: U256::from(1),
-                    transactions: Vec::new(),
-                    transaction_refs: Vec::new(),
-                },
-                BlockInput {
-                    epoch: 45,
-                    index: 1,
-                    hash: H256::from_low_u64_be(15),
-                    deferred_state_root: H256::from_low_u64_be(16),
-                    deferred_receipts_root: H256::from_low_u64_be(17),
-                    deferred_logs_bloom_hash: H256::from_low_u64_be(18),
-                    flags: FLAG_PIVOT | FLAG_ESPACE,
-                    author,
-                    timestamp: 1_700_000_005,
-                    difficulty: U256::from(1000),
-                    gas_limit: U256::from(60_000_000),
-                    base_price_core: U256::from(1_000_000_000),
-                    base_price_espace: U256::from(20_000_000_000u64),
-                    height: 45,
-                    blame: 1,
-                    finalized_epoch: 5,
-                    base_reward: U256::from(2),
-                    transactions: Vec::new(),
-                    transaction_refs: Vec::new(),
-                },
-            ],
-        };
-
-        let packet = encode_raw_data(&raw).expect("encode raw packet");
-        let report = verify_packet(&packet).expect("verify packet");
-        assert_eq!(report.block_count, 2);
-        assert_eq!(report.transaction_blocks, 0);
-        assert_eq!(report.first_block_number, 100);
-        assert!(matches!(report.block_prefix_size, 64 | 72 | 80 | 88 | 96));
-
-        let decoded = decode_packet(&packet).expect("decode packet");
-        assert_eq!(decoded.blocks[0].height, 42);
-        assert_eq!(decoded.blocks[0].epoch, 45);
-        assert_eq!(decoded.blocks[1].height, 45);
-        assert_eq!(decoded.blocks[1].epoch, 45);
-        let reencoded = encode_packet(&decoded).expect("reencode decoded packet");
-        assert_eq!(reencoded, packet);
-        let reencoded_report = verify_packet(&reencoded).expect("verify reencoded packet");
-        assert_eq!(reencoded_report.block_count, report.block_count);
-        assert_eq!(reencoded_report.transaction_items, report.transaction_items);
-        let replay = validate_replay_packet(&packet).expect("validate replay plan");
-        assert_eq!(replay.epoch_count, 1);
-        assert_eq!(replay.block_count, 2);
-        assert_eq!(replay.transaction_count, 0);
-    }
-
-    #[test]
-    fn raw_to_packet_roundtrip_with_transaction_payload() {
-        let author = Address::from_low_u64_be(1);
-        let sender = Address::from_low_u64_be(2);
-        let receiver = Address::from_low_u64_be(3);
-        let tx = NativeTransaction {
-            nonce: U256::from(7),
-            gas_price: U256::from(1_000_000_000u64),
-            gas: U256::from(21_000),
-            action: Action::Call(receiver),
-            value: U256::from(42),
-            storage_limit: 0,
-            epoch_height: 1000,
-            chain_id: 1029,
-            data: Vec::new().into(),
-        }
-        .fake_sign(sender.with_native_space());
-
-        let raw = PacketInput {
-            prev_last_hash: H256::from_low_u64_be(9),
-            prev_last_deferred_state_root: H256::from_low_u64_be(10),
-            first_block_number: 1000,
-            min_timestamp: 1_700_000_000,
-            min_height: 1000,
-            min_pos_height: 0,
-            addresses: vec![author, sender, receiver],
-            pos_entries: Vec::new(),
-            difficulties: vec![U256::from(1000)],
-            sender_base_nonces: Vec::new(),
-            gas_prices: vec![U256::from(1_000_000_000u64)],
-            blocks: vec![BlockInput {
-                epoch: 1000,
-                index: 0,
-                hash: H256::from_low_u64_be(11),
-                deferred_state_root: H256::from_low_u64_be(12),
-                deferred_receipts_root: H256::from_low_u64_be(13),
-                deferred_logs_bloom_hash: H256::from_low_u64_be(14),
-                flags: FLAG_PIVOT,
-                author,
-                timestamp: 1_700_000_000,
-                difficulty: U256::from(1000),
-                gas_limit: U256::from(30_000_000),
-                base_price_core: U256::from(1_000_000_000u64),
-                base_price_espace: U256::zero(),
-                height: 1000,
-                blame: 0,
-                finalized_epoch: 0,
-                base_reward: U256::from(1),
-                transactions: vec![tx],
-                transaction_refs: Vec::new(),
-            }],
-        };
-
-        let packet = encode_raw_data(&raw).expect("encode tx packet");
-        let report = verify_packet(&packet).expect("verify tx packet");
-        assert_eq!(report.block_count, 1);
-        assert_eq!(report.transaction_blocks, 1);
-        assert_eq!(report.transaction_items, 1);
-
-        let decoded = decode_packet(&packet).expect("decode tx packet");
-        assert_eq!(decoded.blocks[0].transactions.len(), 1);
-        let reencoded = encode_packet(&decoded).expect("reencode tx packet");
-        assert_eq!(reencoded, packet);
-        let reencoded_report = verify_packet(&reencoded).expect("verify reencoded tx packet");
-        assert_eq!(reencoded_report.transaction_blocks, 1);
-        assert_eq!(reencoded_report.transaction_items, 1);
-        let replay = validate_replay_packet(&packet).expect("validate tx replay plan");
-        assert_eq!(replay.epoch_count, 1);
-        assert_eq!(replay.transaction_count, 1);
-        assert_eq!(replay.native_transaction_count, 1);
-        assert_eq!(replay.espace_transaction_count, 0);
-    }
 }

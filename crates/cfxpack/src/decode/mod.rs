@@ -1,24 +1,20 @@
-use crate::{
-    codec::{read_qc5e, read_qc8, read_u32_le, read_u64_le, read_uleb128},
-    packet::{
-        BlockInput, PacketInput, PosLookupEntry, SenderBaseNonce, FLAG_HAS_TRANSACTIONS,
-        FLAG_PIVOT, FLAG_TX_COMPRESSED, HEADER_FIXED_LEN, HEADER_LEN, HEADER_OFFSET_COUNT,
-    },
+//! `.cfxpack` decoder: parse a packet back into a [`Packet`]. The header,
+//! interned tables, and fixed-size block prefix records are decoded here; the
+//! transaction segment is decoded in [`tx`].
+
+use crate::codec::{read_qc5e, read_qc8, read_u32_le, read_u64_le, read_uleb128};
+use crate::packet::{
+    Block, Packet, PosLookupEntry, SenderBaseNonce, FLAG_HAS_TRANSACTIONS, FLAG_PIVOT,
+    HEADER_FIXED_LEN, HEADER_LEN, HEADER_OFFSET_COUNT,
 };
 use anyhow::{anyhow, ensure, Context, Result};
-use cfx_types::{Address, AddressSpaceUtil, H256, U256};
-use primitives::{
-    transaction::{
-        Cip1559Transaction, Cip2930Transaction, Eip1559Transaction, Eip155Transaction,
-        Eip2930Transaction, Eip7702Transaction, EthereumTransaction, NativeTransaction,
-        TypedNativeTransaction,
-    },
-    AccessListItem, Action, AuthorizationListItem, SignedTransaction,
-};
-use rlp::Rlp;
-use snap::raw::Decoder as SnapDecoder;
+use cfx_types::{Address, H256, U256};
+use primitives::SignedTransaction;
 
-pub fn decode_packet(data: &[u8]) -> Result<PacketInput> {
+mod tx;
+use tx::decode_tx_payload;
+
+pub fn decode_packet(data: &[u8]) -> Result<Packet> {
     ensure!(data.len() >= HEADER_LEN, "packet shorter than header");
     let prev_last_hash = H256::from_slice(&data[0..32]);
     let prev_last_deferred_state_root = H256::from_slice(&data[32..64]);
@@ -78,7 +74,7 @@ pub fn decode_packet(data: &[u8]) -> Result<PacketInput> {
         decoded_txs[index] = block.transactions.clone();
     }
 
-    Ok(PacketInput {
+    Ok(Packet {
         prev_last_hash,
         prev_last_deferred_state_root,
         first_block_number,
@@ -155,7 +151,7 @@ fn decode_block_record(
     min_height: u64,
     addresses: &[Address],
     difficulties: &[U256],
-) -> Result<BlockInput> {
+) -> Result<Block> {
     ensure!(record.len() >= 45, "block record too short");
     let hash = H256::from_slice(&record[0..32]);
     let deferred_state_root = h256_prefix(&record[32..36]);
@@ -174,7 +170,7 @@ fn decode_block_record(
     let finalized_epoch = read_uleb128(record, &mut offset)?;
     let _tx_segment_offset = read_uleb128(record, &mut offset)?;
     let base_reward = read_qc8(record, &mut offset)?;
-    Ok(BlockInput {
+    Ok(Block {
         epoch: 0,
         index,
         hash,
@@ -197,7 +193,7 @@ fn decode_block_record(
     })
 }
 
-fn assign_epoch_from_pivots(blocks: &mut [BlockInput]) -> Result<()> {
+fn assign_epoch_from_pivots(blocks: &mut [Block]) -> Result<()> {
     let mut group_start = 0usize;
     while group_start < blocks.len() {
         let Some(relative_pivot) = blocks[group_start..]
@@ -216,192 +212,6 @@ fn assign_epoch_from_pivots(blocks: &mut [BlockInput]) -> Result<()> {
         group_start = pivot_index + 1;
     }
     Ok(())
-}
-
-fn decode_tx_payload(
-    data: &[u8],
-    tx_segment_offset: usize,
-    tx_offset_units: u64,
-    flags: u8,
-    block_epoch: u64,
-    addresses: &[Address],
-    gas_prices: &[U256],
-    sender_base_nonces: &[SenderBaseNonce],
-    previous_blocks: &[Vec<SignedTransaction>],
-) -> Result<(Vec<SignedTransaction>, Vec<Option<(usize, usize)>>)> {
-    let absolute = tx_segment_offset + tx_offset_units as usize * 4;
-    ensure!(absolute < data.len(), "tx payload offset out of bounds");
-    let mut offset = absolute;
-    let payload_len = read_uleb128(data, &mut offset)? as usize;
-    ensure!(
-        offset + payload_len <= data.len(),
-        "tx payload exceeds packet"
-    );
-    let payload = &data[offset..offset + payload_len];
-    let decoded = if flags & FLAG_TX_COMPRESSED != 0 {
-        SnapDecoder::new()
-            .decompress_vec(payload)
-            .context("snappy-decompress tx payload")?
-    } else {
-        payload.to_vec()
-    };
-    let rlp = Rlp::new(&decoded);
-    let mut out = Vec::new();
-    let mut refs = Vec::new();
-    for i in 0..rlp.item_count()? {
-        let item = rlp.at(i)?;
-        let marker: u8 = item.val_at(0)?;
-        if marker == 1 {
-            let block_index: usize = item.val_at::<u64>(1)? as usize;
-            let tx_index: usize = item.val_at::<u64>(2)? as usize;
-            out.push(
-                previous_blocks
-                    .get(block_index)
-                    .and_then(|b| b.get(tx_index))
-                    .ok_or_else(|| anyhow!("duplicate tx reference out of range"))?
-                    .clone(),
-            );
-            refs.push(Some((block_index, tx_index)));
-        } else {
-            out.push(decode_tx_item(
-                &item,
-                block_epoch,
-                addresses,
-                gas_prices,
-                sender_base_nonces,
-            )?);
-            refs.push(None);
-        }
-    }
-    Ok((out, refs))
-}
-
-fn decode_tx_item(
-    item: &Rlp,
-    block_epoch: u64,
-    addresses: &[Address],
-    gas_prices: &[U256],
-    sender_base_nonces: &[SenderBaseNonce],
-) -> Result<SignedTransaction> {
-    let space_marker: u8 = item.val_at(0)?;
-    let type_id: u64 = item.val_at(1)?;
-    let sender_index = item.val_at::<u64>(2)? as usize;
-    let sender = table_get(addresses, sender_index)?;
-    let base_nonce = sender_base_nonces
-        .iter()
-        .find(|entry| entry.sender_index == sender_index)
-        .map(|entry| entry.base_nonce)
-        .unwrap_or(0);
-    let nonce = U256::from(base_nonce + item.val_at::<u64>(3)?);
-    let gas_price = decode_price(&item.at(4)?, gas_prices)?;
-    let priority_price = decode_price(&item.at(5)?, gas_prices)?;
-    let gas = U256::from(item.val_at::<u64>(6)?);
-    let action = decode_action(&item.at(7)?, addresses)?;
-    let value = decode_u256_bytes(item.val_at::<Vec<u8>>(8)?)?;
-
-    match space_marker {
-        0 => {
-            let storage_limit = item.val_at(9)?;
-            let epoch_delta: u64 = item.val_at(10)?;
-            let data = item.val_at::<Vec<u8>>(11)?.into();
-            let access_list = optional_list::<AccessListItem>(item, 12)?;
-            let epoch_height = block_epoch + epoch_delta;
-            let tx = match type_id {
-                0 => TypedNativeTransaction::Cip155(NativeTransaction {
-                    nonce,
-                    gas_price,
-                    gas,
-                    action,
-                    value,
-                    storage_limit,
-                    epoch_height,
-                    chain_id: 0,
-                    data,
-                }),
-                1 => TypedNativeTransaction::Cip2930(Cip2930Transaction {
-                    nonce,
-                    gas_price,
-                    gas,
-                    action,
-                    value,
-                    storage_limit,
-                    epoch_height,
-                    chain_id: 0,
-                    data,
-                    access_list,
-                }),
-                2 => TypedNativeTransaction::Cip1559(Cip1559Transaction {
-                    nonce,
-                    max_priority_fee_per_gas: priority_price,
-                    max_fee_per_gas: gas_price,
-                    gas,
-                    action,
-                    value,
-                    storage_limit,
-                    epoch_height,
-                    chain_id: 0,
-                    data,
-                    access_list,
-                }),
-                _ => return Err(anyhow!("unsupported native tx type {type_id}")),
-            };
-            Ok(tx.fake_sign_rpc(sender.with_native_space()))
-        }
-        2 => {
-            let data = item.val_at::<Vec<u8>>(9)?.into();
-            let access_list = optional_list::<AccessListItem>(item, 10)?;
-            let tx = match type_id {
-                0 => EthereumTransaction::Eip155(Eip155Transaction {
-                    nonce,
-                    gas_price,
-                    gas,
-                    action,
-                    value,
-                    chain_id: None,
-                    data,
-                }),
-                1 => EthereumTransaction::Eip2930(Eip2930Transaction {
-                    chain_id: 0,
-                    nonce,
-                    gas_price,
-                    gas,
-                    action,
-                    value,
-                    data,
-                    access_list,
-                }),
-                2 => EthereumTransaction::Eip1559(Eip1559Transaction {
-                    chain_id: 0,
-                    nonce,
-                    max_priority_fee_per_gas: priority_price,
-                    max_fee_per_gas: gas_price,
-                    gas,
-                    action,
-                    value,
-                    data,
-                    access_list,
-                }),
-                4 => EthereumTransaction::Eip7702(Eip7702Transaction {
-                    chain_id: 0,
-                    nonce,
-                    max_priority_fee_per_gas: priority_price,
-                    max_fee_per_gas: gas_price,
-                    gas,
-                    destination: match action {
-                        Action::Call(address) => address,
-                        Action::Create => Address::zero(),
-                    },
-                    value,
-                    data,
-                    access_list,
-                    authorization_list: optional_list::<AuthorizationListItem>(item, 11)?,
-                }),
-                _ => return Err(anyhow!("unsupported ethereum tx type {type_id}")),
-            };
-            Ok(tx.fake_sign_rpc(sender.with_evm_space()))
-        }
-        _ => Err(anyhow!("unsupported tx space marker {space_marker}")),
-    }
 }
 
 fn peek_tx_offset_units(record: &[u8]) -> Result<u64> {
@@ -452,41 +262,12 @@ fn decode_sender_base_nonces(data: &[u8]) -> Result<Vec<SenderBaseNonce>> {
     Ok(out)
 }
 
-fn decode_price(item: &Rlp, gas_prices: &[U256]) -> Result<U256> {
-    let mode: u8 = item.val_at(0)?;
-    match mode {
-        0 => table_get(gas_prices, item.val_at::<u64>(1)? as usize),
-        1 => decode_u256_bytes(item.val_at::<Vec<u8>>(1)?),
-        _ => Err(anyhow!("invalid gas price mode {mode}")),
-    }
-}
-
-fn decode_action(item: &Rlp, addresses: &[Address]) -> Result<Action> {
-    let mode: u8 = item.val_at(0)?;
-    match mode {
-        0 => Ok(Action::Create),
-        1 => Ok(Action::Call(table_get(
-            addresses,
-            item.val_at::<u64>(1)? as usize,
-        )?)),
-        _ => Err(anyhow!("invalid action mode {mode}")),
-    }
-}
-
-fn optional_list<T: rlp::Decodable>(item: &Rlp, index: usize) -> Result<Vec<T>> {
-    if item.item_count()? > index {
-        item.list_at(index).map_err(Into::into)
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-fn decode_u256_bytes(bytes: Vec<u8>) -> Result<U256> {
+pub(super) fn decode_u256_bytes(bytes: Vec<u8>) -> Result<U256> {
     ensure!(bytes.len() <= 32, "U256 byte value exceeds 32 bytes");
     Ok(U256::from_big_endian(&bytes))
 }
 
-fn table_get<T: Copy>(table: &[T], index: usize) -> Result<T> {
+pub(super) fn table_get<T: Copy>(table: &[T], index: usize) -> Result<T> {
     table
         .get(index)
         .copied()

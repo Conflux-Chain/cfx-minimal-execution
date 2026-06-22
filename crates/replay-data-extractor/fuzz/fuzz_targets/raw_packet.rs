@@ -1,9 +1,8 @@
 #![no_main]
 
-use cfx_replay_data_extractor::{
-    packet::{BlockInput, PacketInput, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT},
-    raw::encode_raw_data,
-    validate::validate_replay_packet,
+use cfx_replay_data_extractor::validate::validate_replay_packet;
+use cfxpack::{
+    packet::{encode_packet, Block, Packet, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT},
     verify::verify_packet,
 };
 use cfx_types::{Address, H256, U256};
@@ -22,7 +21,7 @@ fuzz_target!(|data: &[u8]| {
     let mut blocks = Vec::with_capacity(block_count);
     for i in 0..block_count {
         let b = data.get(5 + i).copied().unwrap_or(0);
-        blocks.push(BlockInput {
+        blocks.push(Block {
             epoch,
             index: i,
             hash: H256::from_low_u64_be(100 + i as u64),
@@ -46,7 +45,7 @@ fuzz_target!(|data: &[u8]| {
         });
     }
 
-    let raw = PacketInput {
+    let raw = Packet {
         prev_last_hash: H256::from_low_u64_be(1),
         prev_last_deferred_state_root: H256::from_low_u64_be(2),
         first_block_number: 1,
@@ -60,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
         gas_prices: Vec::new(),
         blocks,
     };
-    if let Ok(packet) = encode_raw_data(&raw) {
+    if let Ok(packet) = encode_packet(&raw) {
         let verify = verify_packet(&packet).unwrap();
         let replay = validate_replay_packet(&packet).unwrap();
         assert_eq!(verify.block_count as usize, replay.block_count);

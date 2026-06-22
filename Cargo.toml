@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cfxpack",
     "crates/minimal-mpt",
     "crates/replay-data-extractor",
 ]

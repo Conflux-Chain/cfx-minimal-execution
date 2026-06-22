@@ -103,7 +103,7 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(key) = entry.key.to_storage_key() {
             let canonical = key.to_key_bytes().unwrap();
             let raw = key
-                .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis())
+                .to_delta_mpt_key_bytes(&DeltaMptKeyPadding::genesis(), None)
                 .unwrap();
             let value = if entry.tombstone {
                 ModelValue {
@@ -135,7 +135,7 @@ fuzz_target!(|data: &[u8]| {
                 if let Ok(key) = key.to_storage_key() {
                     let canonical = key.to_key_bytes().unwrap();
                     let raw_key = key
-                        .to_delta_mpt_key_bytes(&model.delta_padding)
+                        .to_delta_mpt_key_bytes(&model.delta_padding, None)
                         .unwrap();
                     let value = normalize_value(value);
                     state.set(key, value.clone().into_boxed_slice()).unwrap();
@@ -152,7 +152,7 @@ fuzz_target!(|data: &[u8]| {
                 if let Ok(key) = key.to_storage_key() {
                     let canonical = key.to_key_bytes().unwrap();
                     let raw_key = key
-                        .to_delta_mpt_key_bytes(&model.delta_padding)
+                        .to_delta_mpt_key_bytes(&model.delta_padding, None)
                         .unwrap();
                     state.set(key, Box::new([])).unwrap();
                     model.delta.insert(
@@ -254,10 +254,10 @@ impl Model {
     fn prefix_get(&self, prefix: &StorageKeyWithSpace) -> Option<Vec<MptKeyValue>> {
         let canonical_prefix = prefix.to_key_bytes().unwrap();
         let delta_prefix = prefix
-            .to_delta_mpt_key_bytes(&self.delta_padding)
+            .to_delta_mpt_key_bytes(&self.delta_padding, None)
             .unwrap();
         let intermediate_prefix = prefix
-            .to_delta_mpt_key_bytes(&self.intermediate_padding)
+            .to_delta_mpt_key_bytes(&self.intermediate_padding, None)
             .unwrap();
         let address_prefix = address_prefix(prefix);
         let mut seen = BTreeSet::new();
@@ -303,10 +303,10 @@ impl Model {
     fn prefix_delete(&mut self, prefix: &StorageKeyWithSpace) -> Option<Vec<MptKeyValue>> {
         let canonical_prefix = prefix.to_key_bytes().unwrap();
         let delta_prefix = prefix
-            .to_delta_mpt_key_bytes(&self.delta_padding)
+            .to_delta_mpt_key_bytes(&self.delta_padding, None)
             .unwrap();
         let intermediate_prefix = prefix
-            .to_delta_mpt_key_bytes(&self.intermediate_padding)
+            .to_delta_mpt_key_bytes(&self.intermediate_padding, None)
             .unwrap();
         let address_prefix = address_prefix(prefix);
         let mut seen = BTreeSet::new();
@@ -346,7 +346,7 @@ impl Model {
                     key.clone(),
                     ModelValue {
                         raw_key: storage_key
-                            .to_delta_mpt_key_bytes(&self.delta_padding)
+                            .to_delta_mpt_key_bytes(&self.delta_padding, None)
                             .unwrap(),
                         value: None,
                     },
@@ -372,7 +372,7 @@ impl Model {
                 key.clone(),
                 ModelValue {
                         raw_key: storage_key
-                        .to_delta_mpt_key_bytes(&self.delta_padding)
+                        .to_delta_mpt_key_bytes(&self.delta_padding, None)
                         .unwrap(),
                     value: None,
                 },

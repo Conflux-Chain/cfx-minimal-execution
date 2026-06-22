@@ -7,7 +7,7 @@ WORKSPACE_ROOT="$(cd "$CRATE_ROOT/../.." && pwd)"
 
 cd "$WORKSPACE_ROOT"
 cargo fmt --all -- --check
-cargo test -p cfx-minimal-mpt --all-targets
+cargo test -p cfx-minimal-mpt --all-targets --release
 "$CRATE_ROOT/scripts/coverage_fuzz_layered.sh"
 "$CRATE_ROOT/scripts/run_oracle_compare.sh"
 

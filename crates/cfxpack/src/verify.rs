@@ -64,7 +64,41 @@ pub fn verify_packet(data: &[u8]) -> Result<VerifyReport> {
         block_body_offset + prefix_total <= tx_segment_offset,
         "block prefix area exceeds tx segment"
     );
-    let mut overflow_offset = block_body_offset + prefix_total;
+    let block_records = collect_block_records(
+        data,
+        block_body_offset,
+        tx_segment_offset,
+        block_count,
+        prefix_size,
+        bitmap,
+    )?;
+    let (transaction_blocks, transaction_items) =
+        count_transactions(data, &block_records, tx_segment_offset)?;
+
+    Ok(VerifyReport {
+        packet_bytes: data.len(),
+        first_block_number,
+        min_timestamp,
+        min_height,
+        min_pos_height,
+        block_prefix_size,
+        block_count: block_count as u32,
+        transaction_blocks,
+        transaction_items,
+    })
+}
+
+/// Reassemble each block's full record from its fixed-size prefix plus, for the
+/// records the extension bitmap marks, its overflow tail.
+fn collect_block_records(
+    data: &[u8],
+    block_body_offset: usize,
+    tx_segment_offset: usize,
+    block_count: usize,
+    prefix_size: usize,
+    bitmap: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    let mut overflow_offset = block_body_offset + block_count * prefix_size;
     let mut block_records = Vec::with_capacity(block_count);
     for index in 0..block_count {
         let mut record = data[block_body_offset + index * prefix_size
@@ -85,10 +119,20 @@ pub fn verify_packet(data: &[u8]) -> Result<VerifyReport> {
         overflow_offset <= tx_segment_offset,
         "block overflow parser passed tx segment"
     );
+    Ok(block_records)
+}
 
+/// Count transaction-bearing blocks and total transaction items, walking each
+/// block record to its tx segment offset and reading the (possibly compressed)
+/// RLP payload's item count.
+fn count_transactions(
+    data: &[u8],
+    block_records: &[Vec<u8>],
+    tx_segment_offset: usize,
+) -> Result<(u32, u32)> {
     let mut transaction_blocks = 0u32;
     let mut transaction_items = 0u32;
-    for record in &block_records {
+    for record in block_records {
         ensure!(record.len() >= 45, "block record too short");
         let flags = record[44];
         if flags & FLAG_HAS_TRANSACTIONS == 0 {
@@ -125,18 +169,7 @@ pub fn verify_packet(data: &[u8]) -> Result<VerifyReport> {
         let rlp = rlp::Rlp::new(&decoded);
         transaction_items += rlp.item_count().context("decode tx payload RLP")? as u32;
     }
-
-    Ok(VerifyReport {
-        packet_bytes: data.len(),
-        first_block_number,
-        min_timestamp,
-        min_height,
-        min_pos_height,
-        block_prefix_size,
-        block_count: block_count as u32,
-        transaction_blocks,
-        transaction_items,
-    })
+    Ok((transaction_blocks, transaction_items))
 }
 
 fn read_offsets(data: &[u8]) -> Result<[usize; HEADER_OFFSET_COUNT]> {

@@ -1,5 +1,5 @@
-use crate::decode::decode_packet;
 use anyhow::{Context, Result};
+use cfxpack::decode::decode_packet;
 use crossbeam_channel::unbounded;
 use std::{
     path::{Path, PathBuf},
