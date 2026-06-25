@@ -15,6 +15,10 @@ mod tx;
 use tx::decode_tx_payload;
 
 pub fn decode_packet(data: &[u8]) -> Result<Packet> {
+    decode_packet_ext(data, u64::MAX)
+}
+
+pub fn decode_packet_ext(data: &[u8], pos_reference_enable_height: u64) -> Result<Packet> {
     ensure!(data.len() >= HEADER_LEN, "packet shorter than header");
     let prev_last_hash = H256::from_slice(&data[0..32]);
     let prev_last_deferred_state_root = H256::from_slice(&data[32..64]);
@@ -47,6 +51,8 @@ pub fn decode_packet(data: &[u8]) -> Result<Packet> {
             index,
             min_timestamp,
             min_height,
+            min_pos_height,
+            pos_reference_enable_height,
             &addresses,
             &difficulties,
         )?;
@@ -57,7 +63,7 @@ pub fn decode_packet(data: &[u8]) -> Result<Packet> {
 
     for (index, (record, block)) in block_records.iter().zip(blocks.iter_mut()).enumerate() {
         if block.flags & FLAG_HAS_TRANSACTIONS != 0 {
-            let (transactions, transaction_refs) = decode_tx_payload(
+            let (transactions, transaction_refs, pos_rewards) = decode_tx_payload(
                 data,
                 offsets[7],
                 record.tx_offset_units,
@@ -70,6 +76,7 @@ pub fn decode_packet(data: &[u8]) -> Result<Packet> {
             )?;
             block.transactions = transactions;
             block.transaction_refs = transaction_refs;
+            block.pos_rewards = pos_rewards;
         }
         decoded_txs[index] = block.transactions.clone();
     }
@@ -149,6 +156,8 @@ fn decode_block_record(
     index: usize,
     min_timestamp: u64,
     min_height: u64,
+    min_pos_height: u64,
+    pos_reference_enable_height: u64,
     addresses: &[Address],
     difficulties: &[U256],
 ) -> Result<Block> {
@@ -170,6 +179,11 @@ fn decode_block_record(
     let finalized_epoch = read_uleb128(record, &mut offset)?;
     let _tx_segment_offset = read_uleb128(record, &mut offset)?;
     let base_reward = read_qc8(record, &mut offset)?;
+    let pos_view = if height >= pos_reference_enable_height {
+        Some(min_pos_height + read_uleb128(record, &mut offset)?)
+    } else {
+        None
+    };
     Ok(Block {
         epoch: 0,
         index,
@@ -190,6 +204,8 @@ fn decode_block_record(
         base_reward,
         transactions: Vec::new(),
         transaction_refs: Vec::new(),
+        pos_rewards: Vec::new(),
+        pos_view,
     })
 }
 

@@ -3,10 +3,10 @@
 //! gas-price / address / sender-nonce tables.
 
 use super::{decode_u256_bytes, table_get};
-use crate::codec::read_uleb128;
-use crate::packet::{SenderBaseNonce, FLAG_TX_COMPRESSED};
+use crate::codec::{read_uleb128, zigzag_decode};
+use crate::packet::{PosRewardAccount, PosRewardEntry, SenderBaseNonce, FLAG_TX_COMPRESSED};
 use anyhow::{anyhow, ensure, Context, Result};
-use cfx_types::{Address, AddressSpaceUtil, U256};
+use cfx_types::{Address, AddressSpaceUtil, H256, U256};
 use primitives::{
     transaction::{
         Cip1559Transaction, Cip2930Transaction, Eip1559Transaction, Eip155Transaction,
@@ -29,7 +29,11 @@ pub(super) fn decode_tx_payload(
     gas_prices: &[U256],
     sender_base_nonces: &[SenderBaseNonce],
     previous_blocks: &[Vec<SignedTransaction>],
-) -> Result<(Vec<SignedTransaction>, Vec<Option<(usize, usize)>>)> {
+) -> Result<(
+    Vec<SignedTransaction>,
+    Vec<Option<(usize, usize)>>,
+    Vec<PosRewardEntry>,
+)> {
     let absolute = tx_segment_offset + tx_offset_units as usize * 4;
     ensure!(absolute < data.len(), "tx payload offset out of bounds");
     let mut offset = absolute;
@@ -49,6 +53,7 @@ pub(super) fn decode_tx_payload(
     let rlp = Rlp::new(&decoded);
     let mut out = Vec::new();
     let mut refs = Vec::new();
+    let mut pos_rewards = Vec::new();
     for i in 0..rlp.item_count()? {
         let item = rlp.at(i)?;
         let marker: u8 = item.val_at(0)?;
@@ -63,6 +68,10 @@ pub(super) fn decode_tx_payload(
                     .clone(),
             );
             refs.push(Some((block_index, tx_index)));
+        } else if marker == 3 {
+            // PoS interest distribution (tag 3), not a transaction — collected
+            // separately and applied at epoch settlement. See encode/append_pos_reward.
+            pos_rewards.push(decode_pos_reward(&item)?);
         } else {
             out.push(decode_tx_item(
                 &item,
@@ -74,7 +83,32 @@ pub(super) fn decode_tx_payload(
             refs.push(None);
         }
     }
-    Ok((out, refs))
+    Ok((out, refs, pos_rewards))
+}
+
+/// Decode a tag-3 PoS-reward item: `[3, [[address, pos_identifier, reward], ...],
+/// execution_epoch_hash]`. Mirrors production `PosRewardInfo`.
+fn decode_pos_reward(item: &Rlp) -> Result<PosRewardEntry> {
+    let rewards = item.at(1)?;
+    let mut account_rewards = Vec::with_capacity(rewards.item_count()?);
+    for j in 0..rewards.item_count()? {
+        let r = rewards.at(j)?;
+        let addr_bytes = r.val_at::<Vec<u8>>(0)?;
+        ensure!(addr_bytes.len() == 20, "pos reward address not 20 bytes");
+        let id_bytes = r.val_at::<Vec<u8>>(1)?;
+        ensure!(id_bytes.len() == 32, "pos reward identifier not 32 bytes");
+        account_rewards.push(PosRewardAccount {
+            address: Address::from_slice(&addr_bytes),
+            pos_identifier: H256::from_slice(&id_bytes),
+            reward: decode_u256_bytes(r.val_at::<Vec<u8>>(2)?)?,
+        });
+    }
+    let exec_bytes = item.val_at::<Vec<u8>>(2)?;
+    ensure!(exec_bytes.len() == 32, "execution_epoch_hash not 32 bytes");
+    Ok(PosRewardEntry {
+        account_rewards,
+        execution_epoch_hash: H256::from_slice(&exec_bytes),
+    })
 }
 
 fn decode_tx_item(
@@ -142,10 +176,10 @@ fn decode_native_tx(
     value: U256,
 ) -> Result<SignedTransaction> {
     let storage_limit = item.val_at(9)?;
-    let epoch_delta: u64 = item.val_at(10)?;
+    let epoch_delta = zigzag_decode(item.val_at::<u64>(10)?);
     let data = item.val_at::<Vec<u8>>(11)?.into();
     let access_list = optional_list::<AccessListItem>(item, 12)?;
-    let epoch_height = block_epoch + epoch_delta;
+    let epoch_height = (block_epoch as i64).wrapping_add(epoch_delta) as u64;
     let tx = match type_id {
         0 => TypedNativeTransaction::Cip155(NativeTransaction {
             nonce,

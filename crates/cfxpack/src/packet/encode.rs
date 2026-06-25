@@ -8,7 +8,7 @@ use super::{
 };
 use crate::codec::{
     align_to, put_qc5e, put_qc8, put_u32_le, put_uleb128, qc5e_base_price_enum,
-    qc5e_gas_limit_enum, u256_to_be,
+    qc5e_gas_limit_enum, u256_to_be, zigzag_encode,
 };
 use anyhow::{anyhow, ensure, Context, Result};
 use cfx_types::{Address, H256, U256};
@@ -289,6 +289,9 @@ fn encode_block_record(
     put_uleb128(&mut out, block.finalized_epoch);
     put_uleb128(&mut out, tx_segment_offset);
     put_qc8(&mut out, block.base_reward)?;
+    if let Some(pos_view) = block.pos_view {
+        put_uleb128(&mut out, pos_view.saturating_sub(input.min_pos_height));
+    }
     Ok(out)
 }
 
@@ -299,10 +302,10 @@ fn encode_tx_payload(
     sender_nonce_index: &HashMap<usize, u64>,
     seen_txs: &mut HashMap<H256, (usize, usize)>,
 ) -> Result<Vec<u8>> {
-    if block.transactions.is_empty() {
+    if block.transactions.is_empty() && block.pos_rewards.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stream = RlpStream::new_list(block.transactions.len());
+    let mut stream = RlpStream::new_list(block.transactions.len() + block.pos_rewards.len());
     let encoded_refs = (block.transaction_refs.len() == block.transactions.len())
         .then_some(block.transaction_refs.as_slice());
     for (tx_index, tx) in block.transactions.iter().enumerate() {
@@ -332,7 +335,28 @@ fn encode_tx_payload(
             sender_nonce_index,
         )?;
     }
+    // PoS interest distributions (tag 3) trail the transaction items in the same
+    // RLP list; the decoder routes them to `Block::pos_rewards`. See DESIGN §8.8.
+    for entry in &block.pos_rewards {
+        append_pos_reward(&mut stream, entry);
+    }
     Ok(stream.out().to_vec())
+}
+
+/// Encode a PoS-reward item as `[3, [[address, pos_identifier, reward], ...],
+/// execution_epoch_hash]`. Addresses/identifiers are raw bytes (not interned);
+/// `reward` uses the same big-endian-trimmed form as tx values.
+fn append_pos_reward(stream: &mut RlpStream, entry: &super::PosRewardEntry) {
+    stream.begin_list(3);
+    stream.append(&3u8);
+    stream.begin_list(entry.account_rewards.len());
+    for r in &entry.account_rewards {
+        stream.begin_list(3);
+        stream.append(&r.address.as_bytes());
+        stream.append(&r.pos_identifier.as_bytes());
+        stream.append(&u256_to_be(r.reward).as_slice());
+    }
+    stream.append(&entry.execution_epoch_hash.as_bytes());
 }
 
 fn append_tx(
@@ -367,7 +391,10 @@ fn append_tx(
             append_action(stream, tx.action(), address_index)?;
             stream.append(&u256_to_be(*tx.value()).as_slice());
             stream.append(native.storage_limit());
-            stream.append(&epoch_height.abs_diff(block_epoch));
+            // Signed offset (zigzag): epoch_height may be below block_epoch, so
+            // the sign must survive. abs_diff loses it and breaks recovery.
+            let epoch_delta = (epoch_height as i64).wrapping_sub(block_epoch as i64);
+            stream.append(&zigzag_encode(epoch_delta));
             let data: &[u8] = tx.data().as_ref();
             stream.append(&data);
             if let Some(list) = tx.access_list() {

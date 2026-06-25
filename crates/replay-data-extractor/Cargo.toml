@@ -13,8 +13,10 @@ crossbeam-channel = "0.5"
 hex = "0.4"
 rlp = "0.6"
 rocksdb = { git = "https://github.com/Conflux-Chain/rust-rocksdb.git", rev = "672b02bc21874a5e91705f3642dac3614a7a8f9e" }
+serde = { version = "1", features = ["derive"] }
 snap = "1.1"
 thiserror = "2.0"
+toml = "0.8"
 
 # The shared `.cfxpack` wire-format layer. Pins the same conflux git rev as the
 # deps below, so its `primitives`/`cfx-types` unify with this crate's.

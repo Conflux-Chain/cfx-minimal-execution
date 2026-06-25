@@ -1,8 +1,8 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use cfx_types::{Space, H256};
 use cfxpack::packet::{
-    encode_packet, Block, Packet, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT, FLAG_SKIPPED_EXECUTION,
-    FLAG_ZERO_TOTAL_REWARD,
+    encode_packet, Block, Packet, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT,
+    FLAG_SKIPPED_EXECUTION, FLAG_ZERO_TOTAL_REWARD,
 };
 use diem_types::committed_block::CommittedBlock;
 use primitives::{block_header::CIP112_TRANSITION_HEIGHT, BlockHeader, SignedTransaction};
@@ -35,10 +35,44 @@ pub struct ExtractConfig {
     pub data_dir: PathBuf,
     pub start_epoch: u64,
     pub epoch_count: u64,
+    pub chain: ChainParams,
+}
+
+/// Conflux chain parameters that affect field extraction. Loaded from a TOML
+/// config file (see [`ChainParams::from_toml_file`]) rather than a long list of
+/// CLI flags, so a full-chain run carries an auditable, version-controlled set
+/// of mainnet activation heights.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ChainParams {
+    /// espace flag: a pivot block at `height % ratio == 0` carries eSpace txs.
     pub evm_transaction_block_ratio: u64,
-    pub pos_pivot_decision_defer_epoch_count: u64,
+    /// Below this height a block's `pos_reference` is treated as None, so
+    /// `finalized_epoch` is 0. Mainnet: 37400000.
     pub pos_reference_enable_height: u64,
+    /// Height at which the block-header `custom` field encoding is fixed
+    /// (CIP-112). Headers at/after this height decode wrong without it.
+    /// Mainnet: 79050000.
     pub cip112_transition_height: u64,
+}
+
+impl Default for ChainParams {
+    fn default() -> Self {
+        Self {
+            evm_transaction_block_ratio: 5,
+            pos_reference_enable_height: u64::MAX,
+            cip112_transition_height: u64::MAX,
+        }
+    }
+}
+
+impl ChainParams {
+    /// Parse a TOML config file holding the chain parameters.
+    pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read chain config {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse chain config {}", path.display()))
+    }
 }
 
 impl Default for ExtractConfig {
@@ -47,10 +81,7 @@ impl Default for ExtractConfig {
             data_dir: PathBuf::from("data/blockchain_data"),
             start_epoch: 1,
             epoch_count: 2,
-            evm_transaction_block_ratio: 5,
-            pos_pivot_decision_defer_epoch_count: 50,
-            pos_reference_enable_height: u64::MAX,
-            cip112_transition_height: u64::MAX,
+            chain: ChainParams::default(),
         }
     }
 }
@@ -90,7 +121,7 @@ pub fn extract_shards_to_dir(
     ensure!(config.epoch_count > 0, "epoch_count must be positive");
     ensure!(shard_epochs > 0, "shard_epochs must be positive");
     ensure!(jobs > 0, "jobs must be positive");
-    let _ = CIP112_TRANSITION_HEIGHT.set(config.cip112_transition_height);
+    let _ = CIP112_TRANSITION_HEIGHT.set(config.chain.cip112_transition_height);
 
     let output_dir = output_dir.as_ref().to_path_buf();
     std::fs::create_dir_all(&output_dir)
@@ -118,7 +149,7 @@ pub fn extract_packed_to_dir(
     ensure!(shard_epochs > 0, "shard_epochs must be positive");
     ensure!(jobs > 0, "jobs must be positive");
     ensure!(target_bytes > 0, "target_bytes must be positive");
-    let _ = CIP112_TRANSITION_HEIGHT.set(config.cip112_transition_height);
+    let _ = CIP112_TRANSITION_HEIGHT.set(config.chain.cip112_transition_height);
 
     let output_dir = output_dir.as_ref().to_path_buf();
     std::fs::create_dir_all(&output_dir)
@@ -213,7 +244,7 @@ fn extract_raw(
     pos: &PosDb,
 ) -> Result<(Packet, ExtractTiming)> {
     ensure!(config.epoch_count > 0, "epoch_count must be positive");
-    let _ = CIP112_TRANSITION_HEIGHT.set(config.cip112_transition_height);
+    let _ = CIP112_TRANSITION_HEIGHT.set(config.chain.cip112_transition_height);
     let mut timing = ExtractTiming::default();
 
     let epochs = time(&mut timing.load_epochs_ms, || load_epochs(pow, config))?;
@@ -234,13 +265,31 @@ fn extract_raw(
             &block_inputs,
             &pos_blocks,
             min_pos_height,
-            config.pos_reference_enable_height,
+            config.chain.pos_reference_enable_height,
         )
     })?;
 
-    let blocks = time(&mut timing.build_blocks_ms, || {
+    let mut blocks = time(&mut timing.build_blocks_ms, || {
         build_block_inputs(config, pow, &pos_blocks, block_inputs)
     })?;
+
+    // Attach PoS interest distributions (DESIGN §8.8): production stores each in
+    // the reward_by_pos_epoch CF tagged with the pivot hash of the PoW epoch it
+    // was distributed in, so a block whose hash matches gets the entry. Applied
+    // by the executor at that epoch's settlement.
+    let pivots: HashSet<H256> = blocks
+        .iter()
+        .filter(|b| b.flags & FLAG_PIVOT != 0)
+        .map(|b| b.hash)
+        .collect();
+    let pos_rewards = pow.read_pos_rewards(&pivots)?;
+    if !pos_rewards.is_empty() {
+        for block in blocks.iter_mut() {
+            if let Some(entry) = pos_rewards.get(&block.hash) {
+                block.pos_rewards.push(entry.clone());
+            }
+        }
+    }
 
     Ok((
         Packet {
@@ -358,7 +407,7 @@ fn collect_blocks(
             min_timestamp = min_timestamp.min(header.timestamp());
             min_height = min_height.min(header.height());
             if let Some(pos_ref) =
-                effective_pos_reference(&header, config.pos_reference_enable_height)
+                effective_pos_reference(&header, config.chain.pos_reference_enable_height)
             {
                 let committed = pos.get_committed_block(pos_ref)?;
                 min_pos_height = min_pos_height.min(committed.view);
@@ -410,7 +459,7 @@ fn block_flags(
     if pivot {
         flags |= FLAG_PIVOT;
     }
-    if pivot && header.height() % config.evm_transaction_block_ratio == 0 {
+    if pivot && header.height() % config.chain.evm_transaction_block_ratio == 0 {
         flags |= FLAG_ESPACE;
     }
     if skipped.contains(hash) {
@@ -438,9 +487,11 @@ fn build_block_inputs(
             pow,
             pos_blocks,
             &raw,
-            config.pos_pivot_decision_defer_epoch_count,
-            config.pos_reference_enable_height,
+            config.chain.pos_reference_enable_height,
         )?;
+        let pos_view = effective_pos_reference(&raw.header, config.chain.pos_reference_enable_height)
+            .and_then(|pr| pos_blocks.get(pr))
+            .map(|c| c.view);
         blocks.push(Block {
             epoch: raw.epoch,
             index,
@@ -465,6 +516,8 @@ fn build_block_inputs(
             base_reward: raw.reward.base_reward,
             transactions: raw.body.into_iter().map(|tx| (*tx).clone()).collect(),
             transaction_refs: Vec::new(),
+            pos_rewards: Vec::new(),
+            pos_view,
         });
     }
     Ok(blocks)
@@ -487,7 +540,6 @@ fn finalized_epoch_offset(
     pow: &PowDb,
     pos_blocks: &HashMap<H256, CommittedBlock>,
     block: &RawBlock,
-    defer: u64,
     pos_reference_enable_height: u64,
 ) -> Result<u64> {
     let Some(pos_ref) = effective_pos_reference(&block.header, pos_reference_enable_height) else {
@@ -498,8 +550,17 @@ fn finalized_epoch_offset(
         .ok_or_else(|| anyhow!("missing committed block for finalized_epoch"))?;
     let pivot_hash = committed.pivot_decision.block_hash;
     let pivot_header = read_header(pow, &pivot_hash)?;
-    let finalized_height = pivot_header.height().saturating_sub(defer);
-    Ok(block.epoch.saturating_sub(finalized_height))
+    // conflux sets `env.finalized_epoch` directly to the pivot-decision block's
+    // height (see consensus_executor epoch_execution.rs:
+    // `finalized_epoch: pivot_decision_epoch` = `header.height()`), with NO
+    // `pos_pivot_decision_defer_epoch_count` applied at this stage — the defer
+    // was already baked into which block the PoS layer chose as the pivot
+    // decision. We encode the offset the executor inverts (`pivot.epoch -
+    // offset`), so `offset = block.epoch - pd_height`. Subtracting defer here
+    // (the old behaviour) made finalized_epoch wrong by 50/20 and also would
+    // have needed CIP-113 height-dependent switching; neither is correct.
+    let pd_height = pivot_header.height();
+    Ok(block.epoch.saturating_sub(pd_height))
 }
 
 pub(super) fn effective_pos_reference(

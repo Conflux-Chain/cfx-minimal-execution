@@ -35,11 +35,25 @@ cargo build --release --no-default-features --features backend-minimal-mpt
 cfx-replay-data-extractor extract-packed \
     --data-dir /path/to/blockchain_data \
     --output-dir ./data/packed-full \
-    --start-epoch 0 --epoch-count 1000000 \
-    --jobs 8
+    --start-epoch 1 --epoch-count 150000000 \
+    --shard-epochs 2000 --jobs 24 \
+    --target-bytes 104857600 --prefix epochs \
+    --config crates/replay-data-extractor/mainnet.toml
 ```
 
-产出的 `.cfxpack` 文件按 epoch 范围命名（如 `epochs_1_574000.cfxpack`），每个文件约 100 MiB，内部索引支持任意 2000-epoch 组的随机定位。
+| 参数 | 说明 |
+|------|------|
+| `--start-epoch` | 起始 epoch（含） |
+| `--epoch-count` | 提取的 epoch 数量 |
+| `--shard-epochs` | 每个 group 的 epoch 数（固定 2000） |
+| `--jobs` | 并行提取线程数（建议 CPU 核数） |
+| `--target-bytes` | 单个容器文件的目标大小（默认 100 MiB） |
+| `--prefix` | 输出文件名前缀 |
+| `--config` | 链参数配置（含 `pos_reference_enable_height` 等 CIP 激活高度） |
+
+产出的 `.cfxpack` 文件按 epoch 范围命名（如 `epochs_1_574000.cfxpack`），每个文件约 100 MiB，内部索引支持任意 2000-epoch 组的随机定位。全量提取（~1.5 亿 epoch，24 jobs）约需一天。
+
+> **注意**：`--config` 必须传入正确的链参数。PoS 激活高度（mainnet 37400000）之后的区块携带 `pos_view` 字段，需要配置文件中的 `pos_reference_enable_height` 来正确编解码。Pre-PoS 区间不受影响（新旧 encoder 输出逐字节一致）。
 
 **重放与验证**：
 

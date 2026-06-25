@@ -51,6 +51,27 @@ pub struct SenderBaseNonce {
     pub base_nonce: u64,
 }
 
+/// One account's share of a PoS interest distribution, mirroring production
+/// `PosRewardForAccount` (the already-computed final amount, not raw points).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosRewardAccount {
+    pub address: Address,
+    pub pos_identifier: H256,
+    pub reward: U256,
+}
+
+/// A PoS interest distribution event, mirroring production `PosRewardInfo`
+/// (`crates/cfxcore/types/.../block_data_types.rs`). The extractor reads it from
+/// the PoW `reward_by_pos_epoch` CF and attributes it to the PoW epoch whose
+/// pivot hash equals `execution_epoch_hash`; it is carried in that epoch's last
+/// block's tx segment (tag-3 item) and applied at epoch settlement. See
+/// DESIGN.md §8.8.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosRewardEntry {
+    pub account_rewards: Vec<PosRewardAccount>,
+    pub execution_epoch_hash: H256,
+}
+
 // `Serialize`/`Deserialize` are required by the executor's resume checkpoint
 // (which persists `Vec<Block>`); harmless to the extractor, which never
 // serializes it. `primitives` derives serde on the transaction types, so this
@@ -76,12 +97,25 @@ pub struct Block {
     pub base_reward: U256,
     pub transactions: Vec<SignedTransaction>,
     pub transaction_refs: Vec<Option<(usize, usize)>>,
+    /// PoS interest distributions attributed to this block's epoch (DESIGN §8.8).
+    /// Populated by the decoder from tag-3 tx-segment items; the executor applies
+    /// them at epoch settlement. `serde(skip)`: applied at execution time and
+    /// never needed afterwards, so it is not persisted in the resume checkpoint —
+    /// this keeps the checkpoint binary format unchanged (old checkpoints still
+    /// load).
+    #[serde(skip)]
+    pub pos_rewards: Vec<PosRewardEntry>,
+    /// PoS view number derived from this block's `pos_reference`. Not part of
+    /// the wire format: populated by the decoder from the Packet's `pos_entries`
+    /// table, or by the extractor from the PoS DB. `None` before PoS activation.
+    #[serde(skip)]
+    pub pos_view: Option<u64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode::decode_packet, verify::verify_packet};
+    use crate::{decode::{decode_packet, decode_packet_ext}, verify::verify_packet};
     use cfx_types::AddressSpaceUtil;
     use primitives::transaction::NativeTransaction;
 
@@ -121,6 +155,8 @@ mod tests {
                     base_reward: U256::from(1),
                     transactions: Vec::new(),
                     transaction_refs: Vec::new(),
+                    pos_rewards: Vec::new(),
+                    pos_view: None,
                 },
                 Block {
                     epoch: 45,
@@ -142,10 +178,13 @@ mod tests {
                     base_reward: U256::from(2),
                     transactions: Vec::new(),
                     transaction_refs: Vec::new(),
+                    pos_rewards: Vec::new(),
+                    pos_view: Some(7),
                 },
             ],
         };
 
+        let pos_h = 45;
         let packet = encode_packet(&raw).expect("encode raw packet");
         let report = verify_packet(&packet).expect("verify packet");
         assert_eq!(report.block_count, 2);
@@ -153,11 +192,13 @@ mod tests {
         assert_eq!(report.first_block_number, 100);
         assert!(matches!(report.block_prefix_size, 64 | 72 | 80 | 88 | 96));
 
-        let decoded = decode_packet(&packet).expect("decode packet");
+        let decoded = decode_packet_ext(&packet, pos_h).expect("decode packet");
         assert_eq!(decoded.blocks[0].height, 42);
         assert_eq!(decoded.blocks[0].epoch, 45);
+        assert_eq!(decoded.blocks[0].pos_view, None);
         assert_eq!(decoded.blocks[1].height, 45);
         assert_eq!(decoded.blocks[1].epoch, 45);
+        assert_eq!(decoded.blocks[1].pos_view, Some(7));
         let reencoded = encode_packet(&decoded).expect("reencode decoded packet");
         assert_eq!(reencoded, packet);
         let reencoded_report = verify_packet(&reencoded).expect("verify reencoded packet");
@@ -177,7 +218,10 @@ mod tests {
             action: primitives::Action::Call(receiver),
             value: U256::from(42),
             storage_limit: 0,
-            epoch_height: 1000,
+            // Below the block epoch (1000): a negative offset whose sign must
+            // survive the round-trip. A zero/positive delta would not catch the
+            // abs_diff sign-loss regression.
+            epoch_height: 900,
             chain_id: 1029,
             data: Vec::new().into(),
         }
@@ -215,6 +259,8 @@ mod tests {
                 base_reward: U256::from(1),
                 transactions: vec![tx],
                 transaction_refs: Vec::new(),
+                pos_rewards: Vec::new(),
+                pos_view: None,
             }],
         };
 
@@ -226,6 +272,14 @@ mod tests {
 
         let decoded = decode_packet(&packet).expect("decode tx packet");
         assert_eq!(decoded.blocks[0].transactions.len(), 1);
+        // The signed epoch_height offset (900 - 1000 = -100) must be recovered
+        // exactly, not flipped to 1100 by an unsigned (abs_diff) decode.
+        match &decoded.blocks[0].transactions[0].transaction.unsigned {
+            primitives::transaction::Transaction::Native(native) => {
+                assert_eq!(*native.epoch_height(), 900);
+            }
+            primitives::transaction::Transaction::Ethereum(_) => panic!("expected native tx"),
+        }
         let reencoded = encode_packet(&decoded).expect("reencode tx packet");
         assert_eq!(reencoded, packet);
         let reencoded_report = verify_packet(&reencoded).expect("verify reencoded tx packet");

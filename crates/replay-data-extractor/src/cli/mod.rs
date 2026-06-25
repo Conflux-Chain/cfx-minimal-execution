@@ -1,10 +1,19 @@
 mod commands;
 
-use crate::extract::{ExtractConfig, DEFAULT_PACK_TARGET_BYTES};
+use crate::extract::{ChainParams, ExtractConfig, DEFAULT_PACK_TARGET_BYTES};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use commands::*;
 use std::path::PathBuf;
+
+/// Load chain parameters from a TOML config file, or fall back to test defaults
+/// (PoS/CIP-112 disabled) when no `--config` is given.
+fn load_chain(config: Option<PathBuf>) -> Result<ChainParams> {
+    match config {
+        Some(path) => ChainParams::from_toml_file(path),
+        None => Ok(ChainParams::default()),
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "cfx-replay-data-extractor")]
@@ -25,14 +34,11 @@ enum Command {
         epoch_count: u64,
         #[arg(long, default_value = "target/replay-data/sample.cfxpkt")]
         output: PathBuf,
-        #[arg(long, default_value_t = 5)]
-        evm_transaction_block_ratio: u64,
-        #[arg(long, default_value_t = 50)]
-        pos_pivot_decision_defer_epoch_count: u64,
-        #[arg(long, default_value_t = u64::MAX)]
-        pos_reference_enable_height: u64,
-        #[arg(long, default_value_t = u64::MAX)]
-        cip112_transition_height: u64,
+        /// TOML file with chain parameters (evm_transaction_block_ratio,
+        /// pos_reference_enable_height, cip112_transition_height). Omit for
+        /// test defaults (PoS/CIP-112 disabled).
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     Verify {
         #[arg(long)]
@@ -71,14 +77,9 @@ enum Command {
         shard_epochs: u64,
         #[arg(long, default_value_t = 1)]
         jobs: usize,
-        #[arg(long, default_value_t = 5)]
-        evm_transaction_block_ratio: u64,
-        #[arg(long, default_value_t = 50)]
-        pos_pivot_decision_defer_epoch_count: u64,
-        #[arg(long, default_value_t = u64::MAX)]
-        pos_reference_enable_height: u64,
-        #[arg(long, default_value_t = u64::MAX)]
-        cip112_transition_height: u64,
+        /// TOML file with chain parameters; omit for test defaults.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Extract epochs as 2000-epoch groups (unchanged spec) packed into
     /// ~100 MiB container files named `<prefix>_<start_epoch>_<end_epoch>.cfxpack`,
@@ -100,14 +101,10 @@ enum Command {
         target_bytes: u64,
         #[arg(long, default_value_t = 1)]
         jobs: usize,
-        #[arg(long, default_value_t = 5)]
-        evm_transaction_block_ratio: u64,
-        #[arg(long, default_value_t = 50)]
-        pos_pivot_decision_defer_epoch_count: u64,
-        #[arg(long, default_value_t = u64::MAX)]
-        pos_reference_enable_height: u64,
-        #[arg(long, default_value_t = u64::MAX)]
-        cip112_transition_height: u64,
+        /// TOML file with chain parameters (mainnet activation heights). Omit
+        /// for test defaults (PoS/CIP-112 disabled).
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     BenchDecode {
         #[arg(long)]
@@ -146,19 +143,13 @@ pub fn run() -> Result<()> {
             start_epoch,
             epoch_count,
             output,
-            evm_transaction_block_ratio,
-            pos_pivot_decision_defer_epoch_count,
-            pos_reference_enable_height,
-            cip112_transition_height,
+            config,
         } => cmd_extract(
             ExtractConfig {
                 data_dir,
                 start_epoch,
                 epoch_count,
-                evm_transaction_block_ratio,
-                pos_pivot_decision_defer_epoch_count,
-                pos_reference_enable_height,
-                cip112_transition_height,
+                chain: load_chain(config)?,
             },
             output,
         ),
@@ -189,19 +180,13 @@ pub fn run() -> Result<()> {
             output_dir,
             shard_epochs,
             jobs,
-            evm_transaction_block_ratio,
-            pos_pivot_decision_defer_epoch_count,
-            pos_reference_enable_height,
-            cip112_transition_height,
+            config,
         } => cmd_extract_shards(
             ExtractConfig {
                 data_dir,
                 start_epoch,
                 epoch_count,
-                evm_transaction_block_ratio,
-                pos_pivot_decision_defer_epoch_count,
-                pos_reference_enable_height,
-                cip112_transition_height,
+                chain: load_chain(config)?,
             },
             output_dir,
             shard_epochs,
@@ -216,19 +201,13 @@ pub fn run() -> Result<()> {
             shard_epochs,
             target_bytes,
             jobs,
-            evm_transaction_block_ratio,
-            pos_pivot_decision_defer_epoch_count,
-            pos_reference_enable_height,
-            cip112_transition_height,
+            config,
         } => cmd_extract_packed(
             ExtractConfig {
                 data_dir,
                 start_epoch,
                 epoch_count,
-                evm_transaction_block_ratio,
-                pos_pivot_decision_defer_epoch_count,
-                pos_reference_enable_height,
-                cip112_transition_height,
+                chain: load_chain(config)?,
             },
             output_dir,
             prefix,

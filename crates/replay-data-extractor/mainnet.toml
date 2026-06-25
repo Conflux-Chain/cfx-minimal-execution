@@ -1,0 +1,22 @@
+# cfxpack extraction — Conflux mainnet chain parameters.
+#
+# Authoritative values from conflux-rust v3.0.3-fix
+# (crates/config/src/configuration.rs defaults + crates/parameters/src/lib.rs).
+# Pass to `cfx-replay-data-extractor extract-packed --config <this file>`.
+
+# espace flag: a pivot block at `height % ratio == 0` carries eSpace txs.
+evm_transaction_block_ratio = 5
+
+# Below this height a block's `pos_reference` is treated as None, so the
+# block's `finalized_epoch` offset is recorded as 0. At/above it, finalized_epoch
+# is derived from the PoS pivot decision (see DESIGN.md §8.6).
+pos_reference_enable_height = 37400000
+
+# Height at which CIP-112 fixes the block-header `custom` field encoding.
+# Headers at/after this height decode incorrectly without it, corrupting the
+# derived deferred_*_root prefixes and other fields.
+cip112_transition_height = 79050000
+
+# Note: pos_pivot_decision_defer_epoch_count / CIP-113 are intentionally absent.
+# conflux sets env.finalized_epoch directly to the pivot-decision block height
+# with no defer (epoch_execution.rs), so the defer never enters extraction.

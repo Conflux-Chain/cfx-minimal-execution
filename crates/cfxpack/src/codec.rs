@@ -33,6 +33,19 @@ pub fn put_uleb128(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+/// ZigZag-map a signed integer onto an unsigned one so that small-magnitude
+/// values of either sign stay small after encoding: `0,-1,1,-2,2 → 0,1,2,3,4`.
+/// Used to carry a *signed* offset (e.g. `epoch_height − block_epoch`, which may
+/// be negative) through an unsigned channel (RLP `u64`) without losing the sign.
+pub fn zigzag_encode(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+
+/// Inverse of [`zigzag_encode`].
+pub fn zigzag_decode(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ -((value & 1) as i64)
+}
+
 pub fn read_uleb128(data: &[u8], offset: &mut usize) -> Result<u64> {
     let mut shift = 0;
     let mut value = 0u64;
@@ -208,4 +221,24 @@ fn bit_len(bytes: &[u8]) -> usize {
 pub fn align_to(out: &mut Vec<u8>, align: usize) {
     let pad = (align - out.len() % align) % align;
     out.resize(out.len() + pad, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zigzag_roundtrips_and_preserves_sign() {
+        // Spans the ± TRANSACTION_DEFAULT_EPOCH_BOUND range an epoch_height
+        // offset can occupy, plus the boundaries.
+        for v in [0i64, 1, -1, 100, -100, 99_998, -99_998, 100_000, -100_000, i64::MAX, i64::MIN] {
+            assert_eq!(zigzag_decode(zigzag_encode(v)), v, "roundtrip {v}");
+        }
+        // Small magnitudes of either sign stay small (the point of zigzag).
+        assert_eq!(zigzag_encode(0), 0);
+        assert_eq!(zigzag_encode(-1), 1);
+        assert_eq!(zigzag_encode(1), 2);
+        // A negative offset must NOT decode to its positive mirror.
+        assert_ne!(zigzag_decode(zigzag_encode(-100)), 100);
+    }
 }

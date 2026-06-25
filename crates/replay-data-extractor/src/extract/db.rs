@@ -1,14 +1,16 @@
 use super::ExtractConfig;
 use anyhow::{anyhow, Context, Result};
 use cfx_types::H256;
+use cfxpack::packet::{PosRewardAccount, PosRewardEntry};
 use diem_types::committed_block::CommittedBlock;
 use primitives::{Block, BlockHeader, SignedTransaction};
 use rlp::Rlp;
 use rocksdb::{
     rocksdb_options::ColumnFamilyDescriptor, BlockBasedOptions, Cache, ColumnFamilyOptions,
-    DBOptions, LRUCacheOptions, ReadOptions, DB,
+    DBIterator, DBOptions, LRUCacheOptions, ReadOptions, SeekKey, DB,
 };
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -16,6 +18,8 @@ use std::{
 pub(super) const EPOCH_EXECUTED_BLOCK_SET_SUFFIX: u8 = 0x06;
 const COL_BLOCKS: &str = "col1";
 const COL_EPOCH_NUMBERS: &str = "col3";
+// reward_by_pos_epoch (DESIGN §8.1, CF ID 7): PoS epoch (8-byte BE) -> RLP PosRewardInfo.
+const COL_REWARD_BY_POS_EPOCH: &str = "col7";
 const EPOCH_SKIPPED_BLOCK_SET_SUFFIX: u8 = 0x07;
 const BLOCK_BODY_SUFFIX: u8 = 0x02;
 const EPOCH_EXECUTION_CONTEXT_SUFFIX: u8 = 0x04;
@@ -96,6 +100,54 @@ impl PowDb {
             .get_cf_opt(handle, key, &self.read_opts)
             .map(|value| value.map(|value| value.to_vec()))
             .map_err(|e| anyhow!("read CF {cf}: {e}"))
+    }
+
+    /// Scan the `reward_by_pos_epoch` CF (col7) and return every PoS interest
+    /// distribution whose `execution_epoch_hash` is in `pivots`, keyed by that
+    /// pivot hash. Value is RLP `PosRewardInfo` (production `block_data_types.rs`,
+    /// `#[derive(RlpEncodable)]`): `[ [ [addr, pos_id, reward], ... ], exec_hash ]`.
+    /// Full-CF scan — fine for bounded ranges; revisit for whole-chain runs.
+    pub(super) fn read_pos_rewards(
+        &self, pivots: &HashSet<H256>,
+    ) -> Result<HashMap<H256, PosRewardEntry>> {
+        let mut out = HashMap::new();
+        if pivots.is_empty() {
+            return Ok(out);
+        }
+        let handle = self
+            .db
+            .cf_handle(COL_REWARD_BY_POS_EPOCH)
+            .ok_or_else(|| anyhow!("missing CF {COL_REWARD_BY_POS_EPOCH}"))?;
+        let mut iter = DBIterator::new_cf(&self.db, handle, no_cache_read_options());
+        iter.seek(SeekKey::Start)
+            .map_err(|e| anyhow!("seek col7: {e}"))?;
+        while iter.valid().map_err(|e| anyhow!("iter col7: {e}"))? {
+            let value = iter.value().to_vec();
+            let rlp = Rlp::new(&value);
+            let execution_epoch_hash: H256 =
+                rlp.val_at(1).context("decode PosRewardInfo exec hash")?;
+            if pivots.contains(&execution_epoch_hash) {
+                let rewards_rlp = rlp.at(0).context("decode PosRewardInfo account_rewards")?;
+                let mut account_rewards = Vec::with_capacity(rewards_rlp.item_count()?);
+                for j in 0..rewards_rlp.item_count()? {
+                    let a = rewards_rlp.at(j)?;
+                    account_rewards.push(PosRewardAccount {
+                        address: a.val_at(0).context("pos reward address")?,
+                        pos_identifier: a.val_at(1).context("pos reward identifier")?,
+                        reward: a.val_at(2).context("pos reward amount")?,
+                    });
+                }
+                out.insert(
+                    execution_epoch_hash,
+                    PosRewardEntry {
+                        account_rewards,
+                        execution_epoch_hash,
+                    },
+                );
+            }
+            iter.next().map_err(|e| anyhow!("iter col7 next: {e}"))?;
+        }
+        Ok(out)
     }
 }
 
@@ -224,7 +276,14 @@ pub(super) fn read_header(pow: &PowDb, hash: &H256) -> Result<BlockHeader> {
     let bytes = pow
         .get(COL_BLOCKS, &block_key(hash, None))?
         .ok_or_else(|| anyhow!("missing block header {hash:?}"))?;
-    rlp::decode(&bytes).with_context(|| format!("decode block header {hash:?}"))
+    // Headers are stored *with* the pow_hash field (index 14), so the network
+    // `Decodable` (which has no pow_hash and reads pos_reference at 14) shifts
+    // every field after nonce by one — silently misreading pow_hash as
+    // pos_reference and the real pos_reference as base_price. Pre-PoS blocks
+    // hid this because the misread pos_reference is unused there. Use the
+    // pow-hash-aware decoder that matches the stored layout.
+    BlockHeader::decode_with_pow_hash(&bytes)
+        .with_context(|| format!("decode block header {hash:?}"))
 }
 
 pub(super) fn read_body(pow: &PowDb, hash: &H256) -> Result<Vec<Arc<SignedTransaction>>> {
