@@ -15,9 +15,9 @@ fi
 cargo llvm-cov clean --workspace
 rm -rf "$REPORT_DIR"
 mkdir -p "$REPORT_DIR"
-cargo llvm-cov -p cfx-minimal-mpt --all-targets --ignore-filename-regex 'src/bin/trace_standalone.rs' --summary-only | tee "$REPORT_DIR/summary.txt"
-cargo llvm-cov -p cfx-minimal-mpt --all-targets --ignore-filename-regex 'src/bin/trace_standalone.rs' --lcov --output-path "$REPORT_DIR/lcov.info" >/dev/null
-cargo llvm-cov -p cfx-minimal-mpt --all-targets --ignore-filename-regex 'src/bin/trace_standalone.rs' --html --output-dir "$REPORT_DIR" >/dev/null
+cargo llvm-cov -p cfx-minimal-mpt --all-targets --release --ignore-filename-regex 'src/bin/trace_standalone.rs' --summary-only | tee "$REPORT_DIR/summary.txt"
+cargo llvm-cov -p cfx-minimal-mpt --all-targets --release --ignore-filename-regex 'src/bin/trace_standalone.rs' --lcov --output-path "$REPORT_DIR/lcov.info" >/dev/null
+cargo llvm-cov -p cfx-minimal-mpt --all-targets --release --ignore-filename-regex 'src/bin/trace_standalone.rs' --html --output-dir "$REPORT_DIR" >/dev/null
 echo "coverage summary: $REPORT_DIR/summary.txt"
 echo "lcov report: $REPORT_DIR/lcov.info"
 echo "html report: $REPORT_DIR/html/index.html"

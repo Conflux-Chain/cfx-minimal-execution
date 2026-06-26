@@ -14,9 +14,14 @@ LCOV = ROOT / "fuzz/coverage/layered_state_ops/lcov.info"
 # `continue` skips, the tombstone `remove`) so the gate keeps proving the corpus
 # exercises those paths rather than merely entering the function.
 REQUIRED_LINES = {
+    "src/snapshot.rs": {
+        # snapshot apply_updates now owns the insert/remove branch split used by
+        # commit rollover; keep proving both value and tombstone updates.
+        "snapshot batch update insert/remove": [26, 27, 28, 29, 30],
+    },
     "src/state/rotation.rs": {
-        # absorb intermediate into snapshot: both Some(insert) and Tombstone(remove)
-        "commit rollover materializes old intermediate": [38, 39, 41, 42],
+        # absorb intermediate into snapshot before re-rooting
+        "commit rollover materializes old intermediate": [38, 39, 40, 41, 43],
         # rotate delta -> intermediate and re-derive the delta padding
         "commit rollover promotes delta and updates padding": [63, 65, 66, 67, 73],
     },
