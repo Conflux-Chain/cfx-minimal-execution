@@ -40,13 +40,29 @@
 
 use crate::trie::{bytes_to_nibbles, compute_node_merkle, compute_path_merkle, MptValue, CHILDREN};
 use crate::types::{H256, MERKLE_NULL_NODE};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
+
+const PARALLEL_REBUILD_THRESHOLD: usize = 4096;
+const PARALLEL_REBUILD_DEPTH: usize = 3;
 
 /// Cache keyed by a node's routing nibble prefix. FxHash, not SipHash: these
 /// short byte (nibble) keys are hashed on every node visit and SipHash showed
 /// up prominently in profiles.
 type Cache = FxHashMap<Vec<u8>, H256>;
+
+/// Controls which subtree hashes are retained after a root walk.
+///
+/// Delta tries are small and hot, so they use the full cache. Snapshot tries can
+/// contain millions of singleton subtrees whose cached hashes are rarely reused;
+/// skipping those entries keeps branch/path caches warm while avoiding most of
+/// the snapshot cache memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CachePolicy {
+    Full,
+    SkipSingleton,
+}
 
 /// Incremental delta-trie root.
 ///
@@ -107,6 +123,10 @@ impl IncrementalTrie {
     /// Merkle root of the current delta, reusing cached hashes for unchanged
     /// subtrees. Clears the pending dirty set; keeps the cache.
     pub fn root(&mut self) -> H256 {
+        self.root_with_policy(CachePolicy::Full)
+    }
+
+    pub(crate) fn root_with_policy(&mut self, cache_policy: CachePolicy) -> H256 {
         if self.entries.is_empty() {
             self.cache.clear();
             self.dirty.clear();
@@ -121,7 +141,23 @@ impl IncrementalTrie {
         }
         self.dirty.clear();
 
-        let result = memo_node(&self.entries, &[], false, &mut self.cache);
+        let result = if self.cache.is_empty() && self.entries.len() >= PARALLEL_REBUILD_THRESHOLD {
+            let entries: Vec<EntryRef<'_>> = self
+                .entries
+                .iter()
+                .map(|(key, value)| EntryRef {
+                    key: key.as_slice(),
+                    value,
+                })
+                .collect();
+            let (root, cache_entries) =
+                memo_node_rebuild(&entries, &[], false, cache_policy, PARALLEL_REBUILD_DEPTH);
+            self.cache.reserve(cache_entries.len());
+            self.cache.extend(cache_entries);
+            root
+        } else {
+            memo_node(&self.entries, &[], false, &mut self.cache, cache_policy)
+        };
         #[cfg(feature = "verify-incremental")]
         {
             // Cross-check the cached/incremental root against a from-scratch
@@ -202,7 +238,7 @@ impl IncrementalTrie {
 
 /// Inverse of [`bytes_to_nibbles`] for byte-aligned (even-length) nibble keys:
 /// pairs of nibbles recombine into bytes. Snapshot keys are always byte-aligned.
-fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
+pub(crate) fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
     nibbles
         .chunks_exact(2)
         .map(|p| (p[0] << 4) | p[1])
@@ -213,7 +249,7 @@ fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
 /// prefix `rp`: `rp` followed by `CHILDREN` (`16`), which is strictly greater
 /// than every real nibble (`0..16`). So the half-open range `[rp, rp++[16])` is
 /// exactly the keys prefixed by `rp`.
-fn prefix_upper(rp: &[u8]) -> Vec<u8> {
+pub(crate) fn prefix_upper(rp: &[u8]) -> Vec<u8> {
     let mut upper = Vec::with_capacity(rp.len() + 1);
     upper.extend_from_slice(rp);
     upper.push(CHILDREN as u8);
@@ -236,6 +272,7 @@ fn memo_node(
     rp: &[u8],
     allow_path_compression: bool,
     cache: &mut Cache,
+    cache_policy: CachePolicy,
 ) -> H256 {
     if let Some(hash) = cache.get(rp) {
         return *hash;
@@ -254,12 +291,17 @@ fn memo_node(
         .next()
         .expect("non-empty node")
         .0;
-    let common = if allow_path_compression {
-        let last_key = entries
+    let last_key = if allow_path_compression || cache_policy == CachePolicy::SkipSingleton {
+        entries
             .range(rp.to_vec()..upper)
             .next_back()
             .expect("non-empty node")
-            .0;
+            .0
+    } else {
+        first_key
+    };
+    let is_singleton = first_key == last_key;
+    let common = if allow_path_compression {
         common_prefix_len(first_key, last_key, depth)
     } else {
         0
@@ -288,7 +330,7 @@ fn memo_node(
             .next()
             .is_some()
         {
-            *slot = memo_node(entries, &child_rp, true, cache);
+            *slot = memo_node(entries, &child_rp, true, cache, cache_policy);
         }
     }
 
@@ -296,14 +338,140 @@ fn memo_node(
     let node_hash = compute_node_merkle(has_children.then_some(&children), maybe_value);
     let hash = compute_path_merkle(&first_key[depth..node_depth], depth, node_hash);
 
-    cache.insert(rp.to_vec(), hash);
+    if cache_policy == CachePolicy::Full || !is_singleton {
+        cache.insert(rp.to_vec(), hash);
+    }
     hash
+}
+
+#[derive(Clone, Copy)]
+struct EntryRef<'a> {
+    key: &'a [u8],
+    value: &'a MptValue,
+}
+
+/// Cold-cache root/cache rebuild over an already sorted entry slice.
+///
+/// This mirrors `memo_node`, but it uses contiguous slice partitions instead of
+/// BTreeMap range probes. Because the caller only uses it when the cache is
+/// empty, children return cache entries as vectors; the caller builds the real
+/// hash map once after all parallel work joins.
+fn memo_node_rebuild(
+    entries: &[EntryRef<'_>],
+    rp: &[u8],
+    allow_path_compression: bool,
+    cache_policy: CachePolicy,
+    parallel_depth: usize,
+) -> (H256, Vec<(Vec<u8>, H256)>) {
+    debug_assert!(!entries.is_empty());
+
+    let depth = rp.len();
+    let first_key = entries[0].key;
+    let last_key = entries[entries.len() - 1].key;
+    let is_singleton = first_key == last_key;
+    let common = if allow_path_compression {
+        common_prefix_len(first_key, last_key, depth)
+    } else {
+        0
+    };
+    let node_depth = depth + common;
+    let full_prefix = &first_key[0..node_depth];
+
+    let maybe_value = entries
+        .iter()
+        .find(|entry| entry.key.len() == node_depth)
+        .map(|entry| entry.value.merkle_value());
+
+    let ranges = child_ranges(entries, node_depth);
+    let (child_hashes, mut cache_entries): (Vec<(usize, H256)>, Vec<(Vec<u8>, H256)>) =
+        if parallel_depth > 0 && entries.len() >= PARALLEL_REBUILD_THRESHOLD && ranges.len() > 1 {
+            let results: Vec<(usize, H256, Vec<(Vec<u8>, H256)>)> = ranges
+                .par_iter()
+                .map(|(child, start, end)| {
+                    let mut child_rp = Vec::with_capacity(node_depth + 1);
+                    child_rp.extend_from_slice(full_prefix);
+                    child_rp.push(*child as u8);
+
+                    let (hash, cache_entries) = memo_node_rebuild(
+                        &entries[*start..*end],
+                        &child_rp,
+                        true,
+                        cache_policy,
+                        parallel_depth - 1,
+                    );
+                    (*child, hash, cache_entries)
+                })
+                .collect();
+
+            let mut child_hashes = Vec::with_capacity(results.len());
+            let cache_entries_len = results
+                .iter()
+                .map(|(_, _, cache_entries)| cache_entries.len())
+                .sum();
+            let mut cache_entries = Vec::with_capacity(cache_entries_len);
+            for (child, hash, mut child_cache_entries) in results {
+                cache_entries.append(&mut child_cache_entries);
+                child_hashes.push((child, hash));
+            }
+            (child_hashes, cache_entries)
+        } else {
+            let mut child_hashes = Vec::with_capacity(ranges.len());
+            let mut cache_entries = Vec::new();
+            for (child, start, end) in &ranges {
+                let mut child_rp = Vec::with_capacity(node_depth + 1);
+                child_rp.extend_from_slice(full_prefix);
+                child_rp.push(*child as u8);
+                let (hash, mut child_cache_entries) =
+                    memo_node_rebuild(&entries[*start..*end], &child_rp, true, cache_policy, 0);
+                cache_entries.append(&mut child_cache_entries);
+                child_hashes.push((*child, hash));
+            }
+            (child_hashes, cache_entries)
+        };
+
+    let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
+    for (child, hash) in child_hashes {
+        children[child] = hash;
+    }
+
+    let has_children = children.iter().any(|h| *h != MERKLE_NULL_NODE);
+    let node_hash = compute_node_merkle(has_children.then_some(&children), maybe_value);
+    let hash = compute_path_merkle(&first_key[depth..node_depth], depth, node_hash);
+
+    if cache_policy == CachePolicy::Full || !is_singleton {
+        cache_entries.push((rp.to_vec(), hash));
+    }
+    (hash, cache_entries)
+}
+
+fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut idx = 0;
+    while idx < entries.len() {
+        let key = entries[idx].key;
+        if key.len() == node_depth {
+            idx += 1;
+            continue;
+        }
+
+        let child = key[node_depth] as usize;
+        let start = idx;
+        idx += 1;
+        while idx < entries.len()
+            && entries[idx].key.len() > node_depth
+            && entries[idx].key[node_depth] as usize == child
+        {
+            idx += 1;
+        }
+        ranges.push((child, start, idx));
+    }
+    ranges
 }
 
 /// Longest common nibble prefix of the sorted block beyond `depth`. The block's
 /// LCP equals the LCP of its endpoints `first` (min) and `last` (max), so only
 /// the two boundary keys are compared.
-fn common_prefix_len(first: &[u8], last: &[u8], depth: usize) -> usize {
+pub(crate) fn common_prefix_len(first: &[u8], last: &[u8], depth: usize) -> usize {
     first
         .iter()
         .zip(last)

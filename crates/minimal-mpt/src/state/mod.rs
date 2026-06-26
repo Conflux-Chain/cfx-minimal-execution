@@ -1,5 +1,7 @@
 use crate::{
+    incremental::CachePolicy,
     key_codec::{DeltaMptKeyPadding, StorageKeyWithSpace},
+    snapshot::SnapshotTrie,
     store::{MptValueDisk, PersistedState, StateStore},
     trie::{trie_root, MptValue},
     types::{CommitRoot, MptKeyValue, Result, H256, MERKLE_NULL_NODE},
@@ -40,7 +42,7 @@ pub struct State {
     /// incrementally **in place**. Read-only during a period; only
     /// `advance_after_commit` mutates it, at boundaries. No clone, no double
     /// buffer: the incremental root is cheap enough to do synchronously.
-    snapshot: crate::incremental::IncrementalTrie,
+    snapshot: SnapshotTrie,
     intermediate: BTreeMap<Vec<u8>, MptValue>,
     delta: BTreeMap<Vec<u8>, MptValue>,
     snapshot_root: H256,
@@ -72,7 +74,7 @@ impl Default for State {
 impl State {
     pub fn new() -> Self {
         Self {
-            snapshot: crate::incremental::IncrementalTrie::default(),
+            snapshot: SnapshotTrie::default(),
             intermediate: BTreeMap::new(),
             delta: BTreeMap::new(),
             snapshot_root: MERKLE_NULL_NODE,
@@ -96,8 +98,8 @@ impl State {
     }
 
     pub fn from_snapshot(snapshot: BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
-        let mut snapshot_inc = crate::incremental::IncrementalTrie::from_snapshot(&snapshot);
-        let snapshot_root = snapshot_inc.root();
+        let mut snapshot_inc = SnapshotTrie::from_snapshot(&snapshot);
+        let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
         let delta_padding = DeltaMptKeyPadding::from_roots(snapshot_root, MERKLE_NULL_NODE);
         Self {
             snapshot: snapshot_inc,
@@ -108,24 +110,85 @@ impl State {
     }
 
     pub fn from_persisted(state: PersistedState) -> Self {
+        let recover_timing = std::env::var_os("MMPT_RECOVER_TIMING").is_some();
+        let recover_total = std::time::Instant::now();
+        let snapshot_entries = state.snapshot.len();
+        let intermediate_entries = state.intermediate.len();
+        let delta_entries = state.delta.len();
+
+        let t = std::time::Instant::now();
         let intermediate = state
             .intermediate
             .into_iter()
             .map(|(k, v)| (k, MptValue::from(v)))
             .collect();
+        if recover_timing {
+            eprintln!(
+                "[recover] intermediate_build entries={} elapsed={}ms",
+                intermediate_entries,
+                t.elapsed().as_millis()
+            );
+        }
+        let t = std::time::Instant::now();
         let delta = state
             .delta
             .into_iter()
             .map(|(k, v)| (k, MptValue::from(v)))
             .collect();
-        let mut snapshot_inc = crate::incremental::IncrementalTrie::from_snapshot(&state.snapshot);
-        let snapshot_root = snapshot_inc.root();
+        if recover_timing {
+            eprintln!(
+                "[recover] delta_build entries={} elapsed={}ms",
+                delta_entries,
+                t.elapsed().as_millis()
+            );
+        }
+        let t = std::time::Instant::now();
+        let mut snapshot_inc = SnapshotTrie::from_snapshot(&state.snapshot);
+        if recover_timing {
+            eprintln!(
+                "[recover] snapshot_build entries={} elapsed={}ms",
+                snapshot_entries,
+                t.elapsed().as_millis()
+            );
+        }
+        let t = std::time::Instant::now();
+        let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
+        if recover_timing {
+            eprintln!(
+                "[recover] snapshot_root entries={} elapsed={}ms",
+                snapshot_entries,
+                t.elapsed().as_millis()
+            );
+        }
+        let t = std::time::Instant::now();
         let intermediate_root = trie_root(&intermediate);
+        if recover_timing {
+            eprintln!(
+                "[recover] intermediate_root entries={} elapsed={}ms",
+                intermediate_entries,
+                t.elapsed().as_millis()
+            );
+        }
         let intermediate_padding = DeltaMptKeyPadding(state.intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(state.delta_mpt_key_padding);
         // Seed the incremental trie with the loaded delta (one nibble pass);
         // built before `delta` is moved into the struct.
+        let t = std::time::Instant::now();
         let delta_inc = crate::incremental::IncrementalTrie::from_delta(&delta);
+        if recover_timing {
+            eprintln!(
+                "[recover] delta_inc_build entries={} elapsed={}ms",
+                delta_entries,
+                t.elapsed().as_millis()
+            );
+            eprintln!(
+                "[recover] from_persisted_total snapshot={} intermediate={} delta={} elapsed={}ms",
+                snapshot_entries,
+                intermediate_entries,
+                delta_entries,
+                recover_total.elapsed().as_millis()
+            );
+        }
         Self {
             snapshot: snapshot_inc,
             intermediate,
@@ -202,10 +265,7 @@ impl StateTrait for State {
         if let Some(value) = self.intermediate.get(&intermediate_key) {
             return Ok(value.visible_value().map(Box::from));
         }
-        Ok(self
-            .snapshot
-            .snapshot_get(&key.to_key_bytes()?)
-            .map(Box::from))
+        Ok(self.snapshot.snapshot_get_owned(&key.to_key_bytes()?))
     }
 
     fn set(&mut self, key: StorageKeyWithSpace, value: Box<[u8]>) -> Result<()> {

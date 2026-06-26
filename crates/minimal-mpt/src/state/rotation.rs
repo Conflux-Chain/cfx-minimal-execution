@@ -7,8 +7,8 @@
 
 use super::State;
 use crate::{
+    incremental::CachePolicy,
     key_codec::{DeltaMptKeyPadding, StorageKeyWithSpace},
-    trie::MptValue,
     types::{Result, H256},
 };
 
@@ -35,16 +35,15 @@ impl State {
         // the snapshot can be mutated without aliasing it.
         let timing = timing_on();
         let t0 = std::time::Instant::now();
+        let mut snapshot_updates = Vec::with_capacity(self.intermediate.len());
         for (raw_key, value) in std::mem::take(&mut self.intermediate) {
             let canonical = StorageKeyWithSpace::from_delta_mpt_key(&raw_key)?.to_key_bytes()?;
-            match value {
-                MptValue::Some(value) => self.snapshot.insert(&canonical, MptValue::Some(value)),
-                MptValue::Tombstone => self.snapshot.remove(&canonical),
-            }
+            snapshot_updates.push((canonical, value));
         }
+        self.snapshot.apply_updates(snapshot_updates);
         let apply_ms = t0.elapsed().as_millis();
         let t1 = std::time::Instant::now();
-        self.snapshot_root = self.snapshot.root();
+        self.snapshot_root = self.snapshot.root_with_policy(CachePolicy::SkipSingleton);
         let hash_ms = t1.elapsed().as_millis();
         if timing {
             eprintln!(

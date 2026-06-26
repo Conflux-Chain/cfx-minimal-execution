@@ -1,5 +1,6 @@
 mod incremental;
 mod key_codec;
+mod snapshot;
 mod state;
 mod store;
 mod trie;
