@@ -63,7 +63,7 @@ pub fn decode_packet_ext(data: &[u8], pos_reference_enable_height: u64) -> Resul
 
     for (index, (record, block)) in block_records.iter().zip(blocks.iter_mut()).enumerate() {
         if block.flags & FLAG_HAS_TRANSACTIONS != 0 {
-            let (transactions, transaction_refs, pos_rewards) = decode_tx_payload(
+            let (transactions, transaction_refs, pos_rewards, unlock_events) = decode_tx_payload(
                 data,
                 offsets[7],
                 record.tx_offset_units,
@@ -77,6 +77,7 @@ pub fn decode_packet_ext(data: &[u8], pos_reference_enable_height: u64) -> Resul
             block.transactions = transactions;
             block.transaction_refs = transaction_refs;
             block.pos_rewards = pos_rewards;
+            block.unlock_events = unlock_events;
         }
         decoded_txs[index] = block.transactions.clone();
     }
@@ -205,6 +206,7 @@ fn decode_block_record(
         transactions: Vec::new(),
         transaction_refs: Vec::new(),
         pos_rewards: Vec::new(),
+        unlock_events: Vec::new(),
         pos_view,
     })
 }

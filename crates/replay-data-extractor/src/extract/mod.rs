@@ -291,6 +291,21 @@ fn extract_raw(
         }
     }
 
+    // Attach PoS unlock events (DESIGN §8.8): production processes unlock events
+    // when a pivot's pos_reference differs from its parent's. We scan the PoS
+    // event CF between consecutive pos_reference versions and attach unlock
+    // entries to the corresponding epoch's last (pivot) block.
+    let unlock_map = collect_unlock_events(config, pow, pos, &pos_blocks, &epochs)?;
+    if !unlock_map.is_empty() {
+        for block in blocks.iter_mut() {
+            if block.flags & FLAG_PIVOT != 0 {
+                if let Some(unlocks) = unlock_map.get(&block.epoch) {
+                    block.unlock_events = unlocks.clone();
+                }
+            }
+        }
+    }
+
     Ok((
         Packet {
             prev_last_hash: boundary.prev_last_hash,
@@ -517,6 +532,7 @@ fn build_block_inputs(
             transactions: raw.body.into_iter().map(|tx| (*tx).clone()).collect(),
             transaction_refs: Vec::new(),
             pos_rewards: Vec::new(),
+            unlock_events: Vec::new(),
             pos_view,
         });
     }
@@ -572,4 +588,63 @@ pub(super) fn effective_pos_reference(
     } else {
         header.pos_reference().as_ref()
     }
+}
+
+/// Collect PoS unlock events by scanning pos_reference transitions across
+/// consecutive pivot blocks in the packet. Returns a map: epoch_number →
+/// Vec<UnlockEntry>.
+fn collect_unlock_events(
+    config: &ExtractConfig,
+    pow: &PowDb,
+    pos: &PosDb,
+    pos_blocks: &HashMap<H256, CommittedBlock>,
+    epochs: &[EpochBlocks],
+) -> Result<HashMap<u64, Vec<cfxpack::packet::UnlockEntry>>> {
+    let pos_enable = config.chain.pos_reference_enable_height;
+
+    // Get the previous epoch's pivot pos_reference as the starting point.
+    let prev_epoch = config.start_epoch.saturating_sub(1);
+    let prev_hashes = read_epoch_hashes(pow, prev_epoch, EPOCH_EXECUTED_BLOCK_SET_SUFFIX)?
+        .ok_or_else(|| anyhow!("missing previous epoch {} for unlock events", prev_epoch))?;
+    let prev_pivot = prev_hashes
+        .last()
+        .ok_or_else(|| anyhow!("previous epoch {} has no pivot", prev_epoch))?;
+    let prev_header = read_header(pow, prev_pivot)?;
+    let mut last_pos_ref: Option<H256> =
+        effective_pos_reference(&prev_header, pos_enable).copied();
+    // The previous epoch's pos_reference may not be in pos_blocks (which only
+    // covers the current packet), so look it up from the PoS DB on demand.
+    let mut last_version: Option<u64> = last_pos_ref
+        .as_ref()
+        .map(|h| pos.get_committed_block(h).map(|cb| cb.version))
+        .transpose()?;
+
+    let mut result = HashMap::new();
+
+    for epoch in epochs {
+        let pivot_hash = epoch
+            .executed
+            .last()
+            .ok_or_else(|| anyhow!("epoch {} has no pivot", epoch.number))?;
+        let header = read_header(pow, pivot_hash)?;
+        let current_pos_ref = effective_pos_reference(&header, pos_enable).copied();
+
+        if let (Some(prev_ver), Some(curr)) = (last_version, current_pos_ref.as_ref()) {
+            if last_pos_ref.as_ref() != Some(curr) {
+                if let Some(curr_cb) = pos_blocks.get(curr) {
+                    let unlocks = pos.read_unlock_events(prev_ver, curr_cb.version)?;
+                    if !unlocks.is_empty() {
+                        result.insert(epoch.number, unlocks);
+                    }
+                }
+            }
+        }
+
+        if let Some(curr) = current_pos_ref.as_ref() {
+            last_version = pos_blocks.get(curr).map(|cb| cb.version);
+        }
+        last_pos_ref = current_pos_ref;
+    }
+
+    Ok(result)
 }

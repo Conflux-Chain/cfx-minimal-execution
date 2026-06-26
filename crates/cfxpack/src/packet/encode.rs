@@ -302,10 +302,10 @@ fn encode_tx_payload(
     sender_nonce_index: &HashMap<usize, u64>,
     seen_txs: &mut HashMap<H256, (usize, usize)>,
 ) -> Result<Vec<u8>> {
-    if block.transactions.is_empty() && block.pos_rewards.is_empty() {
+    if block.transactions.is_empty() && block.pos_rewards.is_empty() && block.unlock_events.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stream = RlpStream::new_list(block.transactions.len() + block.pos_rewards.len());
+    let mut stream = RlpStream::new_list(block.transactions.len() + block.pos_rewards.len() + block.unlock_events.len());
     let encoded_refs = (block.transaction_refs.len() == block.transactions.len())
         .then_some(block.transaction_refs.as_slice());
     for (tx_index, tx) in block.transactions.iter().enumerate() {
@@ -335,10 +335,11 @@ fn encode_tx_payload(
             sender_nonce_index,
         )?;
     }
-    // PoS interest distributions (tag 3) trail the transaction items in the same
-    // RLP list; the decoder routes them to `Block::pos_rewards`. See DESIGN §8.8.
     for entry in &block.pos_rewards {
         append_pos_reward(&mut stream, entry);
+    }
+    for entry in &block.unlock_events {
+        append_unlock_event(&mut stream, entry);
     }
     Ok(stream.out().to_vec())
 }
@@ -357,6 +358,13 @@ fn append_pos_reward(stream: &mut RlpStream, entry: &super::PosRewardEntry) {
         stream.append(&u256_to_be(r.reward).as_slice());
     }
     stream.append(&entry.execution_epoch_hash.as_bytes());
+}
+
+fn append_unlock_event(stream: &mut RlpStream, entry: &super::UnlockEntry) {
+    stream.begin_list(3);
+    stream.append(&4u8);
+    stream.append(&entry.identifier.as_bytes());
+    stream.append(&entry.unlocked);
 }
 
 fn append_tx(

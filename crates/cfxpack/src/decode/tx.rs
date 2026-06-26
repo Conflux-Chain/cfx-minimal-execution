@@ -4,7 +4,7 @@
 
 use super::{decode_u256_bytes, table_get};
 use crate::codec::{read_uleb128, zigzag_decode};
-use crate::packet::{PosRewardAccount, PosRewardEntry, SenderBaseNonce, FLAG_TX_COMPRESSED};
+use crate::packet::{PosRewardAccount, PosRewardEntry, SenderBaseNonce, UnlockEntry, FLAG_TX_COMPRESSED};
 use anyhow::{anyhow, ensure, Context, Result};
 use cfx_types::{Address, AddressSpaceUtil, H256, U256};
 use primitives::{
@@ -33,6 +33,7 @@ pub(super) fn decode_tx_payload(
     Vec<SignedTransaction>,
     Vec<Option<(usize, usize)>>,
     Vec<PosRewardEntry>,
+    Vec<UnlockEntry>,
 )> {
     let absolute = tx_segment_offset + tx_offset_units as usize * 4;
     ensure!(absolute < data.len(), "tx payload offset out of bounds");
@@ -54,6 +55,7 @@ pub(super) fn decode_tx_payload(
     let mut out = Vec::new();
     let mut refs = Vec::new();
     let mut pos_rewards = Vec::new();
+    let mut unlock_events = Vec::new();
     for i in 0..rlp.item_count()? {
         let item = rlp.at(i)?;
         let marker: u8 = item.val_at(0)?;
@@ -69,9 +71,9 @@ pub(super) fn decode_tx_payload(
             );
             refs.push(Some((block_index, tx_index)));
         } else if marker == 3 {
-            // PoS interest distribution (tag 3), not a transaction — collected
-            // separately and applied at epoch settlement. See encode/append_pos_reward.
             pos_rewards.push(decode_pos_reward(&item)?);
+        } else if marker == 4 {
+            unlock_events.push(decode_unlock_event(&item)?);
         } else {
             out.push(decode_tx_item(
                 &item,
@@ -83,7 +85,7 @@ pub(super) fn decode_tx_payload(
             refs.push(None);
         }
     }
-    Ok((out, refs, pos_rewards))
+    Ok((out, refs, pos_rewards, unlock_events))
 }
 
 /// Decode a tag-3 PoS-reward item: `[3, [[address, pos_identifier, reward], ...],
@@ -108,6 +110,15 @@ fn decode_pos_reward(item: &Rlp) -> Result<PosRewardEntry> {
     Ok(PosRewardEntry {
         account_rewards,
         execution_epoch_hash: H256::from_slice(&exec_bytes),
+    })
+}
+
+fn decode_unlock_event(item: &Rlp) -> Result<UnlockEntry> {
+    let id_bytes = item.val_at::<Vec<u8>>(1)?;
+    ensure!(id_bytes.len() == 32, "unlock identifier not 32 bytes");
+    Ok(UnlockEntry {
+        identifier: H256::from_slice(&id_bytes),
+        unlocked: item.val_at(2)?,
     })
 }
 

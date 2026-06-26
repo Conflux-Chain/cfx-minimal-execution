@@ -1,7 +1,7 @@
 use super::ExtractConfig;
 use anyhow::{anyhow, Context, Result};
 use cfx_types::H256;
-use cfxpack::packet::{PosRewardAccount, PosRewardEntry};
+use cfxpack::packet::{PosRewardAccount, PosRewardEntry, UnlockEntry};
 use diem_types::committed_block::CommittedBlock;
 use primitives::{Block, BlockHeader, SignedTransaction};
 use rlp::Rlp;
@@ -207,6 +207,103 @@ impl PosDb {
             .map_err(|e| anyhow!("read committed_block: {e}"))?
             .ok_or_else(|| anyhow!("missing committed_block for {hash:?}"))?;
         bcs::from_bytes(&value).context("decode committed_block")
+    }
+
+    /// Scan the `event` CF for UnlockEvent entries in the version range
+    /// `[start_version, end_version)` — matching production's
+    /// `get_events(parent_pos_ref, current_pos_ref)` semantics. The event CF
+    /// key is `version(BE u64) || index(BE u64)` and the value is BCS-encoded
+    /// `ContractEvent`.
+    pub(super) fn read_unlock_events(
+        &self, start_version: u64, end_version: u64,
+    ) -> Result<Vec<UnlockEntry>> {
+        if start_version >= end_version {
+            return Ok(Vec::new());
+        }
+        let handle = self
+            .db
+            .cf_handle("event")
+            .ok_or_else(|| anyhow!("missing event CF"))?;
+        let mut iter = DBIterator::new_cf(&self.db, handle, no_cache_read_options());
+        let seek_key = start_version.to_be_bytes();
+        iter.seek(SeekKey::Key(&seek_key))
+            .map_err(|e| anyhow!("seek event CF: {e}"))?;
+        let mut out = Vec::new();
+        while iter.valid().map_err(|e| anyhow!("iter event CF: {e}"))? {
+            let key = iter.key();
+            if key.len() < 8 {
+                break;
+            }
+            let version = u64::from_be_bytes(key[..8].try_into().unwrap());
+            if version >= end_version {
+                break;
+            }
+            let value = iter.value();
+            if let Some(entry) = try_decode_unlock_event(value) {
+                out.push(entry);
+            }
+            iter.next().map_err(|e| anyhow!("iter event CF next: {e}"))?;
+        }
+        Ok(out)
+    }
+}
+
+/// The BCS-encoded UnlockEvent event key (40 bytes): salt=5 (LE u64) ||
+/// address 0x1DC (32 bytes, left-padded). Used to filter ContractEvent entries.
+const UNLOCK_EVENT_KEY: [u8; 40] = {
+    let mut key = [0u8; 40];
+    key[0] = 5; // salt=5 LE
+    key[39] = 0xDC; // address 0x1DC low byte
+    key[38] = 0x01; // address 0x1DC high byte
+    key
+};
+
+/// Try to decode a BCS ContractEvent value as an UnlockEvent. Returns None if
+/// the event key doesn't match UnlockEvent.
+fn try_decode_unlock_event(value: &[u8]) -> Option<UnlockEntry> {
+    // BCS layout: [0x00 (V0 variant)] [0x28 (EventKey serde_bytes length=40)]
+    //             [40 bytes EventKey data] [uleb128 len] [event_data bytes]
+    if value.len() < 43 || value[0] != 0 || value[1] != 40 {
+        return None;
+    }
+    if value[2..42] != UNLOCK_EVENT_KEY {
+        return None;
+    }
+    let mut pos = 42;
+    let data_len = bcs_read_uleb128(value, &mut pos)?;
+    if pos + data_len > value.len() {
+        return None;
+    }
+    let event_data = &value[pos..pos + data_len];
+    // UnlockEvent BCS: [32 bytes AccountAddress (node_id)] [u64 LE unlocked]
+    if event_data.len() < 40 {
+        return None;
+    }
+    let identifier = H256::from_slice(&event_data[..32]);
+    let unlocked = u64::from_le_bytes(event_data[32..40].try_into().ok()?);
+    Some(UnlockEntry {
+        identifier,
+        unlocked,
+    })
+}
+
+fn bcs_read_uleb128(data: &[u8], pos: &mut usize) -> Option<usize> {
+    let mut result: usize = 0;
+    let mut shift = 0;
+    loop {
+        if *pos >= data.len() {
+            return None;
+        }
+        let byte = data[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7F) as usize) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
     }
 }
 

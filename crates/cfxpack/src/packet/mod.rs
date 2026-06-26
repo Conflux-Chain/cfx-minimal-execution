@@ -72,6 +72,17 @@ pub struct PosRewardEntry {
     pub execution_epoch_hash: H256,
 }
 
+/// A PoS node unlock event, mirroring production `UnlockEvent`. The extractor
+/// reads it from the pos-ledger-db `event` CF and attributes it to the PoW
+/// epoch where `pos_reference` changed; it is carried in that epoch's last
+/// block's tx segment (tag-4 item). The executor calls `update_pos_status` to
+/// adjust `TotalPosStaking`. See DESIGN.md §8.8.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlockEntry {
+    pub identifier: H256,
+    pub unlocked: u64,
+}
+
 // `Serialize`/`Deserialize` are required by the executor's resume checkpoint
 // (which persists `Vec<Block>`); harmless to the extractor, which never
 // serializes it. `primitives` derives serde on the transaction types, so this
@@ -105,6 +116,11 @@ pub struct Block {
     /// load).
     #[serde(skip)]
     pub pos_rewards: Vec<PosRewardEntry>,
+    /// PoS node unlock events attributed to this block's epoch (DESIGN §8.8).
+    /// Populated by the decoder from tag-4 tx-segment items; the executor calls
+    /// `update_pos_status` to adjust `TotalPosStaking`.
+    #[serde(skip)]
+    pub unlock_events: Vec<UnlockEntry>,
     /// PoS view number derived from this block's `pos_reference`. Not part of
     /// the wire format: populated by the decoder from the Packet's `pos_entries`
     /// table, or by the extractor from the PoS DB. `None` before PoS activation.
@@ -156,6 +172,7 @@ mod tests {
                     transactions: Vec::new(),
                     transaction_refs: Vec::new(),
                     pos_rewards: Vec::new(),
+                    unlock_events: Vec::new(),
                     pos_view: None,
                 },
                 Block {
@@ -179,6 +196,7 @@ mod tests {
                     transactions: Vec::new(),
                     transaction_refs: Vec::new(),
                     pos_rewards: Vec::new(),
+                    unlock_events: Vec::new(),
                     pos_view: Some(7),
                 },
             ],
@@ -260,6 +278,7 @@ mod tests {
                 transactions: vec![tx],
                 transaction_refs: Vec::new(),
                 pos_rewards: Vec::new(),
+                unlock_events: Vec::new(),
                 pos_view: None,
             }],
         };
@@ -285,5 +304,66 @@ mod tests {
         let reencoded_report = verify_packet(&reencoded).expect("verify reencoded tx packet");
         assert_eq!(reencoded_report.transaction_blocks, 1);
         assert_eq!(reencoded_report.transaction_items, 1);
+    }
+
+    #[test]
+    fn raw_to_packet_roundtrip_with_unlock_events() {
+        let author = Address::from_low_u64_be(1);
+        let node_id = H256::from_low_u64_be(0xABCD);
+        let raw = Packet {
+            prev_last_hash: H256::from_low_u64_be(9),
+            prev_last_deferred_state_root: H256::from_low_u64_be(10),
+            first_block_number: 100,
+            min_timestamp: 1_700_000_000,
+            min_height: 42,
+            min_pos_height: 0,
+            addresses: vec![author],
+            pos_entries: Vec::new(),
+            difficulties: vec![U256::from(1000)],
+            sender_base_nonces: Vec::new(),
+            gas_prices: Vec::new(),
+            blocks: vec![Block {
+                epoch: 42,
+                index: 0,
+                hash: H256::from_low_u64_be(11),
+                deferred_state_root: H256::from_low_u64_be(12),
+                deferred_receipts_root: H256::from_low_u64_be(13),
+                deferred_logs_bloom_hash: H256::from_low_u64_be(14),
+                flags: FLAG_PIVOT,
+                author,
+                timestamp: 1_700_000_000,
+                difficulty: U256::from(1000),
+                gas_limit: U256::from(30_000_000),
+                base_price_core: U256::zero(),
+                base_price_espace: U256::zero(),
+                height: 42,
+                blame: 0,
+                finalized_epoch: 0,
+                base_reward: U256::from(1),
+                transactions: Vec::new(),
+                transaction_refs: Vec::new(),
+                pos_rewards: Vec::new(),
+                unlock_events: vec![
+                    UnlockEntry { identifier: node_id, unlocked: 100 },
+                    UnlockEntry { identifier: H256::from_low_u64_be(0xBEEF), unlocked: 50 },
+                ],
+                pos_view: None,
+            }],
+        };
+
+        let packet = encode_packet(&raw).expect("encode unlock packet");
+        let report = verify_packet(&packet).expect("verify unlock packet");
+        assert_eq!(report.block_count, 1);
+        assert_eq!(report.transaction_blocks, 1);
+
+        let decoded = decode_packet(&packet).expect("decode unlock packet");
+        assert_eq!(decoded.blocks[0].transactions.len(), 0);
+        assert_eq!(decoded.blocks[0].unlock_events.len(), 2);
+        assert_eq!(decoded.blocks[0].unlock_events[0].identifier, node_id);
+        assert_eq!(decoded.blocks[0].unlock_events[0].unlocked, 100);
+        assert_eq!(decoded.blocks[0].unlock_events[1].unlocked, 50);
+
+        let reencoded = encode_packet(&decoded).expect("reencode unlock packet");
+        assert_eq!(reencoded, packet);
     }
 }
