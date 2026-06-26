@@ -231,7 +231,19 @@ mod tests {
     fn zigzag_roundtrips_and_preserves_sign() {
         // Spans the ± TRANSACTION_DEFAULT_EPOCH_BOUND range an epoch_height
         // offset can occupy, plus the boundaries.
-        for v in [0i64, 1, -1, 100, -100, 99_998, -99_998, 100_000, -100_000, i64::MAX, i64::MIN] {
+        for v in [
+            0i64,
+            1,
+            -1,
+            100,
+            -100,
+            99_998,
+            -99_998,
+            100_000,
+            -100_000,
+            i64::MAX,
+            i64::MIN,
+        ] {
             assert_eq!(zigzag_decode(zigzag_encode(v)), v, "roundtrip {v}");
         }
         // Small magnitudes of either sign stay small (the point of zigzag).

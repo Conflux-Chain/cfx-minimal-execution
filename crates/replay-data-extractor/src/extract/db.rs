@@ -108,7 +108,8 @@ impl PowDb {
     /// `#[derive(RlpEncodable)]`): `[ [ [addr, pos_id, reward], ... ], exec_hash ]`.
     /// Full-CF scan — fine for bounded ranges; revisit for whole-chain runs.
     pub(super) fn read_pos_rewards(
-        &self, pivots: &HashSet<H256>,
+        &self,
+        pivots: &HashSet<H256>,
     ) -> Result<HashMap<H256, PosRewardEntry>> {
         let mut out = HashMap::new();
         if pivots.is_empty() {
@@ -215,7 +216,9 @@ impl PosDb {
     /// key is `version(BE u64) || index(BE u64)` and the value is BCS-encoded
     /// `ContractEvent`.
     pub(super) fn read_unlock_events(
-        &self, start_version: u64, end_version: u64,
+        &self,
+        start_version: u64,
+        end_version: u64,
     ) -> Result<Vec<UnlockEntry>> {
         if start_version >= end_version {
             return Ok(Vec::new());
@@ -242,7 +245,8 @@ impl PosDb {
             if let Some(entry) = try_decode_unlock_event(value) {
                 out.push(entry);
             }
-            iter.next().map_err(|e| anyhow!("iter event CF next: {e}"))?;
+            iter.next()
+                .map_err(|e| anyhow!("iter event CF next: {e}"))?;
         }
         Ok(out)
     }

@@ -1,8 +1,8 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use cfx_types::{Space, H256};
 use cfxpack::packet::{
-    encode_packet, Block, Packet, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT,
-    FLAG_SKIPPED_EXECUTION, FLAG_ZERO_TOTAL_REWARD,
+    encode_packet, Block, Packet, FLAG_ADAPTIVE, FLAG_ESPACE, FLAG_PIVOT, FLAG_SKIPPED_EXECUTION,
+    FLAG_ZERO_TOTAL_REWARD,
 };
 use diem_types::committed_block::CommittedBlock;
 use primitives::{block_header::CIP112_TRANSITION_HEIGHT, BlockHeader, SignedTransaction};
@@ -504,9 +504,10 @@ fn build_block_inputs(
             &raw,
             config.chain.pos_reference_enable_height,
         )?;
-        let pos_view = effective_pos_reference(&raw.header, config.chain.pos_reference_enable_height)
-            .and_then(|pr| pos_blocks.get(pr))
-            .map(|c| c.view);
+        let pos_view =
+            effective_pos_reference(&raw.header, config.chain.pos_reference_enable_height)
+                .and_then(|pr| pos_blocks.get(pr))
+                .map(|c| c.view);
         blocks.push(Block {
             epoch: raw.epoch,
             index,
@@ -610,8 +611,7 @@ fn collect_unlock_events(
         .last()
         .ok_or_else(|| anyhow!("previous epoch {} has no pivot", prev_epoch))?;
     let prev_header = read_header(pow, prev_pivot)?;
-    let mut last_pos_ref: Option<H256> =
-        effective_pos_reference(&prev_header, pos_enable).copied();
+    let mut last_pos_ref: Option<H256> = effective_pos_reference(&prev_header, pos_enable).copied();
     // The previous epoch's pos_reference may not be in pos_blocks (which only
     // covers the current packet), so look it up from the PoS DB on demand.
     let mut last_version: Option<u64> = last_pos_ref

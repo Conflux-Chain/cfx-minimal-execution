@@ -131,7 +131,10 @@ pub struct Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode::{decode_packet, decode_packet_ext}, verify::verify_packet};
+    use crate::{
+        decode::{decode_packet, decode_packet_ext},
+        verify::verify_packet,
+    };
     use cfx_types::AddressSpaceUtil;
     use primitives::transaction::NativeTransaction;
 
@@ -344,8 +347,14 @@ mod tests {
                 transaction_refs: Vec::new(),
                 pos_rewards: Vec::new(),
                 unlock_events: vec![
-                    UnlockEntry { identifier: node_id, unlocked: 100 },
-                    UnlockEntry { identifier: H256::from_low_u64_be(0xBEEF), unlocked: 50 },
+                    UnlockEntry {
+                        identifier: node_id,
+                        unlocked: 100,
+                    },
+                    UnlockEntry {
+                        identifier: H256::from_low_u64_be(0xBEEF),
+                        unlocked: 50,
+                    },
                 ],
                 pos_view: None,
             }],

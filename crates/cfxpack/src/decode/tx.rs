@@ -4,7 +4,9 @@
 
 use super::{decode_u256_bytes, table_get};
 use crate::codec::{read_uleb128, zigzag_decode};
-use crate::packet::{PosRewardAccount, PosRewardEntry, SenderBaseNonce, UnlockEntry, FLAG_TX_COMPRESSED};
+use crate::packet::{
+    PosRewardAccount, PosRewardEntry, SenderBaseNonce, UnlockEntry, FLAG_TX_COMPRESSED,
+};
 use anyhow::{anyhow, ensure, Context, Result};
 use cfx_types::{Address, AddressSpaceUtil, H256, U256};
 use primitives::{
