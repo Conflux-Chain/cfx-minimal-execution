@@ -17,7 +17,7 @@ fi
 
 mkdir -p "$(dirname "$EXPECTED")"
 cd "$WORKSPACE_ROOT"
-cargo run --quiet -p cfx-minimal-mpt --bin trace_standalone > "$EXPECTED"
+cargo run --release --quiet -p cfx-minimal-mpt --bin trace_standalone > "$EXPECTED"
 
 cd "$ORACLE_DIR"
 cargo llvm-cov clean --workspace
