@@ -50,7 +50,7 @@ const PARALLEL_REBUILD_DEPTH: usize = 3;
 /// Cache keyed by a node's routing nibble prefix. FxHash, not SipHash: these
 /// short byte (nibble) keys are hashed on every node visit and SipHash showed
 /// up prominently in profiles.
-type Cache = FxHashMap<Vec<u8>, H256>;
+pub(crate) type Cache = FxHashMap<Vec<u8>, H256>;
 
 /// Controls which subtree hashes are retained after a root walk.
 ///
@@ -62,6 +62,34 @@ type Cache = FxHashMap<Vec<u8>, H256>;
 pub(crate) enum CachePolicy {
     Full,
     SkipSingleton,
+}
+
+#[cfg(feature = "snapshot-lmdb")]
+pub(crate) fn rebuild_snapshot_root_cache(
+    snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>,
+    cache_policy: CachePolicy,
+) -> (H256, Cache) {
+    if snapshot.is_empty() {
+        return (MERKLE_NULL_NODE, Cache::default());
+    }
+
+    let encoded: Vec<(Vec<u8>, &[u8])> = snapshot
+        .iter()
+        .map(|(key, value)| (bytes_to_nibbles(key), value.as_ref()))
+        .collect();
+    let entries: Vec<EntryRef<'_>> = encoded
+        .iter()
+        .map(|(key, value)| EntryRef {
+            key: key.as_slice(),
+            value: EntryValueRef::Live(value),
+        })
+        .collect();
+    let (root, cache_entries) =
+        memo_node_rebuild(&entries, &[], false, cache_policy, PARALLEL_REBUILD_DEPTH);
+    let mut cache = Cache::default();
+    cache.reserve(cache_entries.len());
+    cache.extend(cache_entries);
+    (root, cache)
 }
 
 /// Incremental delta-trie root.
@@ -147,7 +175,7 @@ impl IncrementalTrie {
                 .iter()
                 .map(|(key, value)| EntryRef {
                     key: key.as_slice(),
-                    value,
+                    value: EntryValueRef::Mpt(value),
                 })
                 .collect();
             let (root, cache_entries) =
@@ -347,7 +375,24 @@ fn memo_node(
 #[derive(Clone, Copy)]
 struct EntryRef<'a> {
     key: &'a [u8],
-    value: &'a MptValue,
+    value: EntryValueRef<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum EntryValueRef<'a> {
+    Mpt(&'a MptValue),
+    #[cfg(feature = "snapshot-lmdb")]
+    Live(&'a [u8]),
+}
+
+impl<'a> EntryValueRef<'a> {
+    fn merkle_value(self) -> &'a [u8] {
+        match self {
+            Self::Mpt(value) => value.merkle_value(),
+            #[cfg(feature = "snapshot-lmdb")]
+            Self::Live(value) => value,
+        }
+    }
 }
 
 /// Cold-cache root/cache rebuild over an already sorted entry slice.

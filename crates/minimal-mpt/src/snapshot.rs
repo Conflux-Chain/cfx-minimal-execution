@@ -60,7 +60,7 @@ impl SnapshotTrie {
 mod lmdb {
     use super::*;
     use crate::{
-        incremental::{common_prefix_len, nibbles_to_bytes},
+        incremental::{common_prefix_len, nibbles_to_bytes, rebuild_snapshot_root_cache},
         trie::{bytes_to_nibbles, compute_node_merkle, compute_path_merkle, CHILDREN},
         types::MERKLE_NULL_NODE,
     };
@@ -120,11 +120,12 @@ mod lmdb {
                     .expect("load snapshot entry into LMDB");
             }
             wtxn.commit().expect("commit LMDB snapshot load");
+            let (_, cache) = rebuild_snapshot_root_cache(snapshot, CachePolicy::SkipSingleton);
             Self {
                 _dir: dir,
                 env,
                 db,
-                cache: Cache::default(),
+                cache,
                 dirty: BTreeSet::new(),
                 len: snapshot.len(),
             }
