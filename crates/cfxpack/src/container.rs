@@ -13,18 +13,27 @@ pub const HEADER_LEN: u64 = 24;
 /// start_epoch(8) + epoch_count(8) + offset(8) + length(8)
 pub const DIR_ENTRY_LEN: u64 = 32;
 
-/// All `.cfxpack` files in `dir`, sorted by their start epoch (ascending).
+/// All `.cfxpack` (or `.cfxpack.zst`) files in `dir`, sorted by start epoch.
+/// When both compressed and uncompressed variants exist for the same epoch
+/// range, the `.zst` file wins.
 pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+    use std::collections::BTreeMap;
+    let mut by_start: BTreeMap<u64, PathBuf> = BTreeMap::new();
+    for entry in std::fs::read_dir(dir)
         .with_context(|| format!("read dir {}", dir.display()))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.extension()
-                .map(|ext| ext == "cfxpack")
-                .unwrap_or(false)
-        })
-        .collect();
-    files.sort_by_key(|path| start_epoch(path).unwrap_or(u64::MAX));
+    {
+        let path = entry?.path();
+        if !is_cfxpack(&path) {
+            continue;
+        }
+        let Some(start) = start_epoch(&path) else { continue };
+        let prefer_new = is_compressed(&path)
+            || !by_start.get(&start).is_some_and(|old| is_compressed(old));
+        if prefer_new {
+            by_start.insert(start, path);
+        }
+    }
+    let files: Vec<PathBuf> = by_start.into_values().collect();
     anyhow::ensure!(!files.is_empty(), "no .cfxpack files in {}", dir.display());
     Ok(files)
 }
@@ -74,16 +83,40 @@ pub fn parse_directory(data: &[u8]) -> Result<Vec<(u64, u64, usize, usize)>> {
     Ok(entries)
 }
 
-/// The start epoch encoded in a `<prefix>_<start>_<end>.cfxpack` file name.
+/// Whether `path` names a `.cfxpack` or `.cfxpack.zst` file.
+pub fn is_cfxpack(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    name.ends_with(".cfxpack") || name.ends_with(".cfxpack.zst")
+}
+
+/// Whether `path` is a zstd-compressed container (`.cfxpack.zst`).
+pub fn is_compressed(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".cfxpack.zst"))
+}
+
+/// Strip `.cfxpack` or `.cfxpack.zst` and return the base stem
+/// (`epochs_<start>_<end>`).
+fn cfxpack_stem(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_suffix(".cfxpack.zst")
+        .or_else(|| name.strip_suffix(".cfxpack"))
+}
+
+/// The start epoch encoded in a `<prefix>_<start>_<end>.cfxpack[.zst]` file name.
 pub fn start_epoch(path: &Path) -> Option<u64> {
-    let stem = path.file_stem()?.to_str()?;
+    let stem = cfxpack_stem(path)?;
     let mut parts = stem.rsplit('_');
     let _end = parts.next()?;
     parts.next()?.parse().ok()
 }
 
-/// The end epoch encoded in a `<prefix>_<start>_<end>.cfxpack` file name.
+/// The end epoch encoded in a `<prefix>_<start>_<end>.cfxpack[.zst]` file name.
 pub fn end_epoch(path: &Path) -> Option<u64> {
-    let stem = path.file_stem()?.to_str()?;
+    let stem = cfxpack_stem(path)?;
     stem.rsplit('_').next()?.parse().ok()
 }
