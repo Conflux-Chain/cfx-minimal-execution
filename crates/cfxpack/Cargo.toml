@@ -16,3 +16,7 @@ snap = "1.1"
 
 cfx-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
 primitives = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+
+[[bin]]
+name = "patch_pos_reward"
+path = "src/bin/patch_pos_reward.rs"

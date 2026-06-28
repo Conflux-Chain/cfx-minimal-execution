@@ -32,3 +32,7 @@ tempfile = "3"
 [[bin]]
 name = "cfx-replay-data-extractor"
 path = "src/main.rs"
+
+[[bin]]
+name = "dump_pos_reward"
+path = "src/bin/dump_pos_reward.rs"
