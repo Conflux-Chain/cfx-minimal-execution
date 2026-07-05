@@ -2,7 +2,7 @@ use crate::{
     incremental::CachePolicy,
     key_codec::{DeltaMptKeyPadding, StorageKeyWithSpace},
     snapshot::SnapshotTrie,
-    store::{MptValueDisk, PersistedState, StateStore},
+    store::{PersistedState, StateStore},
     trie::{trie_root, MptValue},
     types::{CommitRoot, MptKeyValue, Result, H256, MERKLE_NULL_NODE},
 };
@@ -116,32 +116,8 @@ impl State {
         let intermediate_entries = state.intermediate.len();
         let delta_entries = state.delta.len();
 
-        let t = std::time::Instant::now();
-        let intermediate = state
-            .intermediate
-            .into_iter()
-            .map(|(k, v)| (k, MptValue::from(v)))
-            .collect();
-        if recover_timing {
-            eprintln!(
-                "[recover] intermediate_build entries={} elapsed={}ms",
-                intermediate_entries,
-                t.elapsed().as_millis()
-            );
-        }
-        let t = std::time::Instant::now();
-        let delta = state
-            .delta
-            .into_iter()
-            .map(|(k, v)| (k, MptValue::from(v)))
-            .collect();
-        if recover_timing {
-            eprintln!(
-                "[recover] delta_build entries={} elapsed={}ms",
-                delta_entries,
-                t.elapsed().as_millis()
-            );
-        }
+        let intermediate = state.intermediate;
+        let delta = state.delta;
         let t = std::time::Instant::now();
         let mut snapshot_inc = SnapshotTrie::from_snapshot(&state.snapshot);
         if recover_timing {
@@ -223,9 +199,9 @@ impl State {
         // 1. snapshot — streamed straight into the snapshot store.
         let mut snapshot_inc = SnapshotTrie::from_reader(reader)?;
         // 2-3. intermediate / delta — small, plain bincode.
-        let intermediate_disk: BTreeMap<Vec<u8>, MptValueDisk> =
+        let intermediate: BTreeMap<Vec<u8>, MptValue> =
             bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        let delta_disk: BTreeMap<Vec<u8>, MptValueDisk> =
+        let delta: BTreeMap<Vec<u8>, MptValue> =
             bincode::deserialize_from(&mut *reader).map_err(bin)?;
         // 4-8. scalar tail.
         let intermediate_mpt_key_padding: [u8; 32] =
@@ -236,15 +212,6 @@ impl State {
         let snapshot_epoch_count: u32 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
         let last_root: Option<CommitRoot> =
             bincode::deserialize_from(&mut *reader).map_err(bin)?;
-
-        let intermediate: BTreeMap<Vec<u8>, MptValue> = intermediate_disk
-            .into_iter()
-            .map(|(k, v)| (k, MptValue::from(v)))
-            .collect();
-        let delta: BTreeMap<Vec<u8>, MptValue> = delta_disk
-            .into_iter()
-            .map(|(k, v)| (k, MptValue::from(v)))
-            .collect();
 
         let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
         let intermediate_root = trie_root(&intermediate);
@@ -276,18 +243,8 @@ impl State {
     pub fn persisted(&self) -> PersistedState {
         PersistedState {
             snapshot: self.snapshot.to_canonical_map(),
-            intermediate: self
-                .intermediate
-                .clone()
-                .into_iter()
-                .map(|(k, v)| (k, MptValueDisk::from(v)))
-                .collect(),
-            delta: self
-                .delta
-                .clone()
-                .into_iter()
-                .map(|(k, v)| (k, MptValueDisk::from(v)))
-                .collect(),
+            intermediate: self.intermediate.clone(),
+            delta: self.delta.clone(),
             intermediate_mpt_key_padding: self.intermediate_padding.0,
             delta_mpt_key_padding: self.delta_padding.0,
             height: self.height,
@@ -302,18 +259,8 @@ impl State {
     pub fn persisted_without_snapshot(&self) -> PersistedState {
         PersistedState {
             snapshot: BTreeMap::new(),
-            intermediate: self
-                .intermediate
-                .clone()
-                .into_iter()
-                .map(|(k, v)| (k, MptValueDisk::from(v)))
-                .collect(),
-            delta: self
-                .delta
-                .clone()
-                .into_iter()
-                .map(|(k, v)| (k, MptValueDisk::from(v)))
-                .collect(),
+            intermediate: self.intermediate.clone(),
+            delta: self.delta.clone(),
             intermediate_mpt_key_padding: self.intermediate_padding.0,
             delta_mpt_key_padding: self.delta_padding.0,
             height: self.height,

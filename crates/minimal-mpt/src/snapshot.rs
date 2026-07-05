@@ -160,9 +160,8 @@ mod lmdb {
         /// second full pass over the snapshot. The owned vector (one transient
         /// copy of the snapshot) is dropped as soon as the cache is built.
         pub(crate) fn from_reader(reader: &mut impl io::Read) -> io::Result<Self> {
-            use crate::incremental::{
-                read_len_prefixed, read_u64_le, rebuild_snapshot_root_cache_from_nibble_entries,
-            };
+            use crate::codec::{read_len_prefixed, read_u64_le};
+            use crate::incremental::rebuild_snapshot_root_cache_from_nibble_entries;
             let count = read_u64_le(reader)? as usize;
             let dir = tempfile::Builder::new()
                 .prefix("cfx-mmpt-snapshot-lmdb-")

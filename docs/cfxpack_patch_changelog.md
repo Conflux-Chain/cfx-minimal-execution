@@ -49,7 +49,7 @@ Conflux 全链 replay 项目中，replay-data-extractor 从本地 blockchain_dat
 ## 未覆盖项
 
 - **PoS 1543**：在前序工作中已手动修复（注入至 epochs_42894001_43010000.cfxpack），不在本次 115 条范围内
-- **PoS 17178-17181**：DB 中存在记录但远程 RPC `pos_getRewardsByEpoch` 返回 null，确认链上该 PoS epoch 无 reward 分发，cfxpack 中不应有对应数据，非 bug。这 4 个 PoS epoch 连续出现，对应 PoW 高度约 85500000 附近
+- **PoS 17178-17181**（2023-12-15 主网停机事件）：PoW 在高度 85513896 后停机，PoS 共识继续推进，经过 PoS epoch 17178-17181。PoW 恢复出块后（高度 85513897），pos_reference 从停机前的值直接跳到 17182 之后。PoS reward 分发绑定在 PoW 区块的 pos_reference 变更上，单次变更只分发一次 reward，跳过的中间 epoch 不会各自触发分发。因此 PoS 17178-17181 的 RPC `pos_getRewardsByEpoch` 返回 `powEpochHash=0x000...，accountRewards=null`。这是 by design 的行为，cfxpack 中不应有对应数据
 - **blockchain_data 本身未修改**：本次仅修复 cfxpack 提取产物，不修改源数据库
 
 ## 涉及工具

@@ -6,7 +6,7 @@ use tiny_keccak::{Hasher, Keccak};
 pub(crate) const CHILDREN: usize = 16;
 const PARALLEL_HASH_THRESHOLD: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MptValue {
     Some(Box<[u8]>),
     Tombstone,

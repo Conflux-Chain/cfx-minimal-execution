@@ -1,5 +1,5 @@
 use cfx_minimal_mpt::{
-    DeltaMptKeyPadding, FileStore, MemoryStore, MptValueDisk, PersistedState, Space, StateManager,
+    DeltaMptKeyPadding, FileStore, MemoryStore, MptValue, PersistedState, Space, StateManager,
     StateTrait, StorageKey, StorageKeyWithSpace, H256, MERKLE_NULL_NODE,
 };
 use std::fs;
@@ -325,7 +325,7 @@ fn layered_precedence_matches_delta_intermediate_snapshot_order() {
         .insert(canonical.clone(), Box::from([1u8]) as Box<[u8]>);
     persisted
         .intermediate
-        .insert(raw.clone(), MptValueDisk::Some(Box::from([2u8])));
+        .insert(raw.clone(), MptValue::Some(Box::from([2u8])));
 
     let mut state = cfx_minimal_mpt::State::from_persisted(persisted);
     assert_eq!(state.get(key.clone()).unwrap().unwrap().as_ref(), &[2u8]);

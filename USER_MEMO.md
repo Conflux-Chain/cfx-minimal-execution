@@ -13,14 +13,29 @@ Conflux 存储特点
 
 
 replay 查 bug 约束（对于跑了很久的bug）
-不要一上来猜原因 + 追代码，先看，相关高度触发了哪些 corner case（合约销毁？（涉及 get all 和 delete all）异常共识区块 reward？（涉及 reward 分钱）特定 PoS 事件？特定 CIP 激活节点？era / snapshot 切换点？特殊 storage 读写 pattern（涉及 mpt 核心）？罕见 OPCODE？（涉及 env 上下文参数正确与否））等，然后再有选择地追核心。
+不要一上来猜原因 + 追代码，先看，相关高度触发了哪些 corner case，然后再有选择地追核心。排查方向包括
+a) 合约销毁？（涉及 get all 和 delete all）
+b) 异常共识区块 reward / partial invalid ？（涉及 reward 分钱）
+c) 特定 PoS 事件？
+d) 特定 CIP 激活节点？era / snapshot 切换点？
+e) 特殊 storage 读写 pattern（涉及 mpt 核心）？
+f) 涉及 env 的 OPCODE 如 TIMESTAMP, AUTHOR？
 很多问题需要在代码中临时加日志查看运行时状态，才能准确回答。
+其他注意事项
+1) 对比 increamental 和从零构建，看看是不是 incremental 维护 trie 的问题
+2) 如果 出现 receipt 不一致，可以直接从 blockchain_data 读取原始 receipt，对比虚拟执行引擎给出的 receipt。
+3) blockchain_data 的 schema 要去读文档
+4) 生产代码可以加临时日志，其他逻辑非必要不入侵生产代码。
+
+
+
 
 工作约束
 1. Monitor 不可以使用 &
 2. test 必须使用 release + debug_assert, 禁止用 debug 跑 test
 3. 性能瓶颈分析必须有证据，而不是凭猜测这里发生了资源争用、那里xxx逻辑引入了新开销
 4. 长任务放后台 + async 定时监控。放后台任务第一时间检查正常运行。定时监控不允许跑长任务 / 盲等。
+5. cfxpack 的 spec 包含足够的
 
 
   1. MPT 和标准实现有大量修改，参考 trie.rs
@@ -46,4 +61,4 @@ AI 扫出来的注意事项
   6. genesis 在 delta、首次轮转对齐
   minimal_backend 注释说 genesis 不提交、留在 delta(height 0),advance_after_commit
   跳过 height 0,让首次 snapshot 轮转落在和真实 backend 同一个 epoch。这是个真
-  corner,目前靠注释保证,建议有针对性测试。
+  corner,目前靠注释保证。

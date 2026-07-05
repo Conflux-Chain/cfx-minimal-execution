@@ -2,7 +2,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use cfx_minimal_mpt::{
-    trie_root, DeltaMptKeyPadding, MptKeyValue, MptValue, MptValueDisk, PersistedState, Space,
+    trie_root, DeltaMptKeyPadding, MptKeyValue, MptValue, PersistedState, Space,
     State, StateTrait, StorageKey, StorageKeyWithSpace,
 };
 use libfuzzer_sys::fuzz_target;
@@ -120,8 +120,8 @@ fuzz_target!(|data: &[u8]| {
             persisted.intermediate.insert(
                 value.raw_key,
                 match value.value {
-                    Some(value) => MptValueDisk::Some(value.into_boxed_slice()),
-                    None => MptValueDisk::Tombstone,
+                    Some(value) => MptValue::Some(value.into_boxed_slice()),
+                    None => MptValue::Tombstone,
                 },
             );
         }
