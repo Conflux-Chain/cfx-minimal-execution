@@ -258,6 +258,25 @@ impl IncrementalTrie {
             .collect()
     }
 
+    /// Number of live (non-tombstone) entries.
+    pub fn live_entry_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|v| v.visible_value().is_some())
+            .count()
+    }
+
+    /// Iterate live entries as `(canonical_byte_key, value_bytes)` in sorted
+    /// order, converting nibble keys back to bytes on the fly. No intermediate
+    /// collection — each entry is yielded one at a time.
+    pub fn iter_canonical(&self) -> impl Iterator<Item = (Vec<u8>, &[u8])> + '_ {
+        self.entries.iter().filter_map(|(nibbles, value)| {
+            value
+                .visible_value()
+                .map(|v| (nibbles_to_bytes(nibbles), v))
+        })
+    }
+
     /// Number of stored entries (used by merge instrumentation).
     pub fn len(&self) -> usize {
         self.entries.len()

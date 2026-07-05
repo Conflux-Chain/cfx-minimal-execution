@@ -51,6 +51,20 @@ impl SnapshotTrie {
         self.inner.to_canonical_map()
     }
 
+    pub(crate) fn live_entry_count(&self) -> usize {
+        self.inner.live_entry_count()
+    }
+
+    pub(crate) fn for_each_canonical(
+        &self,
+        mut f: impl FnMut(Vec<u8>, &[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        for (key, value) in self.inner.iter_canonical() {
+            f(key, value)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
@@ -264,6 +278,22 @@ mod lmdb {
                     (nibbles_to_bytes(key), Box::from(value))
                 })
                 .collect()
+        }
+
+        pub(crate) fn live_entry_count(&self) -> usize {
+            self.len
+        }
+
+        pub(crate) fn for_each_canonical(
+            &self,
+            mut f: impl FnMut(Vec<u8>, &[u8]) -> io::Result<()>,
+        ) -> io::Result<()> {
+            let rtxn = self.env.read_txn().map_err(lmdb_io_error)?;
+            for item in self.db.iter(&rtxn).map_err(lmdb_io_error)? {
+                let (key, value) = item.map_err(lmdb_io_error)?;
+                f(nibbles_to_bytes(key), value)?;
+            }
+            Ok(())
         }
 
         pub(crate) fn len(&self) -> usize {

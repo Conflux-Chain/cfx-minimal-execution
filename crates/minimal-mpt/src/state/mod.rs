@@ -233,6 +233,43 @@ impl State {
         }
     }
 
+    /// Like `persisted()` but leaves `snapshot` empty. Used with
+    /// `snapshot_iter_canonical()` for streaming checkpoint writes that avoid
+    /// materializing the entire snapshot BTreeMap in memory.
+    pub fn persisted_without_snapshot(&self) -> PersistedState {
+        PersistedState {
+            snapshot: BTreeMap::new(),
+            intermediate: self
+                .intermediate
+                .clone()
+                .into_iter()
+                .map(|(k, v)| (k, MptValueDisk::from(v)))
+                .collect(),
+            delta: self
+                .delta
+                .clone()
+                .into_iter()
+                .map(|(k, v)| (k, MptValueDisk::from(v)))
+                .collect(),
+            intermediate_mpt_key_padding: self.intermediate_padding.0,
+            delta_mpt_key_padding: self.delta_padding.0,
+            height: self.height,
+            snapshot_epoch_count: self.snapshot_epoch_count,
+            last_root: self.last_root.clone(),
+        }
+    }
+
+    pub fn snapshot_live_count(&self) -> usize {
+        self.snapshot.live_entry_count()
+    }
+
+    pub fn snapshot_for_each_canonical(
+        &self,
+        f: impl FnMut(Vec<u8>, &[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.snapshot.for_each_canonical(f)
+    }
+
     pub fn put_intermediate_raw(&mut self, raw_key: Vec<u8>, value: MptValue) {
         self.intermediate.insert(raw_key, value);
         self.intermediate_root = trie_root(&self.intermediate);
