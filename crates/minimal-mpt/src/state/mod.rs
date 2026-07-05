@@ -210,8 +210,7 @@ impl State {
             bincode::deserialize_from(&mut *reader).map_err(bin)?;
         let height: u64 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
         let snapshot_epoch_count: u32 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        let last_root: Option<CommitRoot> =
-            bincode::deserialize_from(&mut *reader).map_err(bin)?;
+        let last_root: Option<CommitRoot> = bincode::deserialize_from(&mut *reader).map_err(bin)?;
 
         let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
         let intermediate_root = trie_root(&intermediate);
@@ -240,6 +239,50 @@ impl State {
         })
     }
 
+    /// Stream this state in the exact `PersistedState` field order that
+    /// `from_reader` consumes: snapshot, intermediate, delta, paddings, height,
+    /// snapshot_epoch_count, last_root.
+    pub fn write_streaming(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        use crate::codec::{write_len_prefixed, write_u64_le};
+
+        let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+
+        let expected_entries = self.snapshot.live_entry_count();
+        let expected_entries_u64 = u64::try_from(expected_entries).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snapshot entry count does not fit in u64",
+            )
+        })?;
+
+        write_u64_le(w, expected_entries_u64)?;
+        let mut entries_written = 0usize;
+        self.snapshot.for_each_canonical(|key, value| {
+            write_len_prefixed(w, &key)?;
+            write_len_prefixed(w, value)?;
+            entries_written += 1;
+            Ok(())
+        })?;
+        if entries_written != expected_entries {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "snapshot entry count changed during write: expected {expected_entries}, wrote {entries_written}"
+                ),
+            ));
+        }
+
+        bincode::serialize_into(&mut *w, &self.intermediate).map_err(bin)?;
+        bincode::serialize_into(&mut *w, &self.delta).map_err(bin)?;
+        bincode::serialize_into(&mut *w, &self.intermediate_padding.0).map_err(bin)?;
+        bincode::serialize_into(&mut *w, &self.delta_padding.0).map_err(bin)?;
+        bincode::serialize_into(&mut *w, &self.height).map_err(bin)?;
+        bincode::serialize_into(&mut *w, &self.snapshot_epoch_count).map_err(bin)?;
+        bincode::serialize_into(&mut *w, &self.last_root).map_err(bin)?;
+
+        Ok(())
+    }
+
     pub fn persisted(&self) -> PersistedState {
         PersistedState {
             snapshot: self.snapshot.to_canonical_map(),
@@ -251,33 +294,6 @@ impl State {
             snapshot_epoch_count: self.snapshot_epoch_count,
             last_root: self.last_root.clone(),
         }
-    }
-
-    /// Like `persisted()` but leaves `snapshot` empty. Used with
-    /// `snapshot_iter_canonical()` for streaming checkpoint writes that avoid
-    /// materializing the entire snapshot BTreeMap in memory.
-    pub fn persisted_without_snapshot(&self) -> PersistedState {
-        PersistedState {
-            snapshot: BTreeMap::new(),
-            intermediate: self.intermediate.clone(),
-            delta: self.delta.clone(),
-            intermediate_mpt_key_padding: self.intermediate_padding.0,
-            delta_mpt_key_padding: self.delta_padding.0,
-            height: self.height,
-            snapshot_epoch_count: self.snapshot_epoch_count,
-            last_root: self.last_root.clone(),
-        }
-    }
-
-    pub fn snapshot_live_count(&self) -> usize {
-        self.snapshot.live_entry_count()
-    }
-
-    pub fn snapshot_for_each_canonical(
-        &self,
-        f: impl FnMut(Vec<u8>, &[u8]) -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
-        self.snapshot.for_each_canonical(f)
     }
 
     pub fn put_intermediate_raw(&mut self, raw_key: Vec<u8>, value: MptValue) {
@@ -548,6 +564,24 @@ mod tests {
         manager.set(key(3), Box::from([8u8])).unwrap();
         let root = manager.commit().unwrap();
         assert_ne!(root.delta_root, MERKLE_NULL_NODE);
+    }
+
+    #[test]
+    fn write_streaming_roundtrips_persisted_state() {
+        let mut snapshot = BTreeMap::new();
+        snapshot.insert(key(1).to_key_bytes().unwrap(), Box::from([1u8, 2]));
+        snapshot.insert(key(2).to_key_bytes().unwrap(), Box::from([3u8, 4]));
+
+        let mut state = State::from_snapshot(snapshot);
+        state.put_intermediate_raw(vec![0x10, 0x20], MptValue::Some(Box::from([5u8])));
+        state.set(key(3), Box::from([6u8, 7, 8])).unwrap();
+        state.commit().unwrap();
+
+        let mut bytes = Vec::new();
+        state.write_streaming(&mut bytes).unwrap();
+        let restored = State::from_reader(&mut bytes.as_slice()).unwrap();
+
+        assert_eq!(restored.persisted(), state.persisted());
     }
 
     #[test]
