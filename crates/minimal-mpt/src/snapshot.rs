@@ -15,6 +15,14 @@ impl SnapshotTrie {
         }
     }
 
+    /// Stream the snapshot trie from a checkpoint reader, converting keys to
+    /// nibbles on the fly — no byte-keyed `BTreeMap` is ever built.
+    pub(crate) fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: crate::incremental::IncrementalTrie::from_snapshot_reader(reader)?,
+        })
+    }
+
     pub(crate) fn insert(&mut self, key: &[u8], value: MptValue) {
         self.inner.insert(key, value);
     }
@@ -143,6 +151,54 @@ mod lmdb {
                 dirty: BTreeSet::new(),
                 len: snapshot.len(),
             }
+        }
+
+        /// Stream the snapshot from a checkpoint reader straight into LMDB,
+        /// never materializing the byte-keyed `BTreeMap`. Each entry is written
+        /// to LMDB and simultaneously pushed into an owned nibble-entry vector,
+        /// so the parallel hash-cache rebuild runs off that vector without a
+        /// second full pass over the snapshot. The owned vector (one transient
+        /// copy of the snapshot) is dropped as soon as the cache is built.
+        pub(crate) fn from_reader(reader: &mut impl io::Read) -> io::Result<Self> {
+            use crate::incremental::{
+                read_len_prefixed, read_u64_le, rebuild_snapshot_root_cache_from_nibble_entries,
+            };
+            let count = read_u64_le(reader)? as usize;
+            let dir = tempfile::Builder::new()
+                .prefix("cfx-mmpt-snapshot-lmdb-")
+                .tempdir()
+                .map_err(lmdb_io_error)?;
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .map_size(lmdb_map_size())
+                    .max_dbs(1)
+                    .open(dir.path())
+                    .map_err(lmdb_io_error)?
+            };
+            let mut wtxn = env.write_txn().map_err(lmdb_io_error)?;
+            let db = env
+                .create_database(&mut wtxn, Some("snapshot"))
+                .map_err(lmdb_io_error)?;
+            let mut owned: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(count);
+            for _ in 0..count {
+                let key = read_len_prefixed(reader)?;
+                let value = read_len_prefixed(reader)?;
+                let nibbles = bytes_to_nibbles(&key);
+                db.put(&mut wtxn, nibbles.as_slice(), value.as_slice())
+                    .map_err(lmdb_io_error)?;
+                owned.push((nibbles, value));
+            }
+            wtxn.commit().map_err(lmdb_io_error)?;
+            let (_, cache) =
+                rebuild_snapshot_root_cache_from_nibble_entries(&owned, CachePolicy::SkipSingleton);
+            Ok(Self {
+                _dir: dir,
+                env,
+                db,
+                cache,
+                dirty: BTreeSet::new(),
+                len: count,
+            })
         }
 
         pub(crate) fn insert(&mut self, key: &[u8], value: MptValue) {

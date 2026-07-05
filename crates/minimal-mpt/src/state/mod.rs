@@ -210,6 +210,69 @@ impl State {
         }
     }
 
+    /// Reconstruct a `State` by streaming the serialized `PersistedState`
+    /// fields directly from `reader`, in the exact field order bincode uses for
+    /// `PersistedState` (snapshot, intermediate, delta, paddings, height,
+    /// snapshot_epoch_count, last_root). The snapshot is streamed into its
+    /// backing store (nibble map or LMDB) without ever materializing the
+    /// byte-keyed `BTreeMap`; the remaining (small) fields are read via bincode.
+    /// This is the load-side counterpart to the executor's `save_streaming`.
+    pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+
+        // 1. snapshot — streamed straight into the snapshot store.
+        let mut snapshot_inc = SnapshotTrie::from_reader(reader)?;
+        // 2-3. intermediate / delta — small, plain bincode.
+        let intermediate_disk: BTreeMap<Vec<u8>, MptValueDisk> =
+            bincode::deserialize_from(&mut *reader).map_err(bin)?;
+        let delta_disk: BTreeMap<Vec<u8>, MptValueDisk> =
+            bincode::deserialize_from(&mut *reader).map_err(bin)?;
+        // 4-8. scalar tail.
+        let intermediate_mpt_key_padding: [u8; 32] =
+            bincode::deserialize_from(&mut *reader).map_err(bin)?;
+        let delta_mpt_key_padding: [u8; 32] =
+            bincode::deserialize_from(&mut *reader).map_err(bin)?;
+        let height: u64 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
+        let snapshot_epoch_count: u32 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
+        let last_root: Option<CommitRoot> =
+            bincode::deserialize_from(&mut *reader).map_err(bin)?;
+
+        let intermediate: BTreeMap<Vec<u8>, MptValue> = intermediate_disk
+            .into_iter()
+            .map(|(k, v)| (k, MptValue::from(v)))
+            .collect();
+        let delta: BTreeMap<Vec<u8>, MptValue> = delta_disk
+            .into_iter()
+            .map(|(k, v)| (k, MptValue::from(v)))
+            .collect();
+
+        let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
+        let intermediate_root = trie_root(&intermediate);
+        let intermediate_padding = DeltaMptKeyPadding(intermediate_mpt_key_padding);
+        let delta_padding = DeltaMptKeyPadding(delta_mpt_key_padding);
+        let delta_inc = crate::incremental::IncrementalTrie::from_delta(&delta);
+
+        Ok(Self {
+            snapshot: snapshot_inc,
+            intermediate,
+            delta,
+            snapshot_root,
+            intermediate_root,
+            intermediate_padding,
+            delta_padding,
+            last_root,
+            height,
+            snapshot_epoch_count: if snapshot_epoch_count == 0 {
+                DEFAULT_SNAPSHOT_EPOCH_COUNT
+            } else {
+                snapshot_epoch_count
+            },
+            delta_inc,
+            delta_account_cache: Default::default(),
+            intermediate_account_cache: Default::default(),
+        })
+    }
+
     pub fn persisted(&self) -> PersistedState {
         PersistedState {
             snapshot: self.snapshot.to_canonical_map(),

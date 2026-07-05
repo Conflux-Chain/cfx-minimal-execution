@@ -43,6 +43,23 @@ use crate::types::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Read};
+
+/// Read a little-endian `u64` (bincode 1.x fixint length encoding).
+pub(crate) fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Read a bincode length-prefixed byte string (`u64 len` + raw bytes) — the
+/// on-disk form of `Vec<u8>` / `Box<[u8]>` under bincode 1.x default options.
+pub(crate) fn read_len_prefixed(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    let len = read_u64_le(r)? as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
 
 const PARALLEL_REBUILD_THRESHOLD: usize = 4096;
 const PARALLEL_REBUILD_DEPTH: usize = 3;
@@ -86,6 +103,35 @@ pub(crate) fn rebuild_snapshot_root_cache(
         .collect();
     let (root, cache_entries) =
         memo_node_rebuild(&entries, &[], false, cache_policy, PARALLEL_REBUILD_DEPTH);
+    let mut cache = Cache::default();
+    cache.reserve(cache_entries.len());
+    cache.extend(cache_entries);
+    (root, cache)
+}
+
+/// Like [`rebuild_snapshot_root_cache`], but over entries already keyed by
+/// **nibbles** (as streamed from a checkpoint into LMDB), ascending-sorted.
+/// Skips the byte→nibble conversion the byte-keyed variant does. The parallel
+/// rebuild (`memo_node_rebuild`) is preserved — the caller passes the owned
+/// entry vector it accumulated while writing LMDB, so no extra full pass over
+/// the snapshot is needed.
+#[cfg(feature = "snapshot-lmdb")]
+pub(crate) fn rebuild_snapshot_root_cache_from_nibble_entries(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    cache_policy: CachePolicy,
+) -> (H256, Cache) {
+    if entries.is_empty() {
+        return (MERKLE_NULL_NODE, Cache::default());
+    }
+    let refs: Vec<EntryRef<'_>> = entries
+        .iter()
+        .map(|(key, value)| EntryRef {
+            key: key.as_slice(),
+            value: EntryValueRef::Live(value.as_slice()),
+        })
+        .collect();
+    let (root, cache_entries) =
+        memo_node_rebuild(&refs, &[], false, cache_policy, PARALLEL_REBUILD_DEPTH);
     let mut cache = Cache::default();
     cache.reserve(cache_entries.len());
     cache.extend(cache_entries);
@@ -220,6 +266,28 @@ impl IncrementalTrie {
             cache: Cache::default(),
             dirty: BTreeSet::new(),
         }
+    }
+
+    /// Stream a snapshot trie from a bincode-encoded
+    /// `BTreeMap<Vec<u8>, Box<[u8]>>` (`u64 count` then `count` × `(key, value)`
+    /// length-prefixed) without ever materializing the byte-keyed map: each
+    /// entry is converted to nibbles and inserted as it is read. The canonical
+    /// byte keys are ascending on disk, and byte→nibble expansion preserves
+    /// order, so the resulting nibble map is sorted. Cache starts empty; the
+    /// first `root` recomputes it.
+    pub(crate) fn from_snapshot_reader(reader: &mut impl Read) -> io::Result<Self> {
+        let count = read_u64_le(reader)? as usize;
+        let mut entries = BTreeMap::new();
+        for _ in 0..count {
+            let key = read_len_prefixed(reader)?;
+            let value = read_len_prefixed(reader)?;
+            entries.insert(bytes_to_nibbles(&key), MptValue::Some(value.into_boxed_slice()));
+        }
+        Ok(Self {
+            entries,
+            cache: Cache::default(),
+            dirty: BTreeSet::new(),
+        })
     }
 
     /// Point lookup by canonical byte key (snapshot read path). Returns the live
