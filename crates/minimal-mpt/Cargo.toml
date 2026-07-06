@@ -24,7 +24,3 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 [[bin]]
 name = "trace_standalone"
 path = "src/bin/trace_standalone.rs"
-
-[[bin]]
-name = "ckpt_stats"
-path = "src/bin/ckpt_stats.rs"

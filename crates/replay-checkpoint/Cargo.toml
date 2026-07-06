@@ -28,3 +28,7 @@ path = "src/bin/ckpt_verify.rs"
 [[bin]]
 name = "ckpt-restore-rss"
 path = "src/bin/ckpt_restore_rss.rs"
+
+[[bin]]
+name = "ckpt-stats"
+path = "src/bin/ckpt_stats.rs"

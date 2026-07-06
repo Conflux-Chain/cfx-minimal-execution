@@ -89,27 +89,15 @@ fn merkle_for_node(
         ranges.push((child, start, end));
     }
 
-    let child_hashes: Vec<(usize, H256)> = if parallel && entries.len() >= PARALLEL_HASH_THRESHOLD {
-        ranges
-            .par_iter()
-            .map(|(child, start, end)| {
-                (
-                    *child,
-                    merkle_for_node(&entries[*start..*end], node_depth + 1, true, true),
-                )
-            })
-            .collect()
-    } else {
-        ranges
-            .iter()
-            .map(|(child, start, end)| {
-                (
-                    *child,
-                    merkle_for_node(&entries[*start..*end], node_depth + 1, false, true),
-                )
-            })
-            .collect()
+    let merkle_for_child = |&(child, start, end): &(usize, usize, usize)| {
+        (child, merkle_for_node(&entries[start..end], node_depth + 1, true, true))
     };
+    let child_hashes: Vec<_> =
+        if parallel && entries.len() >= PARALLEL_HASH_THRESHOLD {
+            ranges.par_iter().map(merkle_for_child).collect()
+        } else {
+            ranges.iter().map(merkle_for_child).collect()
+        };
 
     let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
     for (child, hash) in child_hashes {
@@ -122,24 +110,17 @@ fn merkle_for_node(
 }
 
 fn common_prefix_len(entries: &[(Vec<u8>, &MptValue)], depth: usize) -> usize {
-    if entries.is_empty() {
-        return 0;
+    // Entries are sorted, so the common prefix equals that of the endpoints.
+    match entries {
+        [(first, _), .., (last, _)] => first
+            .iter()
+            .zip(last)
+            .skip(depth)
+            .take_while(|(a, b)| a == b)
+            .count(),
+        [(k, _)] => k.len().saturating_sub(depth),
+        [] => 0,
     }
-    let first = &entries[0].0;
-    let Some(slice) = first.get(depth..) else {
-        return 0;
-    };
-    slice
-        .iter()
-        .enumerate()
-        .take_while(|(offset, nibble)| {
-            let idx = depth + offset;
-            entries
-                .iter()
-                .skip(1)
-                .all(|(key, _)| key.get(idx) == Some(nibble))
-        })
-        .count()
 }
 
 pub(crate) fn compute_node_merkle(

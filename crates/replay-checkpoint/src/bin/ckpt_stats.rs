@@ -1,35 +1,16 @@
-// Checkpoint KV distribution inspector — reads only the trie portion
-// (PersistedState) from a replay checkpoint file.
-//
-// LAYOUT CONSTRAINT: the on-disk checkpoint format is defined by the executor's
-// `Checkpoint` struct (in replay-data-executor/src/checkpoint/mod.rs). The
-// first three bincode fields are (version: u32, height: u64, mmpt:
-// PersistedState) — this partial struct relies on bincode 1.x stopping after
-// the fields it knows about. If the executor reorders or prepends fields
-// before `mmpt`, this binary must be updated to match.
-
-use cfx_minimal_mpt::{MptValue, PersistedState};
+// Checkpoint KV distribution inspector.
+use anyhow::{Context, Result};
+use cfx_minimal_mpt::MptValue;
 use std::path::PathBuf;
 
-#[derive(serde::Deserialize)]
-struct RawCheckpoint {
-    #[allow(dead_code)]
-    version: u32,
-    #[allow(dead_code)]
-    height: u64,
-    mmpt: PersistedState,
-}
-
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .expect("usage: ckpt_stats <checkpoint.bin>");
-    let bytes = std::fs::read(&path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-    let ckpt: RawCheckpoint = bincode::deserialize(&bytes)
-        .map_err(|e| anyhow::anyhow!("deserialize checkpoint: {e}"))?;
-    let mmpt = ckpt.mmpt;
+        .expect("usage: ckpt-stats <checkpoint.bin>");
+    let data = cfx_replay_checkpoint::CheckpointData::load(&path)?
+        .with_context(|| format!("no checkpoint at {}", path.display()))?;
+    let mmpt = data.state.persisted();
 
     let snap_count = mmpt.snapshot.len();
     let inter_count = mmpt.intermediate.len();

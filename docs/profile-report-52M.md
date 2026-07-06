@@ -153,3 +153,71 @@ Snapshot 使用 `CachePolicy::SkipSingleton` 策略跳过叶节点缓存以节�
 | Nibble key 改为 compact 编码或保持 byte 存储 | 内存 -2.8 GB | 中 |
 | 将 snapshot BTreeMap 替换为 LMDB（已有 `snapshot-lmdb` feature） | 内存从 ~23 GB 降至缓存 + mmap，同时消除 checkpoint 峰值 | 中 |
 | Streaming checkpoint 序列化（避免 Vec 缓冲） | 消除 checkpoint 写入 +4 GB 峰值 | 低 |
+
+---
+
+## 附录 A：稳态运行内存实测（150M 高度尺度，2026-07-06）
+
+上文第三节的内存实测在 epoch ~53M（snapshot 64.4M 条）尺度。链已增长到接近链尾，本附录在 **150M 高度尺度**（snapshot 250M 条，约 3.9× 于 53M 时）重新实测运行期内存及其分布，方法与约束不同，故单列。
+
+**采样方法**
+- **运行期稳态**：从 `ckpt_140460000` 恢复后前向执行 208,000 epoch（104 个 group，~590 eps/s），每 1s 采 `/proc/<pid>/status`（VmRSS/VmHWM）与 `smaps_rollup`。
+- **加载/恢复分布**：只读恢复生产 checkpoint（高度 150,052,000），`MMPT_RECOVER_TIMING=1` 打印各段条目数与恢复耗时。
+
+### A.1 运行期内存（active execution，高度 140.46M → 140.67M）
+
+| 指标 | 数值 |
+|------|------|
+| 加载峰值 VmHWM | **84.3 GB（80.4 GiB）** —— 发生在恢复期 `snapshot_root` 重建阶段，非执行期 |
+| 稳态 VmRSS（执行期） | **73.81 GB（70.4 GiB）** |
+| smaps Pss | 73.81 GB（≈ VmRSS，几乎无共享页） |
+| Private_Dirty / Anonymous | 73,800 MB（**占 RSS 99.98%**，全部为堆） |
+| Private_Clean（代码/rodata） | 12.2 MB |
+| Shared_Clean（共享库） | 2.3 MB |
+
+**关键观察：运行期 RSS 平坦，无 delta sawtooth。** 每 ~3.4s 跨越一个 2,000-epoch group 边界（delta 归 0 → 重建）时，1s 分辨率下 RSS 无可见波动（稳定在 73,814,992 kB）。delta trie 在一个 period 内增长到约 1 万条（数十 MB）后于边界旋转归并入 snapshot，这部分内存被分配器 arena 吸收复用，不体现为进程 RSS 的锯齿。**输入 `.cfxpack` 走缓冲 IO，进入 OS page cache（buff/cache ~40 GB），不计入进程 RSS。**
+
+### A.2 加载/恢复条目数与内存（高度 150,052,000）
+
+`MMPT_RECOVER_TIMING=1` 实测（生产 checkpoint 只读恢复）：
+
+| 项目 | 数值 |
+|------|------|
+| Snapshot 条目 | **250,008,004** |
+| Intermediate 条目 | 11,295 |
+| Delta 条目 | 0（period 边界） |
+| Hash cache 节点数（memo 内部节点） | **99,238,783** |
+| Checkpoint 文件 / 读入原始字节 | 20.78 GB |
+| after_read RSS | 20.29 GB |
+| after_deserialize RSS | 45.9 GB |
+| **恢复后常驻 RSS** | **110.9 GB（105.8 GiB）** |
+| **恢复峰值 VmHWM** | **122.2 GB（116.5 GiB）** |
+
+### A.3 RSS 分布归因（250M 尺度）
+
+进程 RSS 几乎 100% 为匿名堆，由 snapshot IncrementalTrie 主导：
+
+| 组件 | 估算 | 依据 |
+|------|------|------|
+| **Snapshot BTreeMap**（250.0M 条） | **~75–85 GB** | 沿用 A.2/三节实测的 ~3.6× KV 膨胀模型，按 250M 条线性放大 |
+| **Snapshot hash cache**（99.24M 节点） | **~12–13 GB** | 实测缓存节点数 × ~130 B/节点 |
+| Intermediate trie（11,295 条） | 数 MB | 可忽略 |
+| Delta trie（0 → period 内 ~1 万条） | 数十 MB | 被分配器吸收，不体现 RSS 锯齿 |
+| commitments / executed_epochs 有界窗口 | < 1 GB | 由 `--anomaly-streak` / `--max-mismatches` 界定的少量 epoch root |
+| 执行引擎 + cfxpack 解码缓冲 | ~2 GB | EVM 栈、交易缓冲 |
+| 代码 / rodata | ~14 MB | smaps Private_Clean + Shared_Clean |
+| 输入 `.cfxpack` | 不计入 RSS | 缓冲 IO → OS page cache |
+
+### A.4 恢复 `snapshot_root` 成本拆分（250M 条，实测）
+
+恢复时对 250M 条 snapshot 重建 merkle root 是加载阶段的主要单项开销。`root_with_policy` 命中**并行**重建路径（`entries=250,008,004 ≥ PARALLEL_REBUILD_THRESHOLD=4096`，已实测确认走 `memo_node_rebuild` 而非串行 `memo_node`），拆分为：
+
+| 阶段 | 耗时 | 占 snapshot_root | 并行度 |
+|------|------|------------------|--------|
+| `snapshot_hash`（`memo_node_rebuild` 并行 keccak） | **196,364 ms** | **91.7%** | 起步饱和全部 32 核（mpstat idle→0.00%） |
+| `snapshot_cache_extend`（99.24M 条串行 extend 进 FxHashMap） | **13,760 ms** | 6.4% | 单核 |
+| `snapshot_root` 合计 | 214,039 ms | 100% | |
+
+其余恢复段：`snapshot_build`（条目 Vec 构造）59,250 ms、`intermediate_root` 14 ms、`delta_inc_build` 0 ms；`from_persisted_total` 273,303 ms。
+
+> **结论：恢复期 `snapshot_root` 由并行 keccak 哈希主导（196s，92%），而非串行 cache 构建（13.8s，6%）。** 即便哈希已并行化（起步能打满 32 核），250M 条 + 99M 内部节点的 keccak 工作量本身仍是恢复墙钟的最大单项；串行的 `cache.extend` 只是次要项。降低恢复时间应针对哈希阶段（更深的并行切分 / 减少重哈希），而非 cache 构建。

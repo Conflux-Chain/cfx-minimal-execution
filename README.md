@@ -124,6 +124,9 @@ replay progress t=2562s height=23694000 groups=... state_match=4580000/4580000 l
 |------|------|
 | `MMPT_MERGE_TIMING=1` | 打印每次 snapshot 同步 merge 的耗时分解 |
 | `MMPT_DELTA_TIMING=1` | 每 20k commit 打印 delta root 平均耗时 |
+| `MMPT_RECOVER_TIMING=1` | 从 checkpoint 恢复时打印三段 trie（snapshot/intermediate/delta）条目数与恢复耗时（含 `snapshot_root` 哈希/cache 构建拆分） |
+
+> 运行期与恢复期内存实测（150M 高度、250M snapshot 条目：稳态 RSS ~70 GiB、恢复峰值 VmHWM ~116 GiB，及 `snapshot_root` 成本拆分）见 `docs/profile-report-52M.md` 附录 A。
 
 ## 架构与关键设计
 
