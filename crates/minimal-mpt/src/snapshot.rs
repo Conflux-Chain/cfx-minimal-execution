@@ -1,10 +1,33 @@
 use crate::{incremental::CachePolicy, trie::MptValue, types::H256};
 use std::collections::BTreeMap;
 
+/// The snapshot's value type. The snapshot never stores a tombstone (deletes are
+/// applied as removals — see [`SnapshotTrie::apply_updates`]), so it drops
+/// `MptValue`'s tombstone variant and inlines values up to 8 bytes: the ~61% of
+/// snapshot values that are ≤8 B avoid a heap allocation, trading +8 B of inline
+/// `BTreeMap` slot for the saved allocation. Merkle bytes are byte-identical to
+/// the old `MptValue::Some`, so the snapshot root and checkpoint format are
+/// unchanged.
+#[cfg(not(feature = "snapshot-lmdb"))]
+pub(crate) type SnapshotValue = smallvec::SmallVec<[u8; 8]>;
+
+#[cfg(not(feature = "snapshot-lmdb"))]
+impl crate::trie::TrieValue for SnapshotValue {
+    fn merkle_value(&self) -> &[u8] {
+        self.as_slice()
+    }
+    fn visible_value(&self) -> Option<&[u8]> {
+        Some(self.as_slice())
+    }
+    fn from_value_bytes(bytes: &[u8]) -> Self {
+        smallvec::SmallVec::from_slice(bytes)
+    }
+}
+
 #[cfg(not(feature = "snapshot-lmdb"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SnapshotTrie {
-    inner: crate::incremental::IncrementalTrie,
+    inner: crate::incremental::IncrementalTrie<SnapshotValue>,
 }
 
 #[cfg(not(feature = "snapshot-lmdb"))]
@@ -24,7 +47,14 @@ impl SnapshotTrie {
     }
 
     pub(crate) fn insert(&mut self, key: &[u8], value: MptValue) {
-        self.inner.insert(key, value);
+        // The snapshot is tombstone-free: a delete is a removal, never a stored
+        // tombstone. Convert the (always-`Some`) value into the inline type.
+        match value {
+            MptValue::Some(bytes) => self
+                .inner
+                .insert(key, <SnapshotValue as crate::trie::TrieValue>::from_value_bytes(&bytes)),
+            MptValue::Tombstone => self.inner.remove(key),
+        }
     }
 
     pub(crate) fn remove(&mut self, key: &[u8]) {

@@ -32,6 +32,32 @@ impl MptValue {
     }
 }
 
+/// A value stored in an [`crate::incremental::IncrementalTrie`] node, abstracted
+/// so the (dominant) snapshot trie can use a compact inline representation while
+/// the delta keeps the tombstone-carrying [`MptValue`]. The snapshot never holds
+/// a tombstone (deletes are applied as removals), so its value type can drop the
+/// tombstone variant entirely — see the snapshot module.
+pub trait TrieValue {
+    /// Bytes hashed for a key terminating at this node (empty for a tombstone).
+    fn merkle_value(&self) -> &[u8];
+    /// Live value bytes, or `None` for a tombstone (logically absent).
+    fn visible_value(&self) -> Option<&[u8]>;
+    /// Build from raw value bytes — always a present/live value.
+    fn from_value_bytes(bytes: &[u8]) -> Self;
+}
+
+impl TrieValue for MptValue {
+    fn merkle_value(&self) -> &[u8] {
+        MptValue::merkle_value(self)
+    }
+    fn visible_value(&self) -> Option<&[u8]> {
+        MptValue::visible_value(self)
+    }
+    fn from_value_bytes(bytes: &[u8]) -> Self {
+        MptValue::Some(Box::from(bytes))
+    }
+}
+
 pub fn keccak(data: &[u8]) -> H256 {
     let mut out = [0u8; 32];
     let mut hasher = Keccak::v256();

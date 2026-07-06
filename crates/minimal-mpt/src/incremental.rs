@@ -39,7 +39,9 @@
 //! needed during the walk.
 
 use crate::codec::{read_len_prefixed, read_u64_le};
-use crate::trie::{bytes_to_nibbles, compute_node_merkle, compute_path_merkle, MptValue, CHILDREN};
+use crate::trie::{
+    bytes_to_nibbles, compute_node_merkle, compute_path_merkle, MptValue, TrieValue, CHILDREN,
+};
 use crate::types::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -82,7 +84,7 @@ pub(crate) fn rebuild_snapshot_root_cache(
         .iter()
         .map(|(key, value)| EntryRef {
             key: key.as_slice(),
-            value: EntryValueRef::Live(value),
+            value,
         })
         .collect();
     let (root, cache_entries) =
@@ -108,7 +110,7 @@ pub(crate) fn rebuild_snapshot_root_cache_from_nibble_entries(
         .iter()
         .map(|(key, value)| EntryRef {
             key: key.as_slice(),
-            value: EntryValueRef::Live(value.as_slice()),
+            value: value.as_slice(),
         })
         .collect();
     let (root, cache_entries) =
@@ -123,14 +125,30 @@ pub(crate) fn rebuild_snapshot_root_cache_from_nibble_entries(
 /// changed keys are converted, once, at write time. Combined with the
 /// prefix-eviction cache, a commit costs roughly `O(changed keys × depth)`
 /// instead of `O(delta size)`.
-#[derive(Clone, Debug, Default)]
-pub struct IncrementalTrie {
+///
+/// Generic over the stored value type `V` (default [`MptValue`]): the delta and
+/// intermediate tries keep `MptValue` (which carries `Tombstone`), while the
+/// snapshot — provably tombstone-free — instantiates it with a compact inline
+/// value type to save memory. Only [`TrieValue`] (merkle bytes + visibility) is
+/// required, so the hashing and cache logic are identical across value types.
+#[derive(Clone, Debug)]
+pub struct IncrementalTrie<V = MptValue> {
     /// Delta entries keyed by nibbles (the trie's working set).
-    entries: BTreeMap<Vec<u8>, MptValue>,
+    entries: BTreeMap<Vec<u8>, V>,
     /// Cached subtree hashes, keyed by node routing prefix.
     cache: Cache,
     /// Nibble keys changed since the last `root`, pending prefix eviction.
     dirty: BTreeSet<Vec<u8>>,
+}
+
+impl<V> Default for IncrementalTrie<V> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            cache: Cache::default(),
+            dirty: BTreeSet::new(),
+        }
+    }
 }
 
 /// Aggregate counters from [`IncrementalTrie::memory_survey`] — raw single-pass
@@ -187,10 +205,11 @@ impl Default for MemorySurvey {
     }
 }
 
-impl IncrementalTrie {
+impl IncrementalTrie<MptValue> {
     /// Build from an existing byte-keyed delta (e.g. a persisted state): one
     /// nibble conversion per entry. The cache starts empty, so the first
-    /// `root` is a full (correct) recompute that populates it.
+    /// `root` is a full (correct) recompute that populates it. Delta-only, so it
+    /// keeps `MptValue` (tombstones are meaningful in the delta).
     pub fn from_delta(delta: &BTreeMap<Vec<u8>, MptValue>) -> Self {
         let entries = delta
             .iter()
@@ -202,10 +221,12 @@ impl IncrementalTrie {
             dirty: BTreeSet::new(),
         }
     }
+}
 
-    /// Insert / overwrite the value for `key` (the byte-form delta-mpt key).
+impl<V: TrieValue> IncrementalTrie<V> {
+    /// Insert / overwrite the value for `key` (the byte-form mpt key).
     /// The nibble conversion happens here, once — not on every commit.
-    pub fn insert(&mut self, key: &[u8], value: MptValue) {
+    pub fn insert(&mut self, key: &[u8], value: V) {
         let nibbles = bytes_to_nibbles(key);
         self.dirty.insert(nibbles.clone());
         self.entries.insert(nibbles, value);
@@ -251,8 +272,8 @@ impl IncrementalTrie {
                 have_prev = true;
             }
 
-            match v {
-                MptValue::Some(b) => {
+            match v.visible_value() {
+                Some(b) => {
                     let len = b.len();
                     s.value_bytes += len as u64;
                     s.val_len_hist[len.min(33)] += 1;
@@ -265,7 +286,7 @@ impl IncrementalTrie {
                         s.val_u32_fit_bytes += len as u64;
                     }
                 }
-                MptValue::Tombstone => s.n_tombstone += 1,
+                None => s.n_tombstone += 1,
             }
         }
         s.n_cache = self.cache.len();
@@ -301,7 +322,7 @@ impl IncrementalTrie {
                 .iter()
                 .map(|(key, value)| EntryRef {
                     key: key.as_slice(),
-                    value: EntryValueRef::Mpt(value),
+                    value: value.merkle_value(),
                 })
                 .collect();
             let t = std::time::Instant::now();
@@ -336,8 +357,21 @@ impl IncrementalTrie {
             // it should have been evicted) — the one failure mode the incremental
             // walk has that the stateless one cannot. Covers BOTH the delta and
             // snapshot incremental tries. O(N) per call: verify builds only.
+            // Reconstruct an `MptValue` oracle from the generic value type (the
+            // snapshot's value carries no tombstone, so it is always `Some`).
+            let oracle_owned: Vec<(Vec<u8>, MptValue)> = self
+                .entries
+                .iter()
+                .map(|(k, v)| {
+                    let mv = match v.visible_value() {
+                        Some(b) => MptValue::Some(Box::from(b)),
+                        None => MptValue::Tombstone,
+                    };
+                    (k.clone(), mv)
+                })
+                .collect();
             let oracle: Vec<(Vec<u8>, &MptValue)> =
-                self.entries.iter().map(|(k, v)| (k.clone(), v)).collect();
+                oracle_owned.iter().map(|(k, v)| (k.clone(), v)).collect();
             assert_eq!(
                 result,
                 crate::trie::root_for_entries(&oracle),
@@ -355,7 +389,7 @@ impl IncrementalTrie {
     pub fn from_snapshot(snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
         let entries = snapshot
             .iter()
-            .map(|(k, v)| (bytes_to_nibbles(k), MptValue::Some(v.clone())))
+            .map(|(k, v)| (bytes_to_nibbles(k), V::from_value_bytes(v)))
             .collect();
         Self {
             entries,
@@ -377,7 +411,7 @@ impl IncrementalTrie {
         for _ in 0..count {
             let key = read_len_prefixed(reader)?;
             let value = read_len_prefixed(reader)?;
-            entries.insert(bytes_to_nibbles(&key), MptValue::Some(value.into_boxed_slice()));
+            entries.insert(bytes_to_nibbles(&key), V::from_value_bytes(&value));
         }
         Ok(Self {
             entries,
@@ -487,8 +521,8 @@ fn child_prefix(full_prefix: &[u8], c: usize) -> Vec<u8> {
 /// frontier, not the delta size: the old slice version paid `O(N)` per call just
 /// to flatten the map and re-partition the root level (always dirty). Serial only
 /// (the cache is `&mut`).
-fn memo_node(
-    entries: &BTreeMap<Vec<u8>, MptValue>,
+fn memo_node<V: TrieValue>(
+    entries: &BTreeMap<Vec<u8>, V>,
     rp: &[u8],
     allow_path_compression: bool,
     cache: &mut Cache,
@@ -557,27 +591,14 @@ fn memo_node(
     hash
 }
 
+/// One entry fed to the cold [`memo_node_rebuild`]: a nibble key plus its
+/// precomputed **merkle bytes** (empty for a tombstone). The rebuild only ever
+/// needs the merkle bytes, so callers flatten `TrieValue::merkle_value` (or pass
+/// raw LMDB bytes) up front — keeping the rebuild independent of the value type.
 #[derive(Clone, Copy)]
 struct EntryRef<'a> {
     key: &'a [u8],
-    value: EntryValueRef<'a>,
-}
-
-#[derive(Clone, Copy)]
-enum EntryValueRef<'a> {
-    Mpt(&'a MptValue),
-    #[cfg(feature = "snapshot-lmdb")]
-    Live(&'a [u8]),
-}
-
-impl<'a> EntryValueRef<'a> {
-    fn merkle_value(self) -> &'a [u8] {
-        match self {
-            Self::Mpt(value) => value.merkle_value(),
-            #[cfg(feature = "snapshot-lmdb")]
-            Self::Live(value) => value,
-        }
-    }
+    value: &'a [u8],
 }
 
 /// Cold-cache root/cache rebuild over an already sorted entry slice.
@@ -609,7 +630,7 @@ fn memo_node_rebuild(
     let maybe_value = entries
         .iter()
         .find(|entry| entry.key.len() == node_depth)
-        .map(|entry| entry.value.merkle_value());
+        .map(|entry| entry.value);
 
     // Recompute one child subtree: build its routing prefix, recurse over its
     // slice, and return `(child index, hash, its cache entries)`.
@@ -801,6 +822,35 @@ mod tests {
             // first two bytes are a bijection with i, so keys stay distinct.
             let key = vec![(i & 0xff) as u8, (i >> 8) as u8, ((i >> 3) & 0xff) as u8];
             map.insert(key, val((i as u8) | 1));
+        }
+        assert!(map.len() >= PARALLEL_REBUILD_THRESHOLD);
+        let mut inc = IncrementalTrie::from_delta(&map);
+        assert_eq!(inc.root(), trie_root(&map));
+    }
+
+    /// Same cold parallel-rebuild path, but with tombstones interleaved. Proves
+    /// a terminal tombstone still hashes as `Some(&[])` (the `b'v'` marker in
+    /// `compute_node_merkle`) — byte-identical to the stateless oracle — after
+    /// `EntryRef` was flattened to precomputed merkle bytes. The Some/None
+    /// distinction is carried by key-presence (`find` on key length), which the
+    /// flattening does not touch; `merkle_value()` collapses tombstone and empty
+    /// `Some` to the same `&[]`, exactly as the oracle does.
+    #[test]
+    fn parallel_rebuild_with_tombstones_matches_oracle() {
+        let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
+        for i in 0u32..8000 {
+            let key = vec![(i & 0xff) as u8, (i >> 8) as u8, ((i >> 3) & 0xff) as u8];
+            // Every 5th entry is a tombstone (some become terminal-value nodes);
+            // one real entry is deliberately an empty value to exercise the
+            // tombstone-vs-empty-`Some` collapse.
+            let v = if i % 5 == 0 {
+                MptValue::Tombstone
+            } else if i % 5 == 1 {
+                MptValue::Some(Box::from([]))
+            } else {
+                MptValue::Some(Box::from([(i as u8) | 1]))
+            };
+            map.insert(key, v);
         }
         assert!(map.len() >= PARALLEL_REBUILD_THRESHOLD);
         let mut inc = IncrementalTrie::from_delta(&map);
