@@ -106,6 +106,9 @@ pub struct MemorySurvey {
     pub val_trailing_zero_bytes: u64, // Σ trailing zero bytes
     pub val_u32_fit_count: u64,       // #values whose big-endian magnitude < 2^32
     pub val_u32_fit_bytes: u64,       // Σ current stored len of those
+    // two-level structure: level-1 node count + level-2 group-size histogram
+    pub n_level1: usize,
+    pub l2_size_hist: [u64; 12], // 1,2,3,4,5-8,9-16,17-32,33-64,65-256,257-1k,1k-4k,4k+
 }
 
 #[cfg(feature = "mem-survey")]
@@ -128,6 +131,8 @@ impl Default for MemorySurvey {
             val_trailing_zero_bytes: 0,
             val_u32_fit_count: 0,
             val_u32_fit_bytes: 0,
+            n_level1: 0,
+            l2_size_hist: [0; 12],
         }
     }
 }
@@ -250,6 +255,8 @@ impl<V: TrieValue> IncrementalTrie<V> {
         }
         s.n_cache = self.cache.len();
         s.cache_key_bytes = self.cache.keys().map(|p| p.nibble_len() as u64).sum();
+        s.n_level1 = self.entries.level1_len();
+        s.l2_size_hist = self.entries.group_size_hist();
         s
     }
 
@@ -376,11 +383,28 @@ impl<V: TrieValue> IncrementalTrie<V> {
     /// starts empty; the first `root` recomputes it.
     pub(crate) fn from_snapshot_reader(reader: &mut impl Read) -> io::Result<Self> {
         let count = read_u64_le(reader)? as usize;
+        // On-disk keys are ascending, so build the store densely: read fixed-size
+        // sorted batches of `W` and hand each to `bulk_extend_sorted` (dense
+        // level-2 leaves) instead of monotonic per-entry `insert` (~half-full
+        // leaves). The reader stays oblivious to the two-level layout; peak
+        // transient is one batch. `W` is env-tunable for profiling.
+        let w = std::env::var("MMPT_BULK_W")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&w| w > 0)
+            .unwrap_or(1_000_000);
         let mut entries = Entries::new();
+        let mut batch: Vec<(Vec<u8>, V)> = Vec::with_capacity(w.min(count));
         for _ in 0..count {
             let key = read_len_prefixed(reader)?;
             let value = read_len_prefixed(reader)?;
-            entries.insert(&key, V::from_value_bytes(&value));
+            batch.push((key, V::from_value_bytes(&value)));
+            if batch.len() >= w {
+                entries.bulk_extend_sorted(std::mem::replace(&mut batch, Vec::with_capacity(w)));
+            }
+        }
+        if !batch.is_empty() {
+            entries.bulk_extend_sorted(batch);
         }
         Ok(Self {
             entries,

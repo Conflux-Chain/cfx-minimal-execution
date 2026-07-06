@@ -486,6 +486,7 @@ dependencies = [
  "arbitrary",
  "bincode",
  "heed",
+ "itertools",
  "rayon",
  "rustc-hash 2.1.2",
  "serde",

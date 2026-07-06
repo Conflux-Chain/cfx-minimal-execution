@@ -86,6 +86,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cache_key_bytes (Σ)    = {} ({:.2} GiB)  [nibble prefixes]", s.cache_key_bytes, gib(s.cache_key_bytes));
     println!("cache_val_bytes (H256) = {} ({:.2} GiB)  [32 * n_cache]", s.n_cache as u64 * 32, gib(s.n_cache as u64 * 32));
 
+    // ---------- two-level structure: level1 count + level2 group sizes ----------
+    println!("\n==== TWO-LEVEL STRUCTURE ====");
+    println!("n_level1 (distinct 23B prefixes) = {}", s.n_level1);
+    println!("avg level2 group size            = {:.2} entries/group  (n_entries/n_level1)",
+        s.n_entries as f64 / s.n_level1.max(1) as f64);
+    let buckets = ["=1", "=2", "=3", "=4", "5-8", "9-16", "17-32", "33-64", "65-256", "257-1k", "1k-4k", "4k+"];
+    println!("level2 group-size histogram (group count / % of level1):");
+    for (b, &c) in buckets.iter().zip(s.l2_size_hist.iter()) {
+        if c > 0 {
+            println!("  {:>7} => {:>12}  ({:.1}%)", b, c, 100.0 * c as f64 / s.n_level1.max(1) as f64);
+        }
+    }
+
     // ---------- key byte-length histogram (non-empty buckets) ----------
     println!("\n==== ENTRY KEY BYTE-LENGTH HIST (len => count) ====");
     for (len, &c) in s.key_len_hist.iter().enumerate() {

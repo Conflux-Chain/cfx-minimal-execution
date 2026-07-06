@@ -12,6 +12,7 @@ serde = { workspace = true }
 # 2.0 alpha: const-generic inline size so arrays > 32 are allowed (the level-2
 # key `SmallVec<u8, 40>` needs a 40-byte inline buffer).
 smallvec = "2.0.0-alpha.12"
+itertools = "0.14"
 arbitrary = { version = "1.4", features = ["derive"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 heed = { version = "0.20", optional = true }

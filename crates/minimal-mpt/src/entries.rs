@@ -100,6 +100,12 @@ enum Node<V> {
     Branch(BTreeMap<Level2Key, V>),
 }
 
+/// The level-1 key of a canonical key: its first ≤23 bytes (a ≤22B key is its
+/// own whole leaf prefix; a ≥23B key contributes its first 23 bytes).
+fn prefix23_of(key: &[u8]) -> Prefix23 {
+    Prefix23::new(&key[..key.len().min(HEAD_LEN)])
+}
+
 /// A key surfaced from the store as `head ++ tail`, without reassembly. For a
 /// leaf `tail` is empty; for a branch entry `head` is the 23-byte prefix and
 /// `tail` the remainder.
@@ -213,6 +219,32 @@ impl<V> Entries<V> {
         self.len
     }
 
+    /// Number of level-1 nodes (distinct 23-byte prefixes). If this ≈ total
+    /// entries, level-2 maps are ~singletons and the fill waste lives in level-1.
+    #[cfg(feature = "mem-survey")]
+    pub(crate) fn level1_len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Histogram of level-2 group sizes (1,2,3,4,5-8,9-16,17-32,33-64,65-256,
+    /// 257-1024,1025-4096,4097+). A leaf counts as size 1.
+    #[cfg(feature = "mem-survey")]
+    pub(crate) fn group_size_hist(&self) -> [u64; 12] {
+        let mut h = [0u64; 12];
+        for node in self.map.values() {
+            let s = match node {
+                Node::Leaf(_) => 1,
+                Node::Branch(b) => b.len(),
+            };
+            let idx = match s {
+                1 => 0, 2 => 1, 3 => 2, 4 => 3, 5..=8 => 4, 9..=16 => 5, 17..=32 => 6,
+                33..=64 => 7, 65..=256 => 8, 257..=1024 => 9, 1025..=4096 => 10, _ => 11,
+            };
+            h[idx] += 1;
+        }
+        h
+    }
+
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
@@ -240,6 +272,41 @@ impl<V> Entries<V> {
                     }
                 }
                 Node::Leaf(_) => unreachable!("leaf/branch prefix collision"),
+            }
+        }
+    }
+
+    /// Extend with an **ascending** batch whose keys are all greater than any
+    /// key already present (checkpoint load feeds fixed-size sorted batches).
+    /// Each contiguous same-prefix run builds a dense level-2 map via
+    /// `FromIterator` (full BTree leaves) instead of monotonic `insert` (which
+    /// freezes split leaves ~half full). A run continuing a prefix from a prior
+    /// batch is `append`-merged into its existing level-2. Level-1 stays plain
+    /// `insert` (its fill isn't the bottleneck — 99.9% of groups are singletons).
+    /// Larger batches split fewer big-contract runs → denser level-2.
+    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
+        use itertools::Itertools;
+        let runs = batch.into_iter().chunk_by(|(k, _)| prefix23_of(k));
+        for (prefix, run) in &runs {
+            let mut run = run.peekable();
+            if run.peek().is_some_and(|(k, _)| k.len() <= LEAF_MAX) {
+                let (_, v) = run.next().expect("non-empty run");
+                if self.map.insert(prefix, Node::Leaf(v)).is_none() {
+                    self.len += 1;
+                }
+            } else {
+                let mut chunk: BTreeMap<Level2Key, V> =
+                    run.map(|(k, v)| (level2_key(&k[HEAD_LEN..]), v)).collect();
+                self.len += chunk.len();
+                match self
+                    .map
+                    .entry(prefix)
+                    .or_insert_with(|| Node::Branch(BTreeMap::new()))
+                {
+                    Node::Branch(b) if b.is_empty() => *b = chunk,
+                    Node::Branch(b) => b.append(&mut chunk),
+                    Node::Leaf(_) => unreachable!("leaf/branch prefix collision"),
+                }
             }
         }
     }
@@ -431,6 +498,56 @@ impl<'a, 'b, V> Iterator for RangeFwd<'a, 'b, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `bulk_extend_sorted` (dense build) must produce a store byte-identical to
+    /// repeated `insert`, for every batch size `W` — including tiny W that splits
+    /// big-contract groups across many batches (exercising the `append` merge).
+    #[test]
+    fn bulk_matches_insert() {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..40u8 {
+            keys.push(vec![i]); // 1B leaves
+        }
+        for i in 0..30u8 {
+            keys.push(vec![i; 22]); // 22B leaves
+        }
+        for i in 0..30u8 {
+            keys.push(vec![i; 23]); // 23B branch heads (empty tail)
+        }
+        let big = vec![200u8; 23];
+        for i in 0..6000u32 {
+            let mut k = big.clone();
+            k.extend(i.to_be_bytes()); // one big-contract group (shared 23B prefix)
+            keys.push(k);
+        }
+        for i in 0..1500u32 {
+            let mut k = vec![100u8; 20];
+            k.extend(i.to_be_bytes()); // 24B keys → mix of small groups / singletons
+            keys.push(k);
+        }
+        keys.sort();
+        keys.dedup();
+        let kv: Vec<(Vec<u8>, u32)> =
+            keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
+
+        let mut via_insert: Entries<u32> = Entries::new();
+        for (k, v) in &kv {
+            via_insert.insert(k, *v);
+        }
+        let want: Vec<(Vec<u8>, u32)> =
+            via_insert.iter().map(|(c, v)| ([c.head, c.tail].concat(), *v)).collect();
+
+        for w in [1usize, 3, 1023, 6001, kv.len()] {
+            let mut via_bulk: Entries<u32> = Entries::new();
+            for chunk in kv.chunks(w) {
+                via_bulk.bulk_extend_sorted(chunk.to_vec());
+            }
+            assert_eq!(via_bulk.len(), via_insert.len(), "len mismatch at W={w}");
+            let got: Vec<(Vec<u8>, u32)> =
+                via_bulk.iter().map(|(c, v)| ([c.head, c.tail].concat(), *v)).collect();
+            assert_eq!(got, want, "iteration mismatch at W={w}");
+        }
+    }
 
     /// Random keys spanning the leaf/branch boundary, compared against a flat
     /// `BTreeMap` oracle for get / iterate / range endpoints.
