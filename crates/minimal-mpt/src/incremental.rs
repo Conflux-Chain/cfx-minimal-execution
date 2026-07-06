@@ -47,7 +47,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 
 const PARALLEL_REBUILD_THRESHOLD: usize = 4096;
-const PARALLEL_REBUILD_DEPTH: usize = 3;
 
 /// Cache keyed by a node's routing nibble prefix. FxHash, not SipHash: these
 /// short byte (nibble) keys are hashed on every node visit and SipHash showed
@@ -87,11 +86,8 @@ pub(crate) fn rebuild_snapshot_root_cache(
         })
         .collect();
     let (root, cache_entries) =
-        memo_node_rebuild(&entries, &[], false, cache_policy, PARALLEL_REBUILD_DEPTH);
-    let mut cache = Cache::default();
-    cache.reserve(cache_entries.len());
-    cache.extend(cache_entries);
-    (root, cache)
+        memo_node_rebuild(&entries, &[], false, cache_policy);
+    (root, cache_entries.into_iter().collect())
 }
 
 /// Like [`rebuild_snapshot_root_cache`], but over entries already keyed by
@@ -116,11 +112,8 @@ pub(crate) fn rebuild_snapshot_root_cache_from_nibble_entries(
         })
         .collect();
     let (root, cache_entries) =
-        memo_node_rebuild(&refs, &[], false, cache_policy, PARALLEL_REBUILD_DEPTH);
-    let mut cache = Cache::default();
-    cache.reserve(cache_entries.len());
-    cache.extend(cache_entries);
-    (root, cache)
+        memo_node_rebuild(&refs, &[], false, cache_policy);
+    (root, cache_entries.into_iter().collect())
 }
 
 /// Incremental delta-trie root.
@@ -138,6 +131,60 @@ pub struct IncrementalTrie {
     cache: Cache,
     /// Nibble keys changed since the last `root`, pending prefix eviction.
     dirty: BTreeSet<Vec<u8>>,
+}
+
+/// Aggregate counters from [`IncrementalTrie::memory_survey`] — raw single-pass
+/// sums only. All derived arithmetic (breakdown estimate, dedup / padding
+/// optimization potential) lives in the `ckpt-mem-survey` bin so this stays a
+/// pure collector. Keys are nibble-expanded routing prefixes (2 nibbles/byte),
+/// so a logical 20-byte prefix is 40 nibble elements.
+#[cfg(feature = "mem-survey")]
+#[derive(Clone, Debug)]
+pub struct MemorySurvey {
+    // entries: BTreeMap<Vec<u8>, MptValue>
+    pub n_entries: usize,
+    pub n_tombstone: usize,
+    pub entry_key_bytes: u64, // Σ nibble-key stored len
+    pub value_bytes: u64,     // Σ value len
+    // cache: FxHashMap<Vec<u8>, H256>
+    pub n_cache: usize,
+    pub cache_key_bytes: u64, // Σ cache-key nibble len (values are fixed 32B H256)
+    // distributions (O(1) fixed buckets)
+    pub key_len_hist: [u64; 129], // entry key BYTE length (nibble/2), [128]=>=128
+    pub val_len_hist: [u64; 34],  // value length 0..=32, [33]=>=33
+    // (b) shared first-40-nibble (20-byte) routing-prefix dedup on entry keys
+    pub distinct_prefix40: u64,
+    pub prefix40_stored_bytes: u64,  // Σ min(40, keylen) over all entries
+    pub prefix40_deduped_bytes: u64, // Σ that prefix once per distinct group
+    // (c) value zero-padding
+    pub val_leading_zero_bytes: u64,  // Σ leading zero bytes (big-endian strip savings)
+    pub val_trailing_zero_bytes: u64, // Σ trailing zero bytes
+    pub val_u32_fit_count: u64,       // #values whose big-endian magnitude < 2^32
+    pub val_u32_fit_bytes: u64,       // Σ current stored len of those
+}
+
+#[cfg(feature = "mem-survey")]
+impl Default for MemorySurvey {
+    fn default() -> Self {
+        // Arrays > 32 don't derive Default; zero-init explicitly.
+        Self {
+            n_entries: 0,
+            n_tombstone: 0,
+            entry_key_bytes: 0,
+            value_bytes: 0,
+            n_cache: 0,
+            cache_key_bytes: 0,
+            key_len_hist: [0; 129],
+            val_len_hist: [0; 34],
+            distinct_prefix40: 0,
+            prefix40_stored_bytes: 0,
+            prefix40_deduped_bytes: 0,
+            val_leading_zero_bytes: 0,
+            val_trailing_zero_bytes: 0,
+            val_u32_fit_count: 0,
+            val_u32_fit_bytes: 0,
+        }
+    }
 }
 
 impl IncrementalTrie {
@@ -179,6 +226,53 @@ impl IncrementalTrie {
         self.dirty.clear();
     }
 
+    /// Read-only single-pass survey for the memory-optimization study.
+    /// O(1) extra space: the BTreeMap is sorted, so the shared-prefix dedup runs
+    /// by comparing each key's first 40 nibbles to the previous one — no set is
+    /// built. Value zero-padding is measured big-endian (leading zeros).
+    #[cfg(feature = "mem-survey")]
+    pub fn memory_survey(&self) -> MemorySurvey {
+        let mut s = MemorySurvey::default();
+        let mut prev_prefix: Vec<u8> = Vec::new();
+        let mut have_prev = false;
+        for (k, v) in &self.entries {
+            s.n_entries += 1;
+            s.entry_key_bytes += k.len() as u64;
+            s.key_len_hist[(k.len() / 2).min(128)] += 1;
+
+            // (b) shared first-40-nibble routing-prefix dedup, O(1) space.
+            let plen = k.len().min(40);
+            s.prefix40_stored_bytes += plen as u64;
+            if !have_prev || prev_prefix.as_slice() != &k[..plen] {
+                s.distinct_prefix40 += 1;
+                s.prefix40_deduped_bytes += plen as u64;
+                prev_prefix.clear();
+                prev_prefix.extend_from_slice(&k[..plen]);
+                have_prev = true;
+            }
+
+            match v {
+                MptValue::Some(b) => {
+                    let len = b.len();
+                    s.value_bytes += len as u64;
+                    s.val_len_hist[len.min(33)] += 1;
+                    let lz = b.iter().take_while(|&&x| x == 0).count();
+                    let tz = b.iter().rev().take_while(|&&x| x == 0).count();
+                    s.val_leading_zero_bytes += lz as u64;
+                    s.val_trailing_zero_bytes += tz as u64;
+                    if len - lz <= 4 {
+                        s.val_u32_fit_count += 1;
+                        s.val_u32_fit_bytes += len as u64;
+                    }
+                }
+                MptValue::Tombstone => s.n_tombstone += 1,
+            }
+        }
+        s.n_cache = self.cache.len();
+        s.cache_key_bytes = self.cache.keys().map(|k| k.len() as u64).sum();
+        s
+    }
+
     /// Merkle root of the current delta, reusing cached hashes for unchanged
     /// subtrees. Clears the pending dirty set; keeps the cache.
     pub fn root(&mut self) -> H256 {
@@ -201,6 +295,7 @@ impl IncrementalTrie {
         self.dirty.clear();
 
         let result = if self.cache.is_empty() && self.entries.len() >= PARALLEL_REBUILD_THRESHOLD {
+            let timing = std::env::var_os("MMPT_RECOVER_TIMING").is_some();
             let entries: Vec<EntryRef<'_>> = self
                 .entries
                 .iter()
@@ -209,10 +304,26 @@ impl IncrementalTrie {
                     value: EntryValueRef::Mpt(value),
                 })
                 .collect();
+            let t = std::time::Instant::now();
             let (root, cache_entries) =
-                memo_node_rebuild(&entries, &[], false, cache_policy, PARALLEL_REBUILD_DEPTH);
+                memo_node_rebuild(&entries, &[], false, cache_policy);
+            if timing {
+                eprintln!(
+                    "[recover] snapshot_hash elapsed={}ms cache_entries={}",
+                    t.elapsed().as_millis(),
+                    cache_entries.len()
+                );
+            }
+            let t = std::time::Instant::now();
             self.cache.reserve(cache_entries.len());
             self.cache.extend(cache_entries);
+            if timing {
+                eprintln!(
+                    "[recover] snapshot_cache_extend elapsed={}ms cache_len={}",
+                    t.elapsed().as_millis(),
+                    self.cache.len()
+                );
+            }
             root
         } else {
             memo_node(&self.entries, &[], false, &mut self.cache, cache_policy)
@@ -356,6 +467,15 @@ pub(crate) fn prefix_upper(rp: &[u8]) -> Vec<u8> {
     upper
 }
 
+/// Routing prefix of child `c` under `full_prefix`: the parent's prefix with the
+/// child nibble appended.
+fn child_prefix(full_prefix: &[u8], c: usize) -> Vec<u8> {
+    let mut rp = Vec::with_capacity(full_prefix.len() + 1);
+    rp.extend_from_slice(full_prefix);
+    rp.push(c as u8);
+    rp
+}
+
 /// Range-driven mirror of [`crate::trie`]'s `merkle_for_node`, plus a cache keyed
 /// by the node's routing prefix `rp`. Instead of materialising the whole delta
 /// into a slice and scanning it, the node's key block is addressed directly on
@@ -412,27 +532,20 @@ fn memo_node(
     // A key ending exactly at this node can only be `full_prefix` itself.
     let maybe_value = entries.get(full_prefix).map(|value| value.merkle_value());
 
-    let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
-    for (c, slot) in children.iter_mut().enumerate() {
-        let mut child_rp = Vec::with_capacity(node_depth + 1);
-        child_rp.extend_from_slice(full_prefix);
-        child_rp.push(c as u8);
+    // Resolve all 16 child slots left-to-right. A cache hit reuses the clean
+    // subtree's hash without touching `entries`; on a miss, one range probe
+    // decides — a present (dirty) child recurses, an absent one stays null.
+    let children: [H256; CHILDREN] = std::array::from_fn(|c| {
+        let child_rp = child_prefix(full_prefix, c);
         if let Some(hash) = cache.get(&child_rp) {
-            // Clean subtree: reuse the cached hash without touching `entries`.
-            *slot = *hash;
-            continue;
+            return *hash;
         }
-        // Cache miss: the child is either dirty (present) or absent. One range
-        // probe decides; only present children are recomputed.
-        let child_upper = prefix_upper(&child_rp);
-        if entries
-            .range(child_rp.clone()..child_upper)
-            .next()
-            .is_some()
-        {
-            *slot = memo_node(entries, &child_rp, true, cache, cache_policy);
+        if entries.range(child_rp.clone()..prefix_upper(&child_rp)).next().is_some() {
+            memo_node(entries, &child_rp, true, cache, cache_policy)
+        } else {
+            MERKLE_NULL_NODE
         }
-    }
+    });
 
     let has_children = children.iter().any(|h| *h != MERKLE_NULL_NODE);
     let node_hash = compute_node_merkle(has_children.then_some(&children), maybe_value);
@@ -478,7 +591,6 @@ fn memo_node_rebuild(
     rp: &[u8],
     allow_path_compression: bool,
     cache_policy: CachePolicy,
-    parallel_depth: usize,
 ) -> (H256, Vec<(Vec<u8>, H256)>) {
     debug_assert!(!entries.is_empty());
 
@@ -499,56 +611,34 @@ fn memo_node_rebuild(
         .find(|entry| entry.key.len() == node_depth)
         .map(|entry| entry.value.merkle_value());
 
+    // Recompute one child subtree: build its routing prefix, recurse over its
+    // slice, and return `(child index, hash, its cache entries)`.
+    let recurse = |&(child, start, end): &(usize, usize, usize)| {
+        let child_rp = child_prefix(full_prefix, child);
+        let (hash, cache_entries) =
+            memo_node_rebuild(&entries[start..end], &child_rp, true, cache_policy);
+        (child, hash, cache_entries)
+    };
+
+    // Fan out across cores only for a large, multi-child block; recursion turns
+    // serial once a subtree drops below the threshold, bounding task
+    // granularity. Splitting by SUBTREE SIZE (not a fixed depth) lets a few
+    // oversized subtrees — e.g. a large-storage contract — spread across cores.
+    // Nested par_iter is fine: rayon work-steals over the shared pool.
     let ranges = child_ranges(entries, node_depth);
-    let (child_hashes, mut cache_entries): (Vec<(usize, H256)>, Vec<(Vec<u8>, H256)>) =
-        if parallel_depth > 0 && entries.len() >= PARALLEL_REBUILD_THRESHOLD && ranges.len() > 1 {
-            let results: Vec<(usize, H256, Vec<(Vec<u8>, H256)>)> = ranges
-                .par_iter()
-                .map(|(child, start, end)| {
-                    let mut child_rp = Vec::with_capacity(node_depth + 1);
-                    child_rp.extend_from_slice(full_prefix);
-                    child_rp.push(*child as u8);
-
-                    let (hash, cache_entries) = memo_node_rebuild(
-                        &entries[*start..*end],
-                        &child_rp,
-                        true,
-                        cache_policy,
-                        parallel_depth - 1,
-                    );
-                    (*child, hash, cache_entries)
-                })
-                .collect();
-
-            let mut child_hashes = Vec::with_capacity(results.len());
-            let cache_entries_len = results
-                .iter()
-                .map(|(_, _, cache_entries)| cache_entries.len())
-                .sum();
-            let mut cache_entries = Vec::with_capacity(cache_entries_len);
-            for (child, hash, mut child_cache_entries) in results {
-                cache_entries.append(&mut child_cache_entries);
-                child_hashes.push((child, hash));
-            }
-            (child_hashes, cache_entries)
+    let results: Vec<(usize, H256, Vec<(Vec<u8>, H256)>)> =
+        if entries.len() >= PARALLEL_REBUILD_THRESHOLD && ranges.len() > 1 {
+            ranges.par_iter().map(&recurse).collect()
         } else {
-            let mut child_hashes = Vec::with_capacity(ranges.len());
-            let mut cache_entries = Vec::new();
-            for (child, start, end) in &ranges {
-                let mut child_rp = Vec::with_capacity(node_depth + 1);
-                child_rp.extend_from_slice(full_prefix);
-                child_rp.push(*child as u8);
-                let (hash, mut child_cache_entries) =
-                    memo_node_rebuild(&entries[*start..*end], &child_rp, true, cache_policy, 0);
-                cache_entries.append(&mut child_cache_entries);
-                child_hashes.push((*child, hash));
-            }
-            (child_hashes, cache_entries)
+            ranges.iter().map(&recurse).collect()
         };
 
     let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
-    for (child, hash) in child_hashes {
+    let mut cache_entries =
+        Vec::with_capacity(results.iter().map(|(_, _, c)| c.len()).sum());
+    for (child, hash, mut child_cache_entries) in results {
         children[child] = hash;
+        cache_entries.append(&mut child_cache_entries);
     }
 
     let has_children = children.iter().any(|h| *h != MERKLE_NULL_NODE);
@@ -561,28 +651,22 @@ fn memo_node_rebuild(
     (hash, cache_entries)
 }
 
+/// Partition a sorted node block into `(child nibble, start, end)` runs, one per
+/// child subtree. Entries whose key ends exactly at `node_depth` carry no child
+/// nibble and are dropped; the rest — being sorted — group into contiguous runs
+/// sharing their `node_depth`-th nibble.
 fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut idx = 0;
-    while idx < entries.len() {
-        let key = entries[idx].key;
-        if key.len() == node_depth {
-            idx += 1;
-            continue;
-        }
-
-        let child = key[node_depth] as usize;
-        let start = idx;
-        idx += 1;
-        while idx < entries.len()
-            && entries[idx].key.len() > node_depth
-            && entries[idx].key[node_depth] as usize == child
-        {
-            idx += 1;
-        }
-        ranges.push((child, start, idx));
-    }
-    ranges
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| entry.key.get(node_depth).map(|&c| (idx, c as usize)))
+        .fold(Vec::new(), |mut ranges, (idx, child)| {
+            match ranges.last_mut() {
+                Some(last) if last.0 == child && last.2 == idx => last.2 = idx + 1,
+                _ => ranges.push((child, idx, idx + 1)),
+            }
+            ranges
+        })
 }
 
 /// Longest common nibble prefix of the sorted block beyond `depth`. The block's
@@ -627,10 +711,7 @@ mod tests {
         for op_i in 0..4000 {
             // Keys share prefixes to exercise path compression split/merge.
             let klen = 1 + (next() % 4) as usize;
-            let mut key = Vec::with_capacity(klen);
-            for _ in 0..klen {
-                key.push((next() % 6) as u8);
-            }
+            let key: Vec<u8> = (0..klen).map(|_| (next() % 6) as u8).collect();
             let v = (next() % 4) as u8;
 
             let action = if v == 0 && map.contains_key(&key) {
@@ -705,6 +786,23 @@ mod tests {
         for b in 0u8..50 {
             map.insert(vec![b % 7, b % 5, b], val(b | 1));
         }
+        let mut inc = IncrementalTrie::from_delta(&map);
+        assert_eq!(inc.root(), trie_root(&map));
+    }
+
+    /// Force the cold `memo_node_rebuild` PARALLEL fan-out (>= threshold entries,
+    /// empty cache, >1 child at the root) and assert it agrees with the stateless
+    /// oracle — the small-map tests above stay under the serial threshold.
+    #[test]
+    fn parallel_rebuild_matches_oracle() {
+        let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
+        for i in 0u32..8000 {
+            // First byte = i&0xff spans all 16 top nibbles (root fans out); the
+            // first two bytes are a bijection with i, so keys stay distinct.
+            let key = vec![(i & 0xff) as u8, (i >> 8) as u8, ((i >> 3) & 0xff) as u8];
+            map.insert(key, val((i as u8) | 1));
+        }
+        assert!(map.len() >= PARALLEL_REBUILD_THRESHOLD);
         let mut inc = IncrementalTrie::from_delta(&map);
         assert_eq!(inc.root(), trie_root(&map));
     }

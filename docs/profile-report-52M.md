@@ -177,47 +177,68 @@ Snapshot 使用 `CachePolicy::SkipSingleton` 策略跳过叶节点缓存以节�
 
 **关键观察：运行期 RSS 平坦，无 delta sawtooth。** 每 ~3.4s 跨越一个 2,000-epoch group 边界（delta 归 0 → 重建）时，1s 分辨率下 RSS 无可见波动（稳定在 73,814,992 kB）。delta trie 在一个 period 内增长到约 1 万条（数十 MB）后于边界旋转归并入 snapshot，这部分内存被分配器 arena 吸收复用，不体现为进程 RSS 的锯齿。**输入 `.cfxpack` 走缓冲 IO，进入 OS page cache（buff/cache ~40 GB），不计入进程 RSS。**
 
-### A.2 加载/恢复条目数与内存（高度 150,052,000）
+### A.2 加载/恢复条目数与内存（高度 150,052,000，生产 streaming 路径）
 
-`MMPT_RECOVER_TIMING=1` 实测（生产 checkpoint 只读恢复）：
+> **订正（stream / non-stream 混淆）**：本节此前记录的「恢复后常驻 110.9 GB / 峰值 122.2 GB」以及 `after_read 20.29 GB`、`after_deserialize 45.9 GB` 两步，来自 **non-streaming 的诊断工具 `ckpt-restore-rss`**（`fs::read` 整个 checkpoint 进内存 + `bincode` 反序列化出中间 Vec + 再建 trie，三者同时驻留）。**生产恢复走 `Checkpoint::load_streaming`（`State::from_reader`，`BufReader` 直接跨文件，不 `fs::read` 整文件）**，二者内存差 ~37 GB，故此前的数字不代表生产内存。下表为 streaming 路径实测（`ckpt-mem-survey` / `ckpt-bench`，同一 20.78 GB checkpoint）。
 
-| 项目 | 数值 |
+| 项目 | 数值（streaming 生产路径） |
 |------|------|
 | Snapshot 条目 | **250,008,004** |
 | Intermediate 条目 | 11,295 |
 | Delta 条目 | 0（period 边界） |
 | Hash cache 节点数（memo 内部节点） | **99,238,783** |
-| Checkpoint 文件 / 读入原始字节 | 20.78 GB |
-| after_read RSS | 20.29 GB |
-| after_deserialize RSS | 45.9 GB |
-| **恢复后常驻 RSS** | **110.9 GB（105.8 GiB）** |
-| **恢复峰值 VmHWM** | **122.2 GB（116.5 GiB）** |
+| Checkpoint 文件大小 | 20.78 GB（19.35 GiB） |
+| **加载后常驻 RSS** | **73.8 GiB** |
+| **加载峰值 VmHWM** | **84 GiB**（`snapshot_root` 并行重建时的 `cache_entries` 瞬时 Vec） |
 
-### A.3 RSS 分布归因（250M 尺度）
+> 对照：non-streaming `ckpt-restore-rss` 工具在同一 checkpoint 上常驻 110.9 GB / 峰值 122.2 GB —— 仅用于离线诊断，**不是**生产路径。
 
-进程 RSS 几乎 100% 为匿名堆，由 snapshot IncrementalTrie 主导：
+### A.3 RSS 分布归因（250M 尺度，`ckpt-mem-survey` 单趟实测 + glibc chunk 模型）
 
-| 组件 | 估算 | 依据 |
+进程 RSS 几乎 100% 为匿名堆，由 snapshot `IncrementalTrie` 主导。下表所有「实测」行来自对 `entries`/`cache` 的单趟遍历（`memory_survey`）；「计算」行由实测长度直方图套 glibc chunk 公式 `max(32,(n+8+15)&~15)` 得出；「模型」行为对 73.8 GiB 总量的残差归因。**总量与实测 RSS 对齐（Σ ≈ 73.8 GiB）。**
+
+| 组件 | GiB | 来源 |
+|------|-----|------|
+| Entry key nibble 数据 | **24.80** | 实测 Σ key.len()（nibble，2×字节） |
+| Value 数据 | **3.22** | 实测 Σ value.len() |
+| Cache key nibble 数据 | **5.15** | 实测 Σ cache-key.len() |
+| Cache H256（inline 于 hashmap 桶） | **2.96** | 实测 32 × 99.24M |
+| —— *真实数据小计* | **36.13**（49%） | —— |
+| Key buffer 分配器开销 | 3.24 | 计算（chunk−data，键多为 112–114 nibble→128B chunk） |
+| Value buffer 分配器开销 | **5.36** | 计算（208M 个 ≤24B 小值各占 32B 最小 chunk） |
+| Cache-key buffer 分配器开销 | 0.77 | 计算 |
+| BTreeMap inline 头（`Vec<u8>`24 + `MptValue`16 = 40B×250M，已占用槽） | 9.31 | 实测类型尺寸 |
+| BTreeMap 节点结构 + ~54% 填充浪费 + 节点分配 | ~13.3 | 模型（`from_snapshot_reader` 顺序 `.insert()` → 升序插入叶约 54% 满） |
+| Cache hashmap 表（`Vec`头 2.22 + 空桶 1.82 + control 0.13） | 4.17 | 计算（99.24M 条 → 2²⁷=134.2M 桶，7/8 负载） |
+| Intermediate / delta / 执行引擎 / cfxpack 缓冲 | ~1.5 | 估算 |
+| **合计** | **~73.8** | ≈ 实测 RSS |
+
+**结论：73.8 GiB 中仅约 36 GiB（49%）是真实 key/value/cache 数据，另外 ~38 GiB（51%）是开销**，其中最大的三块指针/对齐/结构开销是：① inline 指针头（`Vec`+`MptValue` 共 11.5 GiB）；② glibc chunk 对齐（9.4 GiB，小值的 32B 最小 chunk 是主因）；③ BTreeMap 升序插入的 ~54% 填充浪费（~7.9 GiB，可用 `FromIterator` 批量构建修掉）。
+
+### A.4 恢复 `snapshot_root` 成本拆分（250M 条，streaming 路径实测，并行 fix 之后）
+
+`root_with_policy` 命中**并行**重建路径（`entries=250,008,004 ≥ PARALLEL_REBUILD_THRESHOLD=4096`，实测确认走 `memo_node_rebuild`）。**按子树规模 fan-out 的并行修复落地后**，`snapshot_hash` 由旧的 196s 降到 54s（3.6×）：
+
+| 阶段 | 耗时 | 说明 |
 |------|------|------|
-| **Snapshot BTreeMap**（250.0M 条） | **~75–85 GB** | 沿用 A.2/三节实测的 ~3.6× KV 膨胀模型，按 250M 条线性放大 |
-| **Snapshot hash cache**（99.24M 节点） | **~12–13 GB** | 实测缓存节点数 × ~130 B/节点 |
-| Intermediate trie（11,295 条） | 数 MB | 可忽略 |
-| Delta trie（0 → period 内 ~1 万条） | 数十 MB | 被分配器吸收，不体现 RSS 锯齿 |
-| commitments / executed_epochs 有界窗口 | < 1 GB | 由 `--anomaly-streak` / `--max-mismatches` 界定的少量 epoch root |
-| 执行引擎 + cfxpack 解码缓冲 | ~2 GB | EVM 栈、交易缓冲 |
-| 代码 / rodata | ~14 MB | smaps Private_Clean + Shared_Clean |
-| 输入 `.cfxpack` | 不计入 RSS | 缓冲 IO → OS page cache |
+| `stream_read_snapshot`（流式读 250M 条建 BTreeMap） | **127.3 s** | 单核解析 + `.insert()` |
+| `snapshot_hash`（`memo_node_rebuild` 并行 keccak） | **54.0 s** | 起步打满全部核（旧值 196s，见并行 fix） |
+| `snapshot_cache_extend`（99.24M 条 extend 进 FxHashMap） | **13.5 s** | 单核 |
+| **加载合计** | **≈ 201.7 s** | —— |
 
-### A.4 恢复 `snapshot_root` 成本拆分（250M 条，实测）
+> **结论：streaming 恢复墙钟由 `stream_read`（127s，63%）主导，其次才是并行 keccak（54s，27%）。** 并行 fix 已把哈希从加载瓶颈降为次要项；进一步降恢复时间应针对流式读取/建 BTreeMap 阶段（如批量构建、byte-key 免 nibble 展开）。
 
-恢复时对 250M 条 snapshot 重建 merkle root 是加载阶段的主要单项开销。`root_with_policy` 命中**并行**重建路径（`entries=250,008,004 ≥ PARALLEL_REBUILD_THRESHOLD=4096`，已实测确认走 `memo_node_rebuild` 而非串行 `memo_node`），拆分为：
+### A.5 内存优化潜力（`ckpt-mem-survey` 实测，先不计实现开销）
 
-| 阶段 | 耗时 | 占 snapshot_root | 并行度 |
-|------|------|------------------|--------|
-| `snapshot_hash`（`memo_node_rebuild` 并行 keccak） | **196,364 ms** | **91.7%** | 起步饱和全部 32 核（mpstat idle→0.00%） |
-| `snapshot_cache_extend`（99.24M 条串行 extend 进 FxHashMap） | **13,760 ms** | 6.4% | 单核 |
-| `snapshot_root` 合计 | 214,039 ms | 100% | |
+针对两个候选优化的实测潜力（裸潜力，未扣除新方案自身的指针/结构开销）：
 
-其余恢复段：`snapshot_build`（条目 Vec 构造）59,250 ms、`intermediate_root` 14 ms、`delta_inc_build` 0 ms；`from_persisted_total` 273,303 ms。
+**(b) key 前 40-nibble（20 字节）路由前缀去重**
+- distinct 40-nibble 前缀 = **23,796,252**，vs 250M 条目 → 平均每前缀 ~10.5 条共享。
+- 当前前缀占 `min(40,len)` × 250M = **9.31 GiB**；去重后每个 distinct 前缀只存一次 = **0.89 GiB**。
+- **裸去重潜力 = 8.43 GiB** key 数据。（注：另有正交的更大杠杆——key 以 nibble 存储使体积翻倍，byte-pack 可把 24.80 GiB 减半。）
 
-> **结论：恢复期 `snapshot_root` 由并行 keccak 哈希主导（196s，92%），而非串行 cache 构建（13.8s，6%）。** 即便哈希已并行化（起步能打满 32 核），250M 条 + 99M 内部节点的 keccak 工作量本身仍是恢复墙钟的最大单项；串行的 `cache.extend` 只是次要项。降低恢复时间应针对哈希阶段（更深的并行切分 / 减少重哈希），而非 cache 构建。
+**(c) value 「u32 padding 到 32 字节」猜想 —— 实测不成立**
+- value 长度分布是**变长**的（len 1 / 4 / 21 为主；恰好 32 字节的仅 158,866 条）。
+- 全部 250M value 的 **Σ 前导零字节仅 73,884 B（0.00 GiB）** —— 值已是紧凑（RLP）编码，前导零早被剥离，**没有 padding 到 32 字节**。
+- 46.1%（115M）的值数值上 <2³²，但它们当前平均只占 ~2.2 B；若强行按定长 u32(4B) 存反而**更大**（0.24 GiB → 0.43 GiB）。
+- **结论：value 侧无 padding 浪费，优化潜力 ≈ 0。**

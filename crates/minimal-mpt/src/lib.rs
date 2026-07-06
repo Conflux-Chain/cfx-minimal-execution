@@ -7,6 +7,8 @@ mod store;
 mod trie;
 mod types;
 
+#[cfg(feature = "mem-survey")]
+pub use incremental::MemorySurvey;
 pub use key_codec::{DeltaMptKeyPadding, StorageKey, StorageKeyWithSpace};
 pub use state::{State, StateManager, StateTrait};
 pub use store::{FileStore, MemoryStore, PersistedState, StateStore};

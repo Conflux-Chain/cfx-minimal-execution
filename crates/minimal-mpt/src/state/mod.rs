@@ -195,9 +195,18 @@ impl State {
     /// This is the load-side counterpart to the executor's `save_streaming`.
     pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
         let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+        let timing = std::env::var_os("MMPT_RECOVER_TIMING").is_some();
 
         // 1. snapshot — streamed straight into the snapshot store.
+        let t = std::time::Instant::now();
         let mut snapshot_inc = SnapshotTrie::from_reader(reader)?;
+        if timing {
+            eprintln!(
+                "[recover] stream_read_snapshot entries={} elapsed={}ms",
+                snapshot_inc.len(),
+                t.elapsed().as_millis()
+            );
+        }
         // 2-3. intermediate / delta — small, plain bincode.
         let intermediate: BTreeMap<Vec<u8>, MptValue> =
             bincode::deserialize_from(&mut *reader).map_err(bin)?;
@@ -294,6 +303,13 @@ impl State {
             snapshot_epoch_count: self.snapshot_epoch_count,
             last_root: self.last_root.clone(),
         }
+    }
+
+    /// Read-only single-pass memory survey of the (dominant) snapshot trie —
+    /// for the memory-optimization study. See [`crate::MemorySurvey`].
+    #[cfg(feature = "mem-survey")]
+    pub fn memory_survey(&self) -> crate::MemorySurvey {
+        self.snapshot.memory_survey()
     }
 
     pub fn put_intermediate_raw(&mut self, raw_key: Vec<u8>, value: MptValue) {
