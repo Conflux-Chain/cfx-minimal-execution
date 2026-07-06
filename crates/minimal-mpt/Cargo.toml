@@ -4,19 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rayon = "1.10"
-serde = { version = "1.0", features = ["derive"] }
-tiny-keccak = { version = "2.0", features = ["keccak"] }
-bincode = "1.3"
+anyhow = { workspace = true }
+bincode = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true }
 arbitrary = { version = "1.4", features = ["derive"] }
-rustc-hash = "2.0"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
 heed = { version = "0.20", optional = true }
-tempfile = { version = "3.10", optional = true }
+tempfile = { workspace = true, optional = true }
 
 [features]
-# Cross-check the incremental delta root against the stateless `trie_root`
-# oracle on every commit. On for tests automatically; enable for fuzzing. Off
-# in the replay so it pays only the incremental cost.
 verify-incremental = []
 snapshot-lmdb = ["dep:heed", "dep:tempfile"]
 
@@ -26,3 +24,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 [[bin]]
 name = "trace_standalone"
 path = "src/bin/trace_standalone.rs"
+
+[[bin]]
+name = "ckpt_stats"
+path = "src/bin/ckpt_stats.rs"

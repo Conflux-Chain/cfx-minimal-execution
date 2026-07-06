@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cfxpack",
     "crates/minimal-mpt",
+    "crates/replay-checkpoint",
     "crates/replay-data-extractor",
 ]
 
@@ -11,3 +12,28 @@ exclude = [
     "crates/replay-data-extractor/fuzz",
     "oracle/conflux-rust",
 ]
+
+[workspace.dependencies]
+# External crates (multi-use across workspace members)
+anyhow = "1"
+bincode = "1.3"
+rayon = "1.10"
+rlp = "0.6"
+rustc-hash = "2.1"
+serde = { version = "1", features = ["derive"] }
+snap = "1.1"
+tempfile = "3.10"
+
+# Conflux-Chain git deps — single rev for type unification across the pipeline.
+# The oracle workspace `[patch."https://..."]` redirects these to its own path
+# crates so the executor build unifies on that side.
+cfx-internal-common = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+cfx-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+diem-crypto = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+diem-types = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+primitives = { git = "https://github.com/Conflux-Chain/conflux-rust.git", rev = "817bed88afb11161824b7ec93876c76a38250db8" }
+rocksdb = { git = "https://github.com/Conflux-Chain/rust-rocksdb.git", rev = "672b02bc21874a5e91705f3642dac3614a7a8f9e" }
+
+# Internal path crates
+cfx-minimal-mpt = { path = "crates/minimal-mpt" }
+cfxpack = { path = "crates/cfxpack" }

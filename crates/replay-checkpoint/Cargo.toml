@@ -1,0 +1,30 @@
+[package]
+name = "cfx-replay-checkpoint"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true }
+rlp = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+
+cfx-internal-common = { workspace = true }
+cfx-minimal-mpt = { workspace = true }
+cfx-types = { workspace = true }
+cfxpack = { workspace = true }
+primitives = { workspace = true }
+
+[[bin]]
+name = "ckpt-roundtrip"
+path = "src/bin/ckpt_roundtrip.rs"
+
+[[bin]]
+name = "ckpt-verify"
+path = "src/bin/ckpt_verify.rs"
+
+[[bin]]
+name = "ckpt-restore-rss"
+path = "src/bin/ckpt_restore_rss.rs"

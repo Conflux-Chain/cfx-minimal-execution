@@ -5,7 +5,7 @@
 // Usage: dump_epoch <blockchain_db_path> <epoch>
 use anyhow::{anyhow, Context, Result};
 use cfx_types::{Space, H256};
-use primitives::{Block, BlockHeader, SignedTransaction};
+use primitives::{Block, SignedTransaction};
 use rlp::Rlp;
 use rocksdb::{
     rocksdb_options::ColumnFamilyDescriptor, BlockBasedOptions, Cache, ColumnFamilyOptions,

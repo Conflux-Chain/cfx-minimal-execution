@@ -29,6 +29,9 @@ fn block(index: usize, height: u64, author: Address, flags: u8) -> Block {
         base_reward: U256::from(1),
         transactions: Vec::new(),
         transaction_refs: Vec::new(),
+        pos_rewards: Vec::new(),
+        unlock_events: Vec::new(),
+        pos_view: None,
     }
 }
 
