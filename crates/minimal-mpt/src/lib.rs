@@ -1,6 +1,7 @@
 mod codec;
 mod incremental;
 mod key_codec;
+mod nibbles;
 mod snapshot;
 mod state;
 mod store;

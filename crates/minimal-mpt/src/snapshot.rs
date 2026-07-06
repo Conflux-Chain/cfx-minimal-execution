@@ -117,11 +117,12 @@ impl SnapshotTrie {
 mod lmdb {
     use super::*;
     use crate::{
-        incremental::{common_prefix_len, nibbles_to_bytes, rebuild_snapshot_root_cache},
+        incremental::PARALLEL_REBUILD_THRESHOLD,
         trie::{bytes_to_nibbles, compute_node_merkle, compute_path_merkle, CHILDREN},
         types::MERKLE_NULL_NODE,
     };
     use heed::{types::Bytes, Database, Env, EnvOpenOptions};
+    use rayon::prelude::*;
     use rustc_hash::FxHashMap;
     use std::{collections::BTreeSet, fmt, io};
     use tempfile::TempDir;
@@ -196,7 +197,6 @@ mod lmdb {
         /// copy of the snapshot) is dropped as soon as the cache is built.
         pub(crate) fn from_reader(reader: &mut impl io::Read) -> io::Result<Self> {
             use crate::codec::{read_len_prefixed, read_u64_le};
-            use crate::incremental::rebuild_snapshot_root_cache_from_nibble_entries;
             let count = read_u64_le(reader)? as usize;
             let dir = tempfile::Builder::new()
                 .prefix("cfx-mmpt-snapshot-lmdb-")
@@ -516,6 +516,155 @@ mod lmdb {
             cache.insert(rp.to_vec(), hash);
         }
         hash
+    }
+
+    // --- Nibble-keyed hashing helpers ---------------------------------------
+    //
+    // The LMDB backend keeps the historical one-nibble-per-byte key layout (its
+    // keys live in LMDB, not in RAM, so the packing win doesn't apply). These
+    // are the pre-packing versions of the rebuild machinery, kept local so the
+    // in-memory backend's `incremental` module can move to packed `NibblePrefix`
+    // keys without disturbing this path.
+
+    fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
+        nibbles.chunks_exact(2).map(|p| (p[0] << 4) | p[1]).collect()
+    }
+
+    /// Longest common nibble prefix of two sorted-block endpoints beyond `depth`.
+    fn common_prefix_len(first: &[u8], last: &[u8], depth: usize) -> usize {
+        first
+            .iter()
+            .zip(last)
+            .skip(depth)
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    fn child_prefix(full_prefix: &[u8], c: usize) -> Vec<u8> {
+        let mut rp = Vec::with_capacity(full_prefix.len() + 1);
+        rp.extend_from_slice(full_prefix);
+        rp.push(c as u8);
+        rp
+    }
+
+    /// A nibble-keyed entry fed to [`memo_node_rebuild`].
+    #[derive(Clone, Copy)]
+    struct EntryRef<'a> {
+        key: &'a [u8],
+        value: &'a [u8],
+    }
+
+    fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usize, usize)> {
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| entry.key.get(node_depth).map(|&c| (idx, c as usize)))
+            .fold(Vec::new(), |mut ranges, (idx, child)| {
+                match ranges.last_mut() {
+                    Some(last) if last.0 == child && last.2 == idx => last.2 = idx + 1,
+                    _ => ranges.push((child, idx, idx + 1)),
+                }
+                ranges
+            })
+    }
+
+    /// Cold-cache root/cache rebuild over an already sorted nibble-keyed slice.
+    fn memo_node_rebuild(
+        entries: &[EntryRef<'_>],
+        rp: &[u8],
+        allow_path_compression: bool,
+        cache_policy: CachePolicy,
+    ) -> (H256, Vec<(Vec<u8>, H256)>) {
+        debug_assert!(!entries.is_empty());
+        let depth = rp.len();
+        let first_key = entries[0].key;
+        let last_key = entries[entries.len() - 1].key;
+        let is_singleton = first_key == last_key;
+        let common = if allow_path_compression {
+            common_prefix_len(first_key, last_key, depth)
+        } else {
+            0
+        };
+        let node_depth = depth + common;
+        let full_prefix = &first_key[0..node_depth];
+
+        let maybe_value = entries
+            .iter()
+            .find(|entry| entry.key.len() == node_depth)
+            .map(|entry| entry.value);
+
+        let recurse = |&(child, start, end): &(usize, usize, usize)| {
+            let child_rp = child_prefix(full_prefix, child);
+            let (hash, cache_entries) =
+                memo_node_rebuild(&entries[start..end], &child_rp, true, cache_policy);
+            (child, hash, cache_entries)
+        };
+
+        let ranges = child_ranges(entries, node_depth);
+        let results: Vec<(usize, H256, Vec<(Vec<u8>, H256)>)> =
+            if entries.len() >= PARALLEL_REBUILD_THRESHOLD && ranges.len() > 1 {
+                ranges.par_iter().map(&recurse).collect()
+            } else {
+                ranges.iter().map(&recurse).collect()
+            };
+
+        let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
+        let mut cache_entries = Vec::with_capacity(results.iter().map(|(_, _, c)| c.len()).sum());
+        for (child, hash, mut child_cache_entries) in results {
+            children[child] = hash;
+            cache_entries.append(&mut child_cache_entries);
+        }
+
+        let has_children = children.iter().any(|h| *h != MERKLE_NULL_NODE);
+        let node_hash = compute_node_merkle(has_children.then_some(&children), maybe_value);
+        let hash = compute_path_merkle(&first_key[depth..node_depth], depth, node_hash);
+
+        if cache_policy == CachePolicy::Full || !is_singleton {
+            cache_entries.push((rp.to_vec(), hash));
+        }
+        (hash, cache_entries)
+    }
+
+    fn rebuild_snapshot_root_cache(
+        snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>,
+        cache_policy: CachePolicy,
+    ) -> (H256, Cache) {
+        if snapshot.is_empty() {
+            return (MERKLE_NULL_NODE, Cache::default());
+        }
+        let encoded: Vec<(Vec<u8>, &[u8])> = snapshot
+            .iter()
+            .map(|(key, value)| (bytes_to_nibbles(key), value.as_ref()))
+            .collect();
+        let entries: Vec<EntryRef<'_>> = encoded
+            .iter()
+            .map(|(key, value)| EntryRef {
+                key: key.as_slice(),
+                value,
+            })
+            .collect();
+        let (root, cache_entries) = memo_node_rebuild(&entries, &[], false, cache_policy);
+        (root, cache_entries.into_iter().collect())
+    }
+
+    /// Like [`rebuild_snapshot_root_cache`], but over entries already keyed by
+    /// nibbles (as streamed from a checkpoint into LMDB), ascending-sorted.
+    fn rebuild_snapshot_root_cache_from_nibble_entries(
+        entries: &[(Vec<u8>, Vec<u8>)],
+        cache_policy: CachePolicy,
+    ) -> (H256, Cache) {
+        if entries.is_empty() {
+            return (MERKLE_NULL_NODE, Cache::default());
+        }
+        let refs: Vec<EntryRef<'_>> = entries
+            .iter()
+            .map(|(key, value)| EntryRef {
+                key: key.as_slice(),
+                value: value.as_slice(),
+            })
+            .collect();
+        let (root, cache_entries) = memo_node_rebuild(&refs, &[], false, cache_policy);
+        (root, cache_entries.into_iter().collect())
     }
 }
 

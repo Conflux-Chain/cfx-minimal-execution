@@ -22,6 +22,16 @@
 //! path compression) is mirrored and guarded by a differential check against
 //! `trie_root` in debug builds and the fuzz targets.
 //!
+//! ## Key representation
+//!
+//! Keys are byte-aligned, so their **nibble length is even** and packing two
+//! nibbles per byte reproduces the canonical byte key exactly. The entries map
+//! is therefore keyed directly on canonical bytes (`Box<[u8]>`) — half the heap
+//! of the old one-nibble-per-byte form — and nibble-level routing goes through
+//! the zero-cost [`Nibbles`] view. Routing prefixes / cache keys can be odd
+//! length, so they use [`NibblePrefix`] (packed + a parity byte). See
+//! [`crate::nibbles`].
+//!
 //! ## Cache key and eviction
 //!
 //! A node is identified by its **routing nibble prefix** `P` (the `depth`
@@ -39,21 +49,20 @@
 //! needed during the walk.
 
 use crate::codec::{read_len_prefixed, read_u64_le};
-use crate::trie::{
-    bytes_to_nibbles, compute_node_merkle, compute_path_merkle, MptValue, TrieValue, CHILDREN,
-};
+use crate::nibbles::{to_ref_bounds, NibblePrefix, Nibbles};
+use crate::trie::{compute_node_merkle, compute_path_merkle, MptValue, TrieValue, CHILDREN};
 use crate::types::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 
-const PARALLEL_REBUILD_THRESHOLD: usize = 4096;
+pub(crate) const PARALLEL_REBUILD_THRESHOLD: usize = 4096;
 
 /// Cache keyed by a node's routing nibble prefix. FxHash, not SipHash: these
-/// short byte (nibble) keys are hashed on every node visit and SipHash showed
-/// up prominently in profiles.
-pub(crate) type Cache = FxHashMap<Vec<u8>, H256>;
+/// short packed keys are hashed on every node visit and SipHash showed up
+/// prominently in profiles.
+pub(crate) type Cache = FxHashMap<NibblePrefix, H256>;
 
 /// Controls which subtree hashes are retained after a root walk.
 ///
@@ -67,112 +76,29 @@ pub(crate) enum CachePolicy {
     SkipSingleton,
 }
 
-#[cfg(feature = "snapshot-lmdb")]
-pub(crate) fn rebuild_snapshot_root_cache(
-    snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>,
-    cache_policy: CachePolicy,
-) -> (H256, Cache) {
-    if snapshot.is_empty() {
-        return (MERKLE_NULL_NODE, Cache::default());
-    }
-
-    let encoded: Vec<(Vec<u8>, &[u8])> = snapshot
-        .iter()
-        .map(|(key, value)| (bytes_to_nibbles(key), value.as_ref()))
-        .collect();
-    let entries: Vec<EntryRef<'_>> = encoded
-        .iter()
-        .map(|(key, value)| EntryRef {
-            key: key.as_slice(),
-            value,
-        })
-        .collect();
-    let (root, cache_entries) =
-        memo_node_rebuild(&entries, &[], false, cache_policy);
-    (root, cache_entries.into_iter().collect())
-}
-
-/// Like [`rebuild_snapshot_root_cache`], but over entries already keyed by
-/// **nibbles** (as streamed from a checkpoint into LMDB), ascending-sorted.
-/// Skips the byte→nibble conversion the byte-keyed variant does. The parallel
-/// rebuild (`memo_node_rebuild`) is preserved — the caller passes the owned
-/// entry vector it accumulated while writing LMDB, so no extra full pass over
-/// the snapshot is needed.
-#[cfg(feature = "snapshot-lmdb")]
-pub(crate) fn rebuild_snapshot_root_cache_from_nibble_entries(
-    entries: &[(Vec<u8>, Vec<u8>)],
-    cache_policy: CachePolicy,
-) -> (H256, Cache) {
-    if entries.is_empty() {
-        return (MERKLE_NULL_NODE, Cache::default());
-    }
-    let refs: Vec<EntryRef<'_>> = entries
-        .iter()
-        .map(|(key, value)| EntryRef {
-            key: key.as_slice(),
-            value: value.as_slice(),
-        })
-        .collect();
-    let (root, cache_entries) =
-        memo_node_rebuild(&refs, &[], false, cache_policy);
-    (root, cache_entries.into_iter().collect())
-}
-
-/// Incremental delta-trie root.
-///
-/// Owns the delta as a persistent **nibble-keyed** map, so a commit never
-/// re-derives nibbles or rebuilds the entry list for the whole delta — only
-/// changed keys are converted, once, at write time. Combined with the
-/// prefix-eviction cache, a commit costs roughly `O(changed keys × depth)`
-/// instead of `O(delta size)`.
-///
-/// Generic over the stored value type `V` (default [`MptValue`]): the delta and
-/// intermediate tries keep `MptValue` (which carries `Tombstone`), while the
-/// snapshot — provably tombstone-free — instantiates it with a compact inline
-/// value type to save memory. Only [`TrieValue`] (merkle bytes + visibility) is
-/// required, so the hashing and cache logic are identical across value types.
-#[derive(Clone, Debug)]
-pub struct IncrementalTrie<V = MptValue> {
-    /// Delta entries keyed by nibbles (the trie's working set).
-    entries: BTreeMap<Vec<u8>, V>,
-    /// Cached subtree hashes, keyed by node routing prefix.
-    cache: Cache,
-    /// Nibble keys changed since the last `root`, pending prefix eviction.
-    dirty: BTreeSet<Vec<u8>>,
-}
-
-impl<V> Default for IncrementalTrie<V> {
-    fn default() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-            cache: Cache::default(),
-            dirty: BTreeSet::new(),
-        }
-    }
-}
-
 /// Aggregate counters from [`IncrementalTrie::memory_survey`] — raw single-pass
 /// sums only. All derived arithmetic (breakdown estimate, dedup / padding
 /// optimization potential) lives in the `ckpt-mem-survey` bin so this stays a
-/// pure collector. Keys are nibble-expanded routing prefixes (2 nibbles/byte),
-/// so a logical 20-byte prefix is 40 nibble elements.
+/// pure collector. Byte/prefix totals are reported in **nibble-equivalent**
+/// units (a 20-byte prefix counts as 40 nibbles) so the numbers stay comparable
+/// to the pre-packing survey.
 #[cfg(feature = "mem-survey")]
 #[derive(Clone, Debug)]
 pub struct MemorySurvey {
-    // entries: BTreeMap<Vec<u8>, MptValue>
+    // entries: BTreeMap<Box<[u8]> (canonical), V>
     pub n_entries: usize,
     pub n_tombstone: usize,
-    pub entry_key_bytes: u64, // Σ nibble-key stored len
+    pub entry_key_bytes: u64, // Σ nibble length (= 2 × canonical byte len)
     pub value_bytes: u64,     // Σ value len
-    // cache: FxHashMap<Vec<u8>, H256>
+    // cache: FxHashMap<NibblePrefix, H256>
     pub n_cache: usize,
     pub cache_key_bytes: u64, // Σ cache-key nibble len (values are fixed 32B H256)
     // distributions (O(1) fixed buckets)
-    pub key_len_hist: [u64; 129], // entry key BYTE length (nibble/2), [128]=>=128
+    pub key_len_hist: [u64; 129], // entry key BYTE length, [128]=>=128
     pub val_len_hist: [u64; 34],  // value length 0..=32, [33]=>=33
     // (b) shared first-40-nibble (20-byte) routing-prefix dedup on entry keys
     pub distinct_prefix40: u64,
-    pub prefix40_stored_bytes: u64,  // Σ min(40, keylen) over all entries
+    pub prefix40_stored_bytes: u64,  // Σ min(40, nibblelen) over all entries
     pub prefix40_deduped_bytes: u64, // Σ that prefix once per distinct group
     // (c) value zero-padding
     pub val_leading_zero_bytes: u64,  // Σ leading zero bytes (big-endian strip savings)
@@ -205,15 +131,47 @@ impl Default for MemorySurvey {
     }
 }
 
+/// Incremental delta-trie root.
+///
+/// Owns the delta as a persistent **canonical-byte-keyed** map, so a commit
+/// never rebuilds the entry list for the whole delta — only changed keys are
+/// touched. Combined with the prefix-eviction cache, a commit costs roughly
+/// `O(changed keys × depth)` instead of `O(delta size)`.
+///
+/// Generic over the stored value type `V` (default [`MptValue`]): the delta and
+/// intermediate tries keep `MptValue` (which carries `Tombstone`), while the
+/// snapshot — provably tombstone-free — instantiates it with a compact inline
+/// value type to save memory. Only [`TrieValue`] (merkle bytes + visibility) is
+/// required, so the hashing and cache logic are identical across value types.
+#[derive(Clone, Debug)]
+pub struct IncrementalTrie<V = MptValue> {
+    /// Delta entries keyed by canonical bytes (the trie's working set).
+    entries: BTreeMap<Box<[u8]>, V>,
+    /// Cached subtree hashes, keyed by node routing prefix.
+    cache: Cache,
+    /// Canonical keys changed since the last `root`, pending prefix eviction.
+    dirty: BTreeSet<Box<[u8]>>,
+}
+
+impl<V> Default for IncrementalTrie<V> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            cache: Cache::default(),
+            dirty: BTreeSet::new(),
+        }
+    }
+}
+
 impl IncrementalTrie<MptValue> {
-    /// Build from an existing byte-keyed delta (e.g. a persisted state): one
-    /// nibble conversion per entry. The cache starts empty, so the first
-    /// `root` is a full (correct) recompute that populates it. Delta-only, so it
-    /// keeps `MptValue` (tombstones are meaningful in the delta).
+    /// Build from an existing byte-keyed delta (e.g. a persisted state). The
+    /// cache starts empty, so the first `root` is a full (correct) recompute
+    /// that populates it. Delta-only, so it keeps `MptValue` (tombstones are
+    /// meaningful in the delta).
     pub fn from_delta(delta: &BTreeMap<Vec<u8>, MptValue>) -> Self {
         let entries = delta
             .iter()
-            .map(|(k, v)| (bytes_to_nibbles(k), v.clone()))
+            .map(|(k, v)| (Box::from(k.as_slice()), v.clone()))
             .collect();
         Self {
             entries,
@@ -224,19 +182,17 @@ impl IncrementalTrie<MptValue> {
 }
 
 impl<V: TrieValue> IncrementalTrie<V> {
-    /// Insert / overwrite the value for `key` (the byte-form mpt key).
-    /// The nibble conversion happens here, once — not on every commit.
+    /// Insert / overwrite the value for `key` (the canonical byte mpt key).
     pub fn insert(&mut self, key: &[u8], value: V) {
-        let nibbles = bytes_to_nibbles(key);
-        self.dirty.insert(nibbles.clone());
-        self.entries.insert(nibbles, value);
+        let boxed: Box<[u8]> = Box::from(key);
+        self.dirty.insert(boxed.clone());
+        self.entries.insert(boxed, value);
     }
 
-    /// Remove `key` (byte-form) from the delta.
+    /// Remove `key` (canonical byte form) from the delta.
     pub fn remove(&mut self, key: &[u8]) {
-        let nibbles = bytes_to_nibbles(key);
-        self.entries.remove(&nibbles);
-        self.dirty.insert(nibbles);
+        self.entries.remove(key);
+        self.dirty.insert(Box::from(key));
     }
 
     /// Drop all entries, cached hashes and pending dirty keys. Called when the
@@ -249,7 +205,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
 
     /// Read-only single-pass survey for the memory-optimization study.
     /// O(1) extra space: the BTreeMap is sorted, so the shared-prefix dedup runs
-    /// by comparing each key's first 40 nibbles to the previous one — no set is
+    /// by comparing each key's first 20 bytes to the previous one — no set is
     /// built. Value zero-padding is measured big-endian (leading zeros).
     #[cfg(feature = "mem-survey")]
     pub fn memory_survey(&self) -> MemorySurvey {
@@ -258,15 +214,16 @@ impl<V: TrieValue> IncrementalTrie<V> {
         let mut have_prev = false;
         for (k, v) in &self.entries {
             s.n_entries += 1;
-            s.entry_key_bytes += k.len() as u64;
-            s.key_len_hist[(k.len() / 2).min(128)] += 1;
+            let nibble_len = k.len() * 2;
+            s.entry_key_bytes += nibble_len as u64;
+            s.key_len_hist[k.len().min(128)] += 1;
 
-            // (b) shared first-40-nibble routing-prefix dedup, O(1) space.
-            let plen = k.len().min(40);
-            s.prefix40_stored_bytes += plen as u64;
+            // (b) shared first-40-nibble (20-byte) routing-prefix dedup, O(1) space.
+            let plen = k.len().min(20);
+            s.prefix40_stored_bytes += (plen * 2) as u64;
             if !have_prev || prev_prefix.as_slice() != &k[..plen] {
                 s.distinct_prefix40 += 1;
-                s.prefix40_deduped_bytes += plen as u64;
+                s.prefix40_deduped_bytes += (plen * 2) as u64;
                 prev_prefix.clear();
                 prev_prefix.extend_from_slice(&k[..plen]);
                 have_prev = true;
@@ -290,7 +247,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
             }
         }
         s.n_cache = self.cache.len();
-        s.cache_key_bytes = self.cache.keys().map(|k| k.len() as u64).sum();
+        s.cache_key_bytes = self.cache.keys().map(|p| p.nibble_len() as u64).sum();
         s
     }
 
@@ -307,10 +264,14 @@ impl<V: TrieValue> IncrementalTrie<V> {
             return MERKLE_NULL_NODE;
         }
         // Evict every prefix of every dirty key, so no stale subtree hash can
-        // survive (see module docs). `dirty` already holds nibble keys.
-        for nibbles in &self.dirty {
-            for len in 0..=nibbles.len() {
-                self.cache.remove(&nibbles[0..len]);
+        // survive (see module docs). Build each key's prefixes nibble-by-nibble.
+        for key in &self.dirty {
+            let nibbles = Nibbles::from_bytes(key);
+            let mut p = NibblePrefix::empty();
+            self.cache.remove(&p);
+            for i in 0..nibbles.len() {
+                p = p.push(nibbles.at(i));
+                self.cache.remove(&p);
             }
         }
         self.dirty.clear();
@@ -321,13 +282,13 @@ impl<V: TrieValue> IncrementalTrie<V> {
                 .entries
                 .iter()
                 .map(|(key, value)| EntryRef {
-                    key: key.as_slice(),
+                    key: key.as_ref(),
                     value: value.merkle_value(),
                 })
                 .collect();
             let t = std::time::Instant::now();
             let (root, cache_entries) =
-                memo_node_rebuild(&entries, &[], false, cache_policy);
+                memo_node_rebuild(&entries, &NibblePrefix::empty(), false, cache_policy);
             if timing {
                 eprintln!(
                     "[recover] snapshot_hash elapsed={}ms cache_entries={}",
@@ -347,7 +308,13 @@ impl<V: TrieValue> IncrementalTrie<V> {
             }
             root
         } else {
-            memo_node(&self.entries, &[], false, &mut self.cache, cache_policy)
+            memo_node(
+                &self.entries,
+                &NibblePrefix::empty(),
+                false,
+                &mut self.cache,
+                cache_policy,
+            )
         };
         #[cfg(feature = "verify-incremental")]
         {
@@ -357,17 +324,18 @@ impl<V: TrieValue> IncrementalTrie<V> {
             // it should have been evicted) — the one failure mode the incremental
             // walk has that the stateless one cannot. Covers BOTH the delta and
             // snapshot incremental tries. O(N) per call: verify builds only.
-            // Reconstruct an `MptValue` oracle from the generic value type (the
-            // snapshot's value carries no tombstone, so it is always `Some`).
+            // The oracle works in expanded nibbles, so re-derive them from the
+            // canonical keys (the snapshot's value carries no tombstone).
             let oracle_owned: Vec<(Vec<u8>, MptValue)> = self
                 .entries
                 .iter()
                 .map(|(k, v)| {
+                    let nibbles = crate::trie::bytes_to_nibbles(k);
                     let mv = match v.visible_value() {
                         Some(b) => MptValue::Some(Box::from(b)),
                         None => MptValue::Tombstone,
                     };
-                    (k.clone(), mv)
+                    (nibbles, mv)
                 })
                 .collect();
             let oracle: Vec<(Vec<u8>, &MptValue)> =
@@ -381,15 +349,15 @@ impl<V: TrieValue> IncrementalTrie<V> {
         result
     }
 
-    /// Build from a canonical snapshot map (all live values, no tombstones):
-    /// one nibble conversion per entry. Used to represent the snapshot trie,
-    /// which is read-only during a period and re-merged at boundaries. The cache
-    /// starts empty, so the first `root` is a full recompute that populates it;
-    /// later (incremental) merges clone that warm cache.
+    /// Build from a canonical snapshot map (all live values, no tombstones).
+    /// Used to represent the snapshot trie, which is read-only during a period
+    /// and re-merged at boundaries. The cache starts empty, so the first `root`
+    /// is a full recompute that populates it; later (incremental) merges clone
+    /// that warm cache.
     pub fn from_snapshot(snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
         let entries = snapshot
             .iter()
-            .map(|(k, v)| (bytes_to_nibbles(k), V::from_value_bytes(v)))
+            .map(|(k, v)| (Box::from(k.as_slice()), V::from_value_bytes(v)))
             .collect();
         Self {
             entries,
@@ -400,18 +368,16 @@ impl<V: TrieValue> IncrementalTrie<V> {
 
     /// Stream a snapshot trie from a bincode-encoded
     /// `BTreeMap<Vec<u8>, Box<[u8]>>` (`u64 count` then `count` × `(key, value)`
-    /// length-prefixed) without ever materializing the byte-keyed map: each
-    /// entry is converted to nibbles and inserted as it is read. The canonical
-    /// byte keys are ascending on disk, and byte→nibble expansion preserves
-    /// order, so the resulting nibble map is sorted. Cache starts empty; the
-    /// first `root` recomputes it.
+    /// length-prefixed) without ever materializing an intermediate map: each
+    /// entry is inserted (canonical key, converted value) as it is read. Cache
+    /// starts empty; the first `root` recomputes it.
     pub(crate) fn from_snapshot_reader(reader: &mut impl Read) -> io::Result<Self> {
         let count = read_u64_le(reader)? as usize;
         let mut entries = BTreeMap::new();
         for _ in 0..count {
             let key = read_len_prefixed(reader)?;
             let value = read_len_prefixed(reader)?;
-            entries.insert(bytes_to_nibbles(&key), V::from_value_bytes(&value));
+            entries.insert(key.into_boxed_slice(), V::from_value_bytes(&value));
         }
         Ok(Self {
             entries,
@@ -423,36 +389,25 @@ impl<V: TrieValue> IncrementalTrie<V> {
     /// Point lookup by canonical byte key (snapshot read path). Returns the live
     /// value bytes, or `None` if absent.
     pub fn snapshot_get(&self, canonical: &[u8]) -> Option<&[u8]> {
-        self.entries
-            .get(&bytes_to_nibbles(canonical))
-            .and_then(|v| v.visible_value())
+        self.entries.get(canonical).and_then(|v| v.visible_value())
     }
 
     /// All `(canonical key, value)` pairs whose canonical key starts with
-    /// `canonical_prefix` (snapshot prefix scan). Keys are converted back from
-    /// nibble form; snapshot keys are byte-aligned so nibble length is even.
+    /// `canonical_prefix` (snapshot prefix scan).
     pub fn snapshot_scan_prefix(&self, canonical_prefix: &[u8]) -> Vec<(Vec<u8>, Box<[u8]>)> {
-        let nibble_prefix = bytes_to_nibbles(canonical_prefix);
-        let upper = prefix_upper(&nibble_prefix);
+        let prefix = NibblePrefix::from_nibbles(Nibbles::from_bytes(canonical_prefix));
+        let (lo, hi) = prefix.key_bounds();
         self.entries
-            .range(nibble_prefix..upper)
-            .filter_map(|(nibbles, value)| {
-                value
-                    .visible_value()
-                    .map(|v| (nibbles_to_bytes(nibbles), Box::from(v)))
-            })
+            .range::<[u8], _>(to_ref_bounds(&lo, &hi))
+            .filter_map(|(key, value)| value.visible_value().map(|v| (key.to_vec(), Box::from(v))))
             .collect()
     }
 
-    /// Flatten back to a canonical byte-keyed map (for checkpoint persistence).
+    /// Flatten to a canonical byte-keyed map (for checkpoint persistence).
     pub fn to_canonical_map(&self) -> BTreeMap<Vec<u8>, Box<[u8]>> {
         self.entries
             .iter()
-            .filter_map(|(nibbles, value)| {
-                value
-                    .visible_value()
-                    .map(|v| (nibbles_to_bytes(nibbles), Box::from(v)))
-            })
+            .filter_map(|(key, value)| value.visible_value().map(|v| (key.to_vec(), Box::from(v))))
             .collect()
     }
 
@@ -465,49 +420,17 @@ impl<V: TrieValue> IncrementalTrie<V> {
     }
 
     /// Iterate live entries as `(canonical_byte_key, value_bytes)` in sorted
-    /// order, converting nibble keys back to bytes on the fly. No intermediate
-    /// collection — each entry is yielded one at a time.
+    /// order. No intermediate collection — each entry is yielded one at a time.
     pub fn iter_canonical(&self) -> impl Iterator<Item = (Vec<u8>, &[u8])> + '_ {
-        self.entries.iter().filter_map(|(nibbles, value)| {
-            value
-                .visible_value()
-                .map(|v| (nibbles_to_bytes(nibbles), v))
-        })
+        self.entries
+            .iter()
+            .filter_map(|(key, value)| value.visible_value().map(|v| (key.to_vec(), v)))
     }
 
     /// Number of stored entries (used by merge instrumentation).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
-}
-
-/// Inverse of [`bytes_to_nibbles`] for byte-aligned (even-length) nibble keys:
-/// pairs of nibbles recombine into bytes. Snapshot keys are always byte-aligned.
-pub(crate) fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
-    nibbles
-        .chunks_exact(2)
-        .map(|p| (p[0] << 4) | p[1])
-        .collect()
-}
-
-/// Exclusive upper bound for the BTreeMap range covering all keys with routing
-/// prefix `rp`: `rp` followed by `CHILDREN` (`16`), which is strictly greater
-/// than every real nibble (`0..16`). So the half-open range `[rp, rp++[16])` is
-/// exactly the keys prefixed by `rp`.
-pub(crate) fn prefix_upper(rp: &[u8]) -> Vec<u8> {
-    let mut upper = Vec::with_capacity(rp.len() + 1);
-    upper.extend_from_slice(rp);
-    upper.push(CHILDREN as u8);
-    upper
-}
-
-/// Routing prefix of child `c` under `full_prefix`: the parent's prefix with the
-/// child nibble appended.
-fn child_prefix(full_prefix: &[u8], c: usize) -> Vec<u8> {
-    let mut rp = Vec::with_capacity(full_prefix.len() + 1);
-    rp.extend_from_slice(full_prefix);
-    rp.push(c as u8);
-    rp
 }
 
 /// Range-driven mirror of [`crate::trie`]'s `merkle_for_node`, plus a cache keyed
@@ -518,12 +441,10 @@ fn child_prefix(full_prefix: &[u8], c: usize) -> Vec<u8> {
 /// `root` evicted any prefix touched by a dirty key (see module docs).
 ///
 /// Cost is `O(visited nodes × CHILDREN × log N)` — proportional to the dirty
-/// frontier, not the delta size: the old slice version paid `O(N)` per call just
-/// to flatten the map and re-partition the root level (always dirty). Serial only
-/// (the cache is `&mut`).
+/// frontier, not the delta size. Serial only (the cache is `&mut`).
 fn memo_node<V: TrieValue>(
-    entries: &BTreeMap<Vec<u8>, V>,
-    rp: &[u8],
+    entries: &BTreeMap<Box<[u8]>, V>,
+    rp: &NibblePrefix,
     allow_path_compression: bool,
     cache: &mut Cache,
     cache_policy: CachePolicy,
@@ -531,50 +452,63 @@ fn memo_node<V: TrieValue>(
     if let Some(hash) = cache.get(rp) {
         return *hash;
     }
-    let depth = rp.len();
-    let upper = prefix_upper(rp);
+    let depth = rp.nibble_len();
+    let (lo, hi) = rp.key_bounds();
 
-    // The node's key block is the contiguous range `[rp, rp++[16])`. It is
-    // non-empty: the root is non-empty and `root`/this fn only descend into
-    // children proven to exist. The first key carries the routing/compression
-    // nibbles; with path compression the node absorbs the longest prefix shared
-    // by the whole block, which — the block being sorted — is the common prefix
-    // of just its first (min) and last (max) key.
+    // The node's key block is the contiguous canonical-byte range for `rp`. It is
+    // non-empty: the root is non-empty and this fn only descends into children
+    // proven to exist. The first key carries the routing/compression nibbles;
+    // with path compression the node absorbs the longest prefix shared by the
+    // whole block, which — the block being sorted — is the common prefix of just
+    // its first (min) and last (max) key.
     let first_key = entries
-        .range(rp.to_vec()..upper.clone())
+        .range::<[u8], _>(to_ref_bounds(&lo, &hi))
         .next()
         .expect("non-empty node")
-        .0;
+        .0
+        .as_ref();
     let last_key = if allow_path_compression || cache_policy == CachePolicy::SkipSingleton {
         entries
-            .range(rp.to_vec()..upper)
+            .range::<[u8], _>(to_ref_bounds(&lo, &hi))
             .next_back()
             .expect("non-empty node")
             .0
+            .as_ref()
     } else {
         first_key
     };
+    let first = Nibbles::from_bytes(first_key);
+    let last = Nibbles::from_bytes(last_key);
     let is_singleton = first_key == last_key;
     let common = if allow_path_compression {
-        common_prefix_len(first_key, last_key, depth)
+        first.common_prefix_len_from(&last, depth)
     } else {
         0
     };
     let node_depth = depth + common;
-    let full_prefix = &first_key[0..node_depth];
+    let full_prefix = NibblePrefix::from_nibbles(first.sub(0, node_depth));
 
-    // A key ending exactly at this node can only be `full_prefix` itself.
-    let maybe_value = entries.get(full_prefix).map(|value| value.merkle_value());
+    // A key ending exactly at this node can only be `full_prefix` itself (and
+    // only when it lands on a byte boundary — see `as_canonical_key`).
+    let maybe_value = full_prefix
+        .as_canonical_key()
+        .and_then(|ck| entries.get(ck))
+        .map(|value| value.merkle_value());
 
     // Resolve all 16 child slots left-to-right. A cache hit reuses the clean
     // subtree's hash without touching `entries`; on a miss, one range probe
     // decides — a present (dirty) child recurses, an absent one stays null.
     let children: [H256; CHILDREN] = std::array::from_fn(|c| {
-        let child_rp = child_prefix(full_prefix, c);
+        let child_rp = full_prefix.push(c as u8);
         if let Some(hash) = cache.get(&child_rp) {
             return *hash;
         }
-        if entries.range(child_rp.clone()..prefix_upper(&child_rp)).next().is_some() {
+        let (clo, chi) = child_rp.key_bounds();
+        if entries
+            .range::<[u8], _>(to_ref_bounds(&clo, &chi))
+            .next()
+            .is_some()
+        {
             memo_node(entries, &child_rp, true, cache, cache_policy)
         } else {
             MERKLE_NULL_NODE
@@ -583,22 +517,31 @@ fn memo_node<V: TrieValue>(
 
     let has_children = children.iter().any(|h| *h != MERKLE_NULL_NODE);
     let node_hash = compute_node_merkle(has_children.then_some(&children), maybe_value);
-    let hash = compute_path_merkle(&first_key[depth..node_depth], depth, node_hash);
+    let path = first.sub(depth, node_depth).to_expanded();
+    let hash = compute_path_merkle(&path, depth, node_hash);
 
     if cache_policy == CachePolicy::Full || !is_singleton {
-        cache.insert(rp.to_vec(), hash);
+        cache.insert(rp.clone(), hash);
     }
     hash
 }
 
-/// One entry fed to the cold [`memo_node_rebuild`]: a nibble key plus its
-/// precomputed **merkle bytes** (empty for a tombstone). The rebuild only ever
-/// needs the merkle bytes, so callers flatten `TrieValue::merkle_value` (or pass
-/// raw LMDB bytes) up front — keeping the rebuild independent of the value type.
+/// One entry fed to the cold [`memo_node_rebuild`]: a **canonical byte** key plus
+/// its precomputed **merkle bytes** (empty for a tombstone). The rebuild only
+/// ever needs the merkle bytes, so callers flatten `TrieValue::merkle_value` up
+/// front — keeping the rebuild independent of the value type. Nibble routing is
+/// derived from the canonical key via [`Nibbles`].
 #[derive(Clone, Copy)]
 struct EntryRef<'a> {
     key: &'a [u8],
     value: &'a [u8],
+}
+
+impl EntryRef<'_> {
+    #[inline]
+    fn nibble_len(&self) -> usize {
+        self.key.len() * 2
+    }
 }
 
 /// Cold-cache root/cache rebuild over an already sorted entry slice.
@@ -609,33 +552,35 @@ struct EntryRef<'a> {
 /// hash map once after all parallel work joins.
 fn memo_node_rebuild(
     entries: &[EntryRef<'_>],
-    rp: &[u8],
+    rp: &NibblePrefix,
     allow_path_compression: bool,
     cache_policy: CachePolicy,
-) -> (H256, Vec<(Vec<u8>, H256)>) {
+) -> (H256, Vec<(NibblePrefix, H256)>) {
     debug_assert!(!entries.is_empty());
 
-    let depth = rp.len();
+    let depth = rp.nibble_len();
     let first_key = entries[0].key;
     let last_key = entries[entries.len() - 1].key;
+    let first = Nibbles::from_bytes(first_key);
+    let last = Nibbles::from_bytes(last_key);
     let is_singleton = first_key == last_key;
     let common = if allow_path_compression {
-        common_prefix_len(first_key, last_key, depth)
+        first.common_prefix_len_from(&last, depth)
     } else {
         0
     };
     let node_depth = depth + common;
-    let full_prefix = &first_key[0..node_depth];
+    let full_prefix = NibblePrefix::from_nibbles(first.sub(0, node_depth));
 
     let maybe_value = entries
         .iter()
-        .find(|entry| entry.key.len() == node_depth)
+        .find(|entry| entry.nibble_len() == node_depth)
         .map(|entry| entry.value);
 
     // Recompute one child subtree: build its routing prefix, recurse over its
     // slice, and return `(child index, hash, its cache entries)`.
     let recurse = |&(child, start, end): &(usize, usize, usize)| {
-        let child_rp = child_prefix(full_prefix, child);
+        let child_rp = full_prefix.push(child as u8);
         let (hash, cache_entries) =
             memo_node_rebuild(&entries[start..end], &child_rp, true, cache_policy);
         (child, hash, cache_entries)
@@ -647,7 +592,7 @@ fn memo_node_rebuild(
     // oversized subtrees — e.g. a large-storage contract — spread across cores.
     // Nested par_iter is fine: rayon work-steals over the shared pool.
     let ranges = child_ranges(entries, node_depth);
-    let results: Vec<(usize, H256, Vec<(Vec<u8>, H256)>)> =
+    let results: Vec<(usize, H256, Vec<(NibblePrefix, H256)>)> =
         if entries.len() >= PARALLEL_REBUILD_THRESHOLD && ranges.len() > 1 {
             ranges.par_iter().map(&recurse).collect()
         } else {
@@ -655,8 +600,7 @@ fn memo_node_rebuild(
         };
 
     let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
-    let mut cache_entries =
-        Vec::with_capacity(results.iter().map(|(_, _, c)| c.len()).sum());
+    let mut cache_entries = Vec::with_capacity(results.iter().map(|(_, _, c)| c.len()).sum());
     for (child, hash, mut child_cache_entries) in results {
         children[child] = hash;
         cache_entries.append(&mut child_cache_entries);
@@ -664,23 +608,27 @@ fn memo_node_rebuild(
 
     let has_children = children.iter().any(|h| *h != MERKLE_NULL_NODE);
     let node_hash = compute_node_merkle(has_children.then_some(&children), maybe_value);
-    let hash = compute_path_merkle(&first_key[depth..node_depth], depth, node_hash);
+    let path = first.sub(depth, node_depth).to_expanded();
+    let hash = compute_path_merkle(&path, depth, node_hash);
 
     if cache_policy == CachePolicy::Full || !is_singleton {
-        cache_entries.push((rp.to_vec(), hash));
+        cache_entries.push((rp.clone(), hash));
     }
     (hash, cache_entries)
 }
 
 /// Partition a sorted node block into `(child nibble, start, end)` runs, one per
-/// child subtree. Entries whose key ends exactly at `node_depth` carry no child
+/// child subtree. Entries whose nibble length equals `node_depth` carry no child
 /// nibble and are dropped; the rest — being sorted — group into contiguous runs
 /// sharing their `node_depth`-th nibble.
 fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usize, usize)> {
     entries
         .iter()
         .enumerate()
-        .filter_map(|(idx, entry)| entry.key.get(node_depth).map(|&c| (idx, c as usize)))
+        .filter_map(|(idx, entry)| {
+            (node_depth < entry.nibble_len())
+                .then(|| (idx, crate::nibbles::nibble_at(entry.key, node_depth) as usize))
+        })
         .fold(Vec::new(), |mut ranges, (idx, child)| {
             match ranges.last_mut() {
                 Some(last) if last.0 == child && last.2 == idx => last.2 = idx + 1,
@@ -688,18 +636,6 @@ fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usiz
             }
             ranges
         })
-}
-
-/// Longest common nibble prefix of the sorted block beyond `depth`. The block's
-/// LCP equals the LCP of its endpoints `first` (min) and `last` (max), so only
-/// the two boundary keys are compared.
-pub(crate) fn common_prefix_len(first: &[u8], last: &[u8], depth: usize) -> usize {
-    first
-        .iter()
-        .zip(last)
-        .skip(depth)
-        .take_while(|(a, b)| a == b)
-        .count()
 }
 
 #[cfg(test)]
@@ -830,11 +766,11 @@ mod tests {
 
     /// Same cold parallel-rebuild path, but with tombstones interleaved. Proves
     /// a terminal tombstone still hashes as `Some(&[])` (the `b'v'` marker in
-    /// `compute_node_merkle`) — byte-identical to the stateless oracle — after
-    /// `EntryRef` was flattened to precomputed merkle bytes. The Some/None
-    /// distinction is carried by key-presence (`find` on key length), which the
-    /// flattening does not touch; `merkle_value()` collapses tombstone and empty
-    /// `Some` to the same `&[]`, exactly as the oracle does.
+    /// `compute_node_merkle`) — byte-identical to the stateless oracle. The
+    /// Some/None distinction is carried by key-presence (`find` on nibble
+    /// length), which the flattening to merkle bytes does not touch;
+    /// `merkle_value()` collapses tombstone and empty `Some` to the same `&[]`,
+    /// exactly as the oracle does.
     #[test]
     fn parallel_rebuild_with_tombstones_matches_oracle() {
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
@@ -854,6 +790,37 @@ mod tests {
         }
         assert!(map.len() >= PARALLEL_REBUILD_THRESHOLD);
         let mut inc = IncrementalTrie::from_delta(&map);
+        assert_eq!(inc.root(), trie_root(&map));
+    }
+
+    /// Wide byte-aligned keys (like real 20/57-byte mpt keys) that produce odd
+    /// routing depths and long shared prefixes — exercises the packed
+    /// `NibblePrefix` range translation end-to-end against the oracle.
+    #[test]
+    fn wide_byte_keys_match_oracle() {
+        let mut seed: u64 = 0xd1b54a32d192ed03;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 24) as u8
+        };
+        let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
+        let mut inc = IncrementalTrie::default();
+        // A shared 20-byte account prefix + varying storage tails → deep nodes.
+        let account: Vec<u8> = (0..20).map(|_| next()).collect();
+        for _ in 0..3000 {
+            let mut key = account.clone();
+            key.extend((0..37).map(|_| next()));
+            let v = MptValue::Some(Box::from([next(), next()]));
+            inc.insert(&key, v.clone());
+            map.insert(key, v);
+        }
+        // Plus some entirely independent keys.
+        for _ in 0..500 {
+            let key: Vec<u8> = (0..(1 + (next() % 30) as usize)).map(|_| next()).collect();
+            let v = MptValue::Some(Box::from([next()]));
+            inc.insert(&key, v.clone());
+            map.insert(key, v);
+        }
         assert_eq!(inc.root(), trie_root(&map));
     }
 
