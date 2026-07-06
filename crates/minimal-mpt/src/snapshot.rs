@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 /// the old `MptValue::Some`, so the snapshot root and checkpoint format are
 /// unchanged.
 #[cfg(not(feature = "snapshot-lmdb"))]
-pub(crate) type SnapshotValue = smallvec::SmallVec<[u8; 8]>;
+pub(crate) type SnapshotValue = smallvec::SmallVec<u8, 8>;
 
 #[cfg(not(feature = "snapshot-lmdb"))]
 impl crate::trie::TrieValue for SnapshotValue {
@@ -20,7 +20,9 @@ impl crate::trie::TrieValue for SnapshotValue {
         Some(self.as_slice())
     }
     fn from_value_bytes(bytes: &[u8]) -> Self {
-        smallvec::SmallVec::from_slice(bytes)
+        let mut v = smallvec::SmallVec::new();
+        v.extend_from_slice(bytes);
+        v
     }
 }
 

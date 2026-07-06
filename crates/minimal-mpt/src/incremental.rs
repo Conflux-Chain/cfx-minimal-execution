@@ -49,7 +49,8 @@
 //! needed during the walk.
 
 use crate::codec::{read_len_prefixed, read_u64_le};
-use crate::nibbles::{to_ref_bounds, NibblePrefix, Nibbles};
+use crate::entries::{Composite, Entries};
+use crate::nibbles::{NibblePrefix, Nibbles};
 use crate::trie::{compute_node_merkle, compute_path_merkle, MptValue, TrieValue, CHILDREN};
 use crate::types::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
@@ -145,8 +146,8 @@ impl Default for MemorySurvey {
 /// required, so the hashing and cache logic are identical across value types.
 #[derive(Clone, Debug)]
 pub struct IncrementalTrie<V = MptValue> {
-    /// Delta entries keyed by canonical bytes (the trie's working set).
-    entries: BTreeMap<Box<[u8]>, V>,
+    /// Delta entries, stored two-level to factor out shared key prefixes.
+    entries: Entries<V>,
     /// Cached subtree hashes, keyed by node routing prefix.
     cache: Cache,
     /// Canonical keys changed since the last `root`, pending prefix eviction.
@@ -156,7 +157,7 @@ pub struct IncrementalTrie<V = MptValue> {
 impl<V> Default for IncrementalTrie<V> {
     fn default() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: Entries::new(),
             cache: Cache::default(),
             dirty: BTreeSet::new(),
         }
@@ -169,10 +170,10 @@ impl IncrementalTrie<MptValue> {
     /// that populates it. Delta-only, so it keeps `MptValue` (tombstones are
     /// meaningful in the delta).
     pub fn from_delta(delta: &BTreeMap<Vec<u8>, MptValue>) -> Self {
-        let entries = delta
-            .iter()
-            .map(|(k, v)| (Box::from(k.as_slice()), v.clone()))
-            .collect();
+        let mut entries = Entries::new();
+        for (k, v) in delta {
+            entries.insert(k, v.clone());
+        }
         Self {
             entries,
             cache: Cache::default(),
@@ -184,9 +185,8 @@ impl IncrementalTrie<MptValue> {
 impl<V: TrieValue> IncrementalTrie<V> {
     /// Insert / overwrite the value for `key` (the canonical byte mpt key).
     pub fn insert(&mut self, key: &[u8], value: V) {
-        let boxed: Box<[u8]> = Box::from(key);
-        self.dirty.insert(boxed.clone());
-        self.entries.insert(boxed, value);
+        self.dirty.insert(Box::from(key));
+        self.entries.insert(key, value);
     }
 
     /// Remove `key` (canonical byte form) from the delta.
@@ -212,20 +212,22 @@ impl<V: TrieValue> IncrementalTrie<V> {
         let mut s = MemorySurvey::default();
         let mut prev_prefix: Vec<u8> = Vec::new();
         let mut have_prev = false;
-        for (k, v) in &self.entries {
+        for (c, v) in self.entries.iter() {
             s.n_entries += 1;
-            let nibble_len = k.len() * 2;
-            s.entry_key_bytes += nibble_len as u64;
-            s.key_len_hist[k.len().min(128)] += 1;
+            let key_len = c.byte_len();
+            s.entry_key_bytes += (key_len * 2) as u64;
+            s.key_len_hist[key_len.min(128)] += 1;
 
-            // (b) shared first-40-nibble (20-byte) routing-prefix dedup, O(1) space.
-            let plen = k.len().min(20);
+            // (b) shared first-40-nibble (20-byte) routing-prefix dedup, O(1)
+            // space. The first ≤20 bytes always lie in `head` (branch heads are
+            // 23 B; only short leaves are shorter, and then `head` is the key).
+            let plen = c.head.len().min(20);
             s.prefix40_stored_bytes += (plen * 2) as u64;
-            if !have_prev || prev_prefix.as_slice() != &k[..plen] {
+            if !have_prev || prev_prefix.as_slice() != &c.head[..plen] {
                 s.distinct_prefix40 += 1;
                 s.prefix40_deduped_bytes += (plen * 2) as u64;
                 prev_prefix.clear();
-                prev_prefix.extend_from_slice(&k[..plen]);
+                prev_prefix.extend_from_slice(&c.head[..plen]);
                 have_prev = true;
             }
 
@@ -282,7 +284,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
                 .entries
                 .iter()
                 .map(|(key, value)| EntryRef {
-                    key: key.as_ref(),
+                    key,
                     value: value.merkle_value(),
                 })
                 .collect();
@@ -329,8 +331,9 @@ impl<V: TrieValue> IncrementalTrie<V> {
             let oracle_owned: Vec<(Vec<u8>, MptValue)> = self
                 .entries
                 .iter()
-                .map(|(k, v)| {
-                    let nibbles = crate::trie::bytes_to_nibbles(k);
+                .map(|(c, v)| {
+                    let key: Vec<u8> = [c.head, c.tail].concat();
+                    let nibbles = crate::trie::bytes_to_nibbles(&key);
                     let mv = match v.visible_value() {
                         Some(b) => MptValue::Some(Box::from(b)),
                         None => MptValue::Tombstone,
@@ -355,10 +358,10 @@ impl<V: TrieValue> IncrementalTrie<V> {
     /// is a full recompute that populates it; later (incremental) merges clone
     /// that warm cache.
     pub fn from_snapshot(snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
-        let entries = snapshot
-            .iter()
-            .map(|(k, v)| (Box::from(k.as_slice()), V::from_value_bytes(v)))
-            .collect();
+        let mut entries = Entries::new();
+        for (k, v) in snapshot {
+            entries.insert(k, V::from_value_bytes(v));
+        }
         Self {
             entries,
             cache: Cache::default(),
@@ -373,11 +376,11 @@ impl<V: TrieValue> IncrementalTrie<V> {
     /// starts empty; the first `root` recomputes it.
     pub(crate) fn from_snapshot_reader(reader: &mut impl Read) -> io::Result<Self> {
         let count = read_u64_le(reader)? as usize;
-        let mut entries = BTreeMap::new();
+        let mut entries = Entries::new();
         for _ in 0..count {
             let key = read_len_prefixed(reader)?;
             let value = read_len_prefixed(reader)?;
-            entries.insert(key.into_boxed_slice(), V::from_value_bytes(&value));
+            entries.insert(&key, V::from_value_bytes(&value));
         }
         Ok(Self {
             entries,
@@ -398,8 +401,12 @@ impl<V: TrieValue> IncrementalTrie<V> {
         let prefix = NibblePrefix::from_nibbles(Nibbles::from_bytes(canonical_prefix));
         let (lo, hi) = prefix.key_bounds();
         self.entries
-            .range::<[u8], _>(to_ref_bounds(&lo, &hi))
-            .filter_map(|(key, value)| value.visible_value().map(|v| (key.to_vec(), Box::from(v))))
+            .range(&lo, crate::nibbles::hi_bound_ref(&hi))
+            .filter_map(|(c, value)| {
+                value
+                    .visible_value()
+                    .map(|v| ([c.head, c.tail].concat(), Box::from(v)))
+            })
             .collect()
     }
 
@@ -407,24 +414,28 @@ impl<V: TrieValue> IncrementalTrie<V> {
     pub fn to_canonical_map(&self) -> BTreeMap<Vec<u8>, Box<[u8]>> {
         self.entries
             .iter()
-            .filter_map(|(key, value)| value.visible_value().map(|v| (key.to_vec(), Box::from(v))))
+            .filter_map(|(c, value)| {
+                value
+                    .visible_value()
+                    .map(|v| ([c.head, c.tail].concat(), Box::from(v)))
+            })
             .collect()
     }
 
     /// Number of live (non-tombstone) entries.
     pub fn live_entry_count(&self) -> usize {
         self.entries
-            .values()
-            .filter(|v| v.visible_value().is_some())
+            .iter()
+            .filter(|(_, v)| v.visible_value().is_some())
             .count()
     }
 
     /// Iterate live entries as `(canonical_byte_key, value_bytes)` in sorted
-    /// order. No intermediate collection — each entry is yielded one at a time.
+    /// order. Each key is reassembled from its `head ++ tail` on the fly.
     pub fn iter_canonical(&self) -> impl Iterator<Item = (Vec<u8>, &[u8])> + '_ {
         self.entries
             .iter()
-            .filter_map(|(key, value)| value.visible_value().map(|v| (key.to_vec(), v)))
+            .filter_map(|(c, value)| value.visible_value().map(|v| ([c.head, c.tail].concat(), v)))
     }
 
     /// Number of stored entries (used by merge instrumentation).
@@ -443,7 +454,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
 /// Cost is `O(visited nodes × CHILDREN × log N)` — proportional to the dirty
 /// frontier, not the delta size. Serial only (the cache is `&mut`).
 fn memo_node<V: TrieValue>(
-    entries: &BTreeMap<Box<[u8]>, V>,
+    entries: &Entries<V>,
     rp: &NibblePrefix,
     allow_path_compression: bool,
     cache: &mut Cache,
@@ -454,32 +465,23 @@ fn memo_node<V: TrieValue>(
     }
     let depth = rp.nibble_len();
     let (lo, hi) = rp.key_bounds();
+    let hi_ref = crate::nibbles::hi_bound_ref(&hi);
 
-    // The node's key block is the contiguous canonical-byte range for `rp`. It is
-    // non-empty: the root is non-empty and this fn only descends into children
-    // proven to exist. The first key carries the routing/compression nibbles;
-    // with path compression the node absorbs the longest prefix shared by the
-    // whole block, which — the block being sorted — is the common prefix of just
-    // its first (min) and last (max) key.
-    let first_key = entries
-        .range::<[u8], _>(to_ref_bounds(&lo, &hi))
-        .next()
-        .expect("non-empty node")
-        .0
-        .as_ref();
+    // The node's key block is the contiguous key range for `rp`. It is non-empty:
+    // the root is non-empty and this fn only descends into children proven to
+    // exist. The first key carries the routing/compression nibbles; with path
+    // compression the node absorbs the longest prefix shared by the whole block,
+    // which — the block being sorted — is the common prefix of just its first
+    // (min) and last (max) key.
+    let first_key = entries.range_first(&lo, hi_ref).expect("non-empty node");
     let last_key = if allow_path_compression || cache_policy == CachePolicy::SkipSingleton {
-        entries
-            .range::<[u8], _>(to_ref_bounds(&lo, &hi))
-            .next_back()
-            .expect("non-empty node")
-            .0
-            .as_ref()
+        entries.range_last(&lo, hi_ref).expect("non-empty node")
     } else {
         first_key
     };
-    let first = Nibbles::from_bytes(first_key);
-    let last = Nibbles::from_bytes(last_key);
-    let is_singleton = first_key == last_key;
+    let first = first_key.nibbles();
+    let last = last_key.nibbles();
+    let is_singleton = first_key.same_key(&last_key);
     let common = if allow_path_compression {
         first.common_prefix_len_from(&last, depth)
     } else {
@@ -505,8 +507,7 @@ fn memo_node<V: TrieValue>(
         }
         let (clo, chi) = child_rp.key_bounds();
         if entries
-            .range::<[u8], _>(to_ref_bounds(&clo, &chi))
-            .next()
+            .range_first(&clo, crate::nibbles::hi_bound_ref(&chi))
             .is_some()
         {
             memo_node(entries, &child_rp, true, cache, cache_policy)
@@ -533,14 +534,18 @@ fn memo_node<V: TrieValue>(
 /// derived from the canonical key via [`Nibbles`].
 #[derive(Clone, Copy)]
 struct EntryRef<'a> {
-    key: &'a [u8],
+    key: Composite<'a>,
     value: &'a [u8],
 }
 
-impl EntryRef<'_> {
+impl<'a> EntryRef<'a> {
+    #[inline]
+    fn nibbles(&self) -> Nibbles<'a> {
+        self.key.nibbles()
+    }
     #[inline]
     fn nibble_len(&self) -> usize {
-        self.key.len() * 2
+        self.key.byte_len() * 2
     }
 }
 
@@ -559,11 +564,9 @@ fn memo_node_rebuild(
     debug_assert!(!entries.is_empty());
 
     let depth = rp.nibble_len();
-    let first_key = entries[0].key;
-    let last_key = entries[entries.len() - 1].key;
-    let first = Nibbles::from_bytes(first_key);
-    let last = Nibbles::from_bytes(last_key);
-    let is_singleton = first_key == last_key;
+    let first = entries[0].nibbles();
+    let last = entries[entries.len() - 1].nibbles();
+    let is_singleton = entries[0].key.same_key(&entries[entries.len() - 1].key);
     let common = if allow_path_compression {
         first.common_prefix_len_from(&last, depth)
     } else {
@@ -626,8 +629,7 @@ fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usiz
         .iter()
         .enumerate()
         .filter_map(|(idx, entry)| {
-            (node_depth < entry.nibble_len())
-                .then(|| (idx, crate::nibbles::nibble_at(entry.key, node_depth) as usize))
+            (node_depth < entry.nibble_len()).then(|| (idx, entry.nibbles().at(node_depth) as usize))
         })
         .fold(Vec::new(), |mut ranges, (idx, child)| {
             match ranges.last_mut() {

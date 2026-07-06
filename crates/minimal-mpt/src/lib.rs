@@ -1,4 +1,5 @@
 mod codec;
+mod entries;
 mod incremental;
 mod key_codec;
 mod nibbles;

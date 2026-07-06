@@ -25,24 +25,35 @@
 
 use std::ops::Bound;
 
-/// Read the `i`-th nibble of a packed byte buffer. Nibble `0` is the *high* half
-/// of byte `0`, nibble `1` the low half, and so on (big-endian within a byte).
-#[inline]
-pub(crate) fn nibble_at(bytes: &[u8], i: usize) -> u8 {
-    let b = bytes[i / 2];
-    if i % 2 == 0 {
-        b >> 4
-    } else {
-        b & 0x0f
+/// The byte backing of a [`Nibbles`] view: either one contiguous slice, or two
+/// slices to be read as their concatenation. The two-level entries store keeps a
+/// key as `head` (shared prefix, ≤23 B) + `tail` (per-entry remainder), and this
+/// lets the nibble routing read that split key with no allocation.
+#[derive(Clone, Copy)]
+enum Backing<'a> {
+    One(&'a [u8]),
+    Two(&'a [u8], &'a [u8]),
+}
+
+impl Backing<'_> {
+    #[inline]
+    fn byte_at(&self, i: usize) -> u8 {
+        match self {
+            Backing::One(b) => b[i],
+            Backing::Two(h, t) => match i.checked_sub(h.len()) {
+                Some(j) => t[j],
+                None => h[i],
+            },
+        }
     }
 }
 
-/// Borrowed nibble view over a packed byte buffer, spanning logical nibbles
-/// `[start, end)`. Zero-cost: it holds a slice and two offsets. All the
-/// "split into nibbles / take a prefix" logic lives here.
+/// Borrowed nibble view over a (possibly split) byte buffer, spanning logical
+/// nibbles `[start, end)`. Zero-cost: it holds the backing and two offsets. All
+/// the "split into nibbles / take a prefix" logic lives here.
 #[derive(Clone, Copy)]
 pub(crate) struct Nibbles<'a> {
-    bytes: &'a [u8],
+    bytes: Backing<'a>,
     start: usize,
     end: usize,
 }
@@ -52,9 +63,19 @@ impl<'a> Nibbles<'a> {
     #[inline]
     pub(crate) fn from_bytes(bytes: &'a [u8]) -> Self {
         Self {
-            bytes,
+            bytes: Backing::One(bytes),
             start: 0,
             end: bytes.len() * 2,
+        }
+    }
+
+    /// View the nibble sequence of a key split across `head ++ tail`.
+    #[inline]
+    pub(crate) fn from_composite(head: &'a [u8], tail: &'a [u8]) -> Self {
+        Self {
+            bytes: Backing::Two(head, tail),
+            start: 0,
+            end: (head.len() + tail.len()) * 2,
         }
     }
 
@@ -65,7 +86,13 @@ impl<'a> Nibbles<'a> {
 
     #[inline]
     pub(crate) fn at(&self, i: usize) -> u8 {
-        nibble_at(self.bytes, self.start + i)
+        let n = self.start + i;
+        let b = self.bytes.byte_at(n / 2);
+        if n % 2 == 0 {
+            b >> 4
+        } else {
+            b & 0x0f
+        }
     }
 
     /// Sub-view over logical nibbles `[a, b)` of this view.
@@ -223,18 +250,14 @@ fn byte_prefix_successor(p: &[u8]) -> Bound<Vec<u8>> {
     Bound::Unbounded
 }
 
-/// Borrow an owned `(lower, upper)` pair from [`NibblePrefix::key_bounds`] as
-/// slice bounds usable with `BTreeMap<Box<[u8]>, _>::range::<[u8], _>`.
-pub(crate) fn to_ref_bounds<'a>(
-    lo: &'a [u8],
-    hi: &'a Bound<Vec<u8>>,
-) -> (Bound<&'a [u8]>, Bound<&'a [u8]>) {
-    let hi = match hi {
+/// Borrow the upper bound of [`NibblePrefix::key_bounds`] as a slice bound. The
+/// lower bound is always `Included` and borrowed directly by the caller.
+pub(crate) fn hi_bound_ref(hi: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match hi {
         Bound::Included(v) => Bound::Included(v.as_slice()),
         Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
         Bound::Unbounded => Bound::Unbounded,
-    };
-    (Bound::Included(lo), hi)
+    }
 }
 
 #[cfg(test)]
@@ -289,13 +312,23 @@ mod tests {
                 b
             };
             let view = Nibbles {
-                bytes: &bytes,
+                bytes: Backing::One(&bytes),
                 start: 0,
                 end: raw.len(),
             };
             let p = NibblePrefix::from_nibbles(view);
             assert_eq!(p.nibble_len(), raw.len(), "len for {raw:?}");
-            let back: Vec<u8> = (0..p.nibble_len()).map(|i| nibble_at(p.packed(), i)).collect();
+            let packed = p.packed();
+            let back: Vec<u8> = (0..p.nibble_len())
+                .map(|i| {
+                    let b = packed[i / 2];
+                    if i % 2 == 0 {
+                        b >> 4
+                    } else {
+                        b & 0x0f
+                    }
+                })
+                .collect();
             assert_eq!(back, raw, "roundtrip for {raw:?}");
         }
     }
@@ -320,7 +353,7 @@ mod tests {
                 b
             };
             let expect = NibblePrefix::from_nibbles(Nibbles {
-                bytes: &bytes,
+                bytes: Backing::One(&bytes),
                 start: 0,
                 end: i + 1,
             });
@@ -366,14 +399,14 @@ mod tests {
             let nib = expand(k);
             for plen in 0..=nib.len() {
                 let view = Nibbles {
-                    bytes: k,
+                    bytes: Backing::One(k),
                     start: 0,
                     end: plen,
                 };
                 let prefix = NibblePrefix::from_nibbles(view);
                 let (lo, hi) = prefix.key_bounds();
                 let selected: Vec<&[u8]> = map
-                    .range::<[u8], _>(to_ref_bounds(&lo, &hi))
+                    .range::<[u8], _>((Bound::Included(lo.as_slice()), hi_bound_ref(&hi)))
                     .map(|(kk, _)| kk.as_ref())
                     .collect();
                 // Reference: keys whose nibble expansion starts with `nib[..plen]`,
