@@ -257,14 +257,7 @@ impl State {
         let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
 
         let expected_entries = self.snapshot.live_entry_count();
-        let expected_entries_u64 = u64::try_from(expected_entries).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "snapshot entry count does not fit in u64",
-            )
-        })?;
-
-        write_u64_le(w, expected_entries_u64)?;
+        write_u64_le(w, expected_entries as u64)?;
         let mut entries_written = 0usize;
         self.snapshot.for_each_canonical(|key, value| {
             write_len_prefixed(w, &key)?;

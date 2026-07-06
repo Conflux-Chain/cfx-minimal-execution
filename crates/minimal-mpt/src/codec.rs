@@ -17,7 +17,7 @@ pub(crate) fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
 }
 
 /// Write a little-endian `u64` (bincode 1.x fixint length encoding).
-pub(crate) fn write_u64_le(w: &mut (impl Write + ?Sized), v: u64) -> io::Result<()> {
+pub(crate) fn write_u64_le(w: &mut impl Write, v: u64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
@@ -43,13 +43,7 @@ pub(crate) fn read_len_prefixed(r: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 /// Write a bincode length-prefixed byte string (`u64 len` + raw bytes).
-pub(crate) fn write_len_prefixed(w: &mut (impl Write + ?Sized), data: &[u8]) -> io::Result<()> {
-    let len = u64::try_from(data.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "length-prefixed field does not fit in u64",
-        )
-    })?;
-    write_u64_le(w, len)?;
+pub(crate) fn write_len_prefixed(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
+    write_u64_le(w, data.len() as u64)?;
     w.write_all(data)
 }
