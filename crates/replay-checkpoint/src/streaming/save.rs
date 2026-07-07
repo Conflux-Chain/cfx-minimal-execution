@@ -29,8 +29,7 @@ impl CheckpointRef<'_> {
             .context("ckpt: version")?;
         bincode::serialize_into(&mut *w, &self.state.height())
             .context("ckpt: height")?;
-        self.state
-            .write_streaming(&mut *w)
+        cfx_minimal_mpt::save_state(self.state, &mut *w)
             .context("ckpt: stream mmpt state")?;
         bincode::serialize_into(&mut *w, &self.previous_epoch_hash)
             .context("ckpt: prev_hash")?;

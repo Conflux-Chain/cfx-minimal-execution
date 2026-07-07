@@ -24,8 +24,8 @@ impl CheckpointData {
     pub fn stream_read(r: &mut impl std::io::Read) -> Result<Self> {
         let height: u64 =
             bincode::deserialize_from(&mut *r).context("ckpt: height")?;
-        let state =
-            MmptState::from_reader(&mut *r).context("ckpt: stream mmpt state")?;
+        let state = cfx_minimal_mpt::load_state(&mut *r)
+            .context("ckpt: stream mmpt state")?;
         let previous_epoch_hash: H256 =
             bincode::deserialize_from(&mut *r).context("ckpt: prev_hash")?;
         let previous_state_root: StateRootWithAuxInfo =

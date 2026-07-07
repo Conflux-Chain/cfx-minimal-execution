@@ -14,6 +14,7 @@ pub(crate) use trie::store::two_level as entries;
 
 pub use keys::{DeltaMptKeyPadding, StorageKey, StorageKeyWithSpace};
 pub use persist::format::PersistedState;
+pub use persist::{load_state, save_state};
 pub use primitives::{MptKeyValue, Space, H256, MERKLE_NULL_NODE};
 pub use state::{CommitRoot, State, StateTrait};
 pub use trie::MptValue;
