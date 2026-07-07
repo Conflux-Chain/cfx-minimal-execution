@@ -1,4 +1,4 @@
-use crate::{trie::MptValue, types::CommitRoot};
+use crate::{state::CommitRoot, trie::MptValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

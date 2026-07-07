@@ -7,9 +7,10 @@
 
 use super::{State, StateTrait};
 use crate::{
-    key_codec::{StorageKey, StorageKeyWithSpace},
+    keys::{StorageKey, StorageKeyWithSpace},
+    primitives::MptKeyValue,
     trie::MptValue,
-    types::{MptKeyValue, Result},
+    Result,
 };
 use std::collections::{BTreeMap, HashSet};
 

@@ -1,17 +1,51 @@
+use crate::state::layers::snapshot::SnapshotTrie;
 use crate::{
     incremental::CachePolicy,
-    key_codec::{DeltaMptKeyPadding, StorageKeyWithSpace},
-    snapshot::SnapshotTrie,
-    store::PersistedState,
+    keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
+    persist::format::PersistedState,
+    primitives::{MptKeyValue, H256, MERKLE_NULL_NODE},
     trie::{trie_root, MptValue},
-    types::{CommitRoot, MptKeyValue, Result, H256, MERKLE_NULL_NODE},
+    Result,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod layers;
 mod prefix;
 mod rotation;
 
 pub const DEFAULT_SNAPSHOT_EPOCH_COUNT: u32 = 2000;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRoot {
+    pub snapshot_root: H256,
+    pub intermediate_delta_root: H256,
+    pub delta_root: H256,
+    pub state_root_hash: H256,
+    pub delta_mpt_key_padding: [u8; 32],
+}
+
+impl CommitRoot {
+    pub fn new(
+        snapshot_root: H256,
+        intermediate_delta_root: H256,
+        delta_root: H256,
+        delta_mpt_key_padding: [u8; 32],
+    ) -> Self {
+        let mut buf = Vec::with_capacity(96);
+        buf.extend_from_slice(snapshot_root.as_bytes());
+        buf.extend_from_slice(intermediate_delta_root.as_bytes());
+        buf.extend_from_slice(delta_root.as_bytes());
+        let state_root_hash = crate::trie::keccak(&buf);
+        Self {
+            snapshot_root,
+            intermediate_delta_root,
+            delta_root,
+            state_root_hash,
+            delta_mpt_key_padding,
+        }
+    }
+}
 
 /// Env-gated (`MMPT_DELTA_TIMING=1`) accumulator for time spent in the
 /// incremental delta-root call, so a replay run can report real per-commit delta
@@ -62,8 +96,8 @@ pub struct State {
     /// fill them behind `&self`; padding-stamped so they self-invalidate, and
     /// rotated at the boundary — `intermediate(k)`'s padding equals `delta(k-1)`'s,
     /// so the old delta cache is exactly the new intermediate one.
-    delta_account_cache: std::cell::RefCell<crate::key_codec::AccountKeyCache>,
-    intermediate_account_cache: std::cell::RefCell<crate::key_codec::AccountKeyCache>,
+    delta_account_cache: std::cell::RefCell<crate::keys::AccountKeyCache>,
+    intermediate_account_cache: std::cell::RefCell<crate::keys::AccountKeyCache>,
 }
 
 impl Default for State {
@@ -253,7 +287,7 @@ impl State {
     /// `from_reader` consumes: snapshot, intermediate, delta, paddings, height,
     /// snapshot_epoch_count, last_root.
     pub fn write_streaming(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        use crate::codec::{write_len_prefixed, write_u64_le};
+        use crate::persist::wire::{write_len_prefixed, write_u64_le};
 
         let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
 

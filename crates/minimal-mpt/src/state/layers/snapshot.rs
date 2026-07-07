@@ -1,4 +1,4 @@
-use crate::{incremental::CachePolicy, trie::MptValue, types::H256};
+use crate::{incremental::CachePolicy, primitives::H256, trie::MptValue};
 use std::collections::BTreeMap;
 
 /// The snapshot's value type. The snapshot never stores a tombstone (deletes are

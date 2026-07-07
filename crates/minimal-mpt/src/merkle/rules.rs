@@ -1,4 +1,4 @@
-use crate::types::{H256, MERKLE_NULL_NODE};
+use crate::primitives::{H256, MERKLE_NULL_NODE};
 use tiny_keccak::{Hasher, Keccak};
 
 pub(crate) const CHILDREN: usize = 16;

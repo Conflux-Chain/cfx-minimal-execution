@@ -8,8 +8,9 @@
 use super::State;
 use crate::{
     incremental::CachePolicy,
-    key_codec::{DeltaMptKeyPadding, StorageKeyWithSpace},
-    types::{Result, H256},
+    keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
+    primitives::H256,
+    Result,
 };
 
 /// Env-gated (`MMPT_MERGE_TIMING=1`) switch for the in-place `[merge]`

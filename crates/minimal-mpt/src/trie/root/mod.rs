@@ -48,13 +48,13 @@
 //! always means "content unchanged since cached" — no per-node dirty check is
 //! needed during the walk.
 
-use crate::codec::{read_len_prefixed, read_u64_le};
+use crate::persist::wire::{read_len_prefixed, read_u64_le};
 use crate::entries::{Composite, Entries};
 use crate::nibbles::{
     empty_prefix_buf, pack_nibbles, push_nibble, NibblePrefix, NibbleRef, Nibbles,
 };
 use crate::trie::{compute_node_merkle, compute_path_merkle, MptValue, TrieValue, CHILDREN};
-use crate::types::{H256, MERKLE_NULL_NODE};
+use crate::primitives::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};

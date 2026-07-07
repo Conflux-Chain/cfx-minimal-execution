@@ -1,6 +1,6 @@
 use crate::merkle::rules::{compute_node_merkle, compute_path_merkle, CHILDREN};
 use crate::trie::MptValue;
-use crate::types::{H256, MERKLE_NULL_NODE};
+use crate::primitives::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
