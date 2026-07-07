@@ -27,6 +27,8 @@
 //! this module.
 
 use crate::nibbles::{NibbleRef, Nibbles};
+use crate::trie::reader::TrieReader;
+use crate::trie::TrieValue;
 use smallvec::SmallVec;
 use std::collections::{btree_map, BTreeMap};
 use std::ops::Bound;
@@ -492,6 +494,44 @@ impl<V> Entries<V> {
             }
         };
         last.map(|c| c.nibbles())
+    }
+}
+
+/// The two-level store as seen by the root/memo traversal: each method forwards
+/// to the inherent method it abstracts, flattening `V` to merkle bytes at the
+/// two `V`-touching points (`get_merkle`, `iter_merkle`) so the engine never
+/// names the value type. Requires `V: TrieValue` for that flattening.
+impl<V: TrieValue> TrieReader for Entries<V> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn get_merkle(&self, key: NibbleRef) -> Option<&[u8]> {
+        key.as_canonical_key()
+            .and_then(|ck| self.get(ck))
+            .map(|v| v.merkle_value())
+    }
+
+    fn prefix_exists(&self, prefix: NibbleRef) -> bool {
+        Entries::prefix_exists(self, prefix)
+    }
+
+    fn prefix_first(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
+        Entries::prefix_first(self, prefix)
+    }
+
+    fn prefix_last(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
+        Entries::prefix_last(self, prefix)
+    }
+
+    fn iter_merkle(&self) -> impl Iterator<Item = (Nibbles<'_>, &[u8])> {
+        self.iter().map(|(n, v)| (n, v.merkle_value()))
     }
 }
 

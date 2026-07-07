@@ -52,6 +52,7 @@ use crate::entries::Entries;
 use crate::nibbles::{
     empty_prefix_buf, pack_nibbles, push_nibble, NibblePrefix, NibbleRef, Nibbles,
 };
+use crate::trie::reader::TrieReader;
 use crate::trie::{compute_node_merkle, compute_path_merkle, MptValue, TrieValue, CHILDREN};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
@@ -180,10 +181,10 @@ impl<V: TrieValue> IncrementalTrie<V> {
             let timing = crate::diag::recover_timing();
             let entries: Vec<EntryRef<'_>> = self
                 .entries
-                .iter()
+                .iter_merkle()
                 .map(|(key, value)| EntryRef {
-                    key, // Nibbles view surfaced by the store
-                    value: value.merkle_value(),
+                    key,   // Nibbles view surfaced by the store
+                    value, // precomputed merkle bytes (value type stays behind the trait)
                 })
                 .collect();
             let t = std::time::Instant::now();
@@ -225,18 +226,16 @@ impl<V: TrieValue> IncrementalTrie<V> {
             // walk has that the stateless one cannot. Covers BOTH the delta and
             // snapshot incremental tries. O(N) per call: verify builds only.
             // The oracle works in expanded nibbles, so re-derive them from the
-            // canonical keys (the snapshot's value carries no tombstone).
+            // canonical keys. It hashes only `merkle_value()` (tombstone and
+            // empty-`Some` both collapse to `&[]`), so wrapping the store's
+            // surfaced merkle bytes as `Some(..)` reproduces the identical oracle
+            // root — the value type stays entirely behind the trait here too.
             let oracle_owned: Vec<(Vec<u8>, MptValue)> = self
                 .entries
-                .iter()
-                .map(|(n, v)| {
-                    let key: Vec<u8> = n.to_canonical_bytes();
-                    let nibbles = crate::trie::bytes_to_nibbles(&key);
-                    let mv = match v.visible_value() {
-                        Some(b) => MptValue::Some(Box::from(b)),
-                        None => MptValue::Tombstone,
-                    };
-                    (nibbles, mv)
+                .iter_merkle()
+                .map(|(n, merkle)| {
+                    let nibbles = crate::trie::bytes_to_nibbles(&n.to_canonical_bytes());
+                    (nibbles, MptValue::Some(Box::from(merkle)))
                 })
                 .collect();
             let oracle: Vec<(Vec<u8>, &MptValue)> =
@@ -334,14 +333,15 @@ impl<V: TrieValue> IncrementalTrie<V> {
 /// Range-driven mirror of [`crate::trie`]'s `merkle_for_node`, plus a cache keyed
 /// by the node's routing prefix `rp`. Instead of materialising the whole delta
 /// into a slice and scanning it, the node's key block is addressed directly on
-/// the sorted `entries` map via `range` queries, and clean children short-circuit
-/// on a cache hit without ever touching `entries`. A hit is always valid because
-/// `root` evicted any prefix touched by a dirty key (see module docs).
+/// the sorted `store` via its [`TrieReader`] prefix queries, and clean children
+/// short-circuit on a cache hit without ever touching the store. A hit is always
+/// valid because `root` evicted any prefix touched by a dirty key (see module
+/// docs). Generic over the store so the engine sees only merkle bytes, never `V`.
 ///
 /// Cost is `O(visited nodes × CHILDREN × log N)` — proportional to the dirty
 /// frontier, not the delta size. Serial only (the cache is `&mut`).
-fn memo_node<V: TrieValue>(
-    entries: &Entries<V>,
+fn memo_node<S: TrieReader>(
+    store: &S,
     rp: NibbleRef,
     allow_path_compression: bool,
     cache: &mut Cache,
@@ -358,9 +358,9 @@ fn memo_node<V: TrieValue>(
     // compression the node absorbs the longest prefix shared by the whole block,
     // which — the block being sorted — is the common prefix of just its first
     // (min) and last (max) key.
-    let first = entries.prefix_first(rp).expect("non-empty node");
+    let first = store.prefix_first(rp).expect("non-empty node");
     let last = if allow_path_compression || cache_policy == CachePolicy::SkipSingleton {
-        entries.prefix_last(rp).expect("non-empty node")
+        store.prefix_last(rp).expect("non-empty node")
     } else {
         first
     };
@@ -378,11 +378,9 @@ fn memo_node<V: TrieValue>(
     let full = NibbleRef::new(&full_buf);
 
     // A key ending exactly at this node can only be `full` itself (and only when
-    // it lands on a byte boundary — see `as_canonical_key`).
-    let maybe_value = full
-        .as_canonical_key()
-        .and_then(|ck| entries.get(ck))
-        .map(|value| value.merkle_value());
+    // it lands on a byte boundary — see `as_canonical_key`). The store flattens
+    // any terminal value to its merkle bytes behind the trait.
+    let maybe_value = store.get_merkle(full);
 
     // Resolve all 16 child slots left-to-right. Each child routing key is `full`
     // extended by one nibble into a fresh stack buffer (no heap): a cache hit
@@ -395,8 +393,8 @@ fn memo_node<V: TrieValue>(
             return *hash;
         }
         let child = NibbleRef::new(&child_buf);
-        if entries.prefix_exists(child) {
-            memo_node(entries, child, true, cache, cache_policy)
+        if store.prefix_exists(child) {
+            memo_node(store, child, true, cache, cache_policy)
         } else {
             MERKLE_NULL_NODE
         }

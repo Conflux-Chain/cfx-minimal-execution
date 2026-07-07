@@ -1,4 +1,5 @@
 pub(crate) mod nibbles;
+pub(crate) mod reader;
 pub(crate) mod root;
 pub(crate) mod store;
 mod value;
