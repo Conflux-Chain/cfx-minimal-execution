@@ -227,6 +227,43 @@ impl IncrementalTrie<MptValue> {
     }
 }
 
+/// A **flat-`BTreeMap`-backed** incremental trie: the generic combinator pinned
+/// to [`store::flat::FlatStore`] instead of the two-level [`Entries`].
+///
+/// A value-clean newtype (like [`IncrementalTrie`]) exposed only under `fuzzing`
+/// so the `incremental_trie` differential fuzz can drive the same op sequence
+/// through **both** stores and assert equal roots — the store-independence the
+/// [`reader::TrieReader`] abstraction promises. It has no production use in this
+/// commit (the delta layer wires `FlatStore` in a later commit); `Full` cache
+/// policy (delta semantics), matching what the differential fuzz needs.
+#[cfg(fuzzing)]
+pub struct FlatTrie<V: TrieValue = MptValue>(AuthenticatedTrie<store::flat::FlatStore<V>>);
+
+#[cfg(fuzzing)]
+impl<V: TrieValue> Default for FlatTrie<V> {
+    fn default() -> Self {
+        Self(AuthenticatedTrie::default())
+    }
+}
+
+#[cfg(fuzzing)]
+impl<V: TrieValue> FlatTrie<V> {
+    /// Insert / overwrite the value for `key` (canonical byte mpt key).
+    pub fn insert(&mut self, key: &[u8], value: V) {
+        self.0.insert(key, value);
+    }
+
+    /// Remove `key` (canonical byte form).
+    pub fn remove(&mut self, key: &[u8]) {
+        self.0.remove(key);
+    }
+
+    /// Merkle root, reusing cached hashes for unchanged subtrees.
+    pub fn root(&mut self) -> H256 {
+        self.0.root()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{IncrementalTrie, MptValue};

@@ -25,6 +25,10 @@ pub use trie::MptValue;
 pub use trie::trie_root;
 #[cfg(fuzzing)]
 pub use trie::IncrementalTrie;
+// Flat-backed trie: the differential fuzz drives it alongside `IncrementalTrie`
+// to prove the engine is store-independent (same root over either backend).
+#[cfg(fuzzing)]
+pub use trie::FlatTrie;
 
 #[derive(Debug)]
 pub enum Error {
