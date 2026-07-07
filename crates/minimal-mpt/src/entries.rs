@@ -24,9 +24,8 @@
 //! Keys are surfaced to the trie walk as a [`Composite`] (`head` + `tail` slices)
 //! read through [`Nibbles::from_composite`] — never reassembled into one buffer.
 
-use crate::nibbles::Nibbles;
+use crate::nibbles::{NibbleRef, Nibbles};
 use smallvec::SmallVec;
-use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap};
 use std::ops::Bound;
 
@@ -135,34 +134,101 @@ impl<'a> Composite<'a> {
     }
 }
 
-/// Compare `head ++ tail` against a contiguous slice `other`, without building
-/// the concatenation.
-fn cmp_composite(head: &[u8], tail: &[u8], other: &[u8]) -> Ordering {
-    let hn = head.len();
-    let m = hn.min(other.len());
-    match head[..m].cmp(&other[..m]) {
-        Ordering::Equal => {}
-        ne => return ne,
-    }
-    if other.len() <= hn {
-        // `other` lies within `head`; the composite is a (possibly proper)
-        // extension of it.
-        if hn == other.len() && tail.is_empty() {
-            Ordering::Equal
-        } else {
-            Ordering::Greater
-        }
+/// Does the split key `head ++ tail` start with the byte slice `p`, without
+/// reassembling the concatenation?
+fn starts_with_composite(head: &[u8], tail: &[u8], p: &[u8]) -> bool {
+    if p.len() <= head.len() {
+        head.starts_with(p)
     } else {
-        tail.cmp(&other[hn..])
+        let (in_head, in_tail) = p.split_at(head.len());
+        head == in_head && tail.len() >= in_tail.len() && &tail[..in_tail.len()] == in_tail
     }
 }
 
-/// Is a full key strictly/inclusively below the upper bound `hi`?
-fn below_hi(head: &[u8], tail: &[u8], hi: Bound<&[u8]>) -> bool {
-    match hi {
-        Bound::Unbounded => true,
-        Bound::Excluded(h) => cmp_composite(head, tail, h) == Ordering::Less,
-        Bound::Included(h) => cmp_composite(head, tail, h) != Ordering::Greater,
+/// Read byte `i` of the split key `head ++ tail` (caller ensures `i` is in range).
+#[inline]
+fn composite_byte(head: &[u8], tail: &[u8], i: usize) -> u8 {
+    match i.checked_sub(head.len()) {
+        Some(j) => tail[j],
+        None => head[i],
+    }
+}
+
+/// Does the full canonical key `head ++ tail` carry the nibble `prefix`?
+/// **Zero-alloc**: matched directly against the packed prefix bytes + parity —
+/// no byte bound materialized, no key reassembled. This is the membership
+/// predicate that drives every forward prefix scan.
+fn under_prefix(prefix: NibbleRef, head: &[u8], tail: &[u8]) -> bool {
+    let qp = prefix.packed();
+    if qp.is_empty() {
+        return true; // the empty prefix carries every key
+    }
+    // Fully-constrained leading bytes, plus (for an odd prefix) one byte whose
+    // HIGH nibble must match.
+    let (full, half) = match qp.split_last() {
+        Some((last, rest)) if !prefix.is_even() => (rest, Some(last >> 4)),
+        _ => (qp, None),
+    };
+    if !starts_with_composite(head, tail, full) {
+        return false;
+    }
+    match half {
+        None => true,
+        Some(h) => {
+            let m = full.len();
+            head.len() + tail.len() > m && composite_byte(head, tail, m) >> 4 == h
+        }
+    }
+}
+
+/// Inline capacity for a reverse-seek anchor: canonical keys are ≤57 bytes, so
+/// level-1 heads (≤23 B) and level-2 tails (≤34 B) both fit with no heap.
+type Anchor = SmallVec<u8, 48>;
+
+/// Smallest byte string strictly greater than every string having `p` as a
+/// prefix: increment the last non-`0xff` byte, dropping trailing `0xff`. An
+/// all-`0xff` (or empty) `p` has no successor → the range is open-ended.
+fn byte_successor(p: &[u8]) -> Bound<Anchor> {
+    let mut v = Anchor::new();
+    v.extend_from_slice(p);
+    while let Some(&last) = v.last() {
+        if last == 0xff {
+            v.pop();
+        } else {
+            let n = v.len();
+            v[n - 1] = last + 1;
+            return Bound::Excluded(v);
+        }
+    }
+    Bound::Unbounded
+}
+
+/// Exclusive upper byte-bound of the packed prefix `packed` (parity `even`): the
+/// first canonical key NOT under it. Parity-aware — an odd prefix's trailing
+/// half-nibble `h` ends the range at high-nibble `h + 1`, carrying out of the
+/// byte when `h == 15`.
+fn prefix_upper(packed: &[u8], even: bool) -> Bound<Anchor> {
+    if even {
+        return byte_successor(packed);
+    }
+    let (last, rest) = packed.split_last().expect("odd prefix has ≥1 byte");
+    let h = last >> 4;
+    if h < 15 {
+        let mut u = Anchor::new();
+        u.extend_from_slice(rest);
+        u.push((h + 1) << 4);
+        Bound::Excluded(u)
+    } else {
+        byte_successor(rest)
+    }
+}
+
+/// Borrow an [`Anchor`] bound as a slice bound for `BTreeMap::range`.
+fn anchor_ref(b: &Bound<Anchor>) -> Bound<&[u8]> {
+    match b {
+        Bound::Included(v) => Bound::Included(v.as_ref()),
+        Bound::Excluded(v) => Bound::Excluded(v.as_ref()),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
@@ -295,6 +361,7 @@ impl<V> Entries<V> {
                     self.len += 1;
                 }
             } else {
+                // LLM: 为什么这里 collect 成 BTreeMap，而不是 or_insert_with 之后，根据类型 collect？
                 let mut chunk: BTreeMap<Level2Key, V> =
                     run.map(|(k, v)| (level2_key(&k[HEAD_LEN..]), v)).collect();
                 self.len += chunk.len();
@@ -340,98 +407,138 @@ impl<V> Entries<V> {
         }
     }
 
-    /// Forward iterator over `[lo, hi)` in sorted key order. The yielded
-    /// [`Composite`]s borrow the store (`'a`); the bounds only need to outlive
-    /// the walk (`'b`), so an endpoint can be returned past the bounds' scope.
-    pub(crate) fn range<'a, 'b>(
+    /// Forward iterator over all entries carrying nibble `prefix`, in sorted key
+    /// order. **Zero-alloc**: seeks to the prefix's borrowed lower bound
+    /// ([`NibblePrefix::packed`]) and stops at the first key that no longer
+    /// carries the prefix ([`under_prefix`]) — no `(lo, hi)` byte pair is ever
+    /// materialized (contrast the old `key_bounds` → `range` path, which
+    /// heap-allocated the bounds on every call, 16×/node in the trie walk).
+    pub(crate) fn prefix_range<'a, 'b>(
         &'a self,
-        lo: &'b [u8],
-        hi: Bound<&'b [u8]>,
-    ) -> RangeFwd<'a, 'b, V> {
+        prefix: NibbleRef<'b>,
+    ) -> PrefixRange<'a, 'b, V> {
+        let lo = prefix.packed();
         let l1_lo = &lo[..lo.len().min(HEAD_LEN)];
-        RangeFwd {
+        PrefixRange {
             l1: self.map.range::<[u8], _>((Bound::Included(l1_lo), Bound::Unbounded)),
             branch: None,
-            lo,
-            hi,
+            prefix: Some(prefix),
             done: false,
         }
     }
 
     /// Full iterator over all entries in sorted key order.
-    pub(crate) fn iter(&self) -> RangeFwd<'_, 'static, V> {
-        self.range(&[], Bound::Unbounded)
+    pub(crate) fn iter(&self) -> PrefixRange<'_, 'static, V> {
+        PrefixRange {
+            l1: self.map.range::<[u8], _>((Bound::Included(&[][..]), Bound::Unbounded)),
+            branch: None,
+            prefix: None,
+            done: false,
+        }
     }
 
-    /// First key in `[lo, hi)`, or `None` if the range is empty.
-    pub(crate) fn range_first<'a>(&'a self, lo: &[u8], hi: Bound<&[u8]>) -> Option<Composite<'a>> {
-        self.range(lo, hi).next().map(|(c, _)| c)
+    /// First key carrying `prefix`, or `None` if none. Zero-alloc.
+    pub(crate) fn prefix_first(&self, prefix: NibbleRef) -> Option<Composite<'_>> {
+        self.prefix_range(prefix).next().map(|(c, _)| c)
     }
 
-    /// Last key in `[lo, hi)`, or `None` if empty. Both the level-1 reverse scan
-    /// and the boundary branch's level-2 scan are **bounded by `hi`** (seeked,
-    /// not linearly skipped from the global maximum), so this costs `O(log n)`
-    /// per level — not `O(nodes above hi)`.
-    pub(crate) fn range_last<'a>(&'a self, lo: &[u8], hi: Bound<&[u8]>) -> Option<Composite<'a>> {
-        let l1_lo = &lo[..lo.len().min(HEAD_LEN)];
-        // Upper-bound the level-1 range by hi's prefix so `next_back` starts just
-        // below hi rather than at the map's global maximum.
-        let l1_hi: Bound<&[u8]> = match hi {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Excluded(h) | Bound::Included(h) => {
-                Bound::Included(&h[..h.len().min(HEAD_LEN)])
-            }
+    /// Whether any key carries `prefix`. The trie walk's per-child existence
+    /// probe (16×/node), so it does the **least** work: one level-1 seek, and
+    /// only for a tail-reaching prefix does it also probe level 2. Zero-alloc.
+    pub(crate) fn prefix_exists(&self, prefix: NibbleRef) -> bool {
+        let packed = prefix.packed();
+        let l1_lo = &packed[..packed.len().min(HEAD_LEN)];
+        let Some((p, node)) = self
+            .map
+            .range::<[u8], _>((Bound::Included(l1_lo), Bound::Unbounded))
+            .next()
+        else {
+            return false;
         };
-        let mut l1 = self.map.range::<[u8], _>((Bound::Included(l1_lo), l1_hi));
-        while let Some((p, node)) = l1.next_back() {
-            let head = p.as_slice();
-            // Whole node above `hi` (its minimum key `head[..]` already ≥ hi)? skip.
-            if !below_hi(head, &[], hi) {
-                continue;
-            }
+        let head = p.as_slice();
+        if packed.len() > HEAD_LEN {
+            // Prefix reaches into the tail: only `head == packed[..23]` (a branch)
+            // can carry it, and only if it holds a tail under `packed[23..]`.
             match node {
-                Node::Leaf(_) => {
-                    // head < hi (checked). Qualifies iff ≥ lo; else nothing below does.
-                    return (head >= lo).then_some(Composite { head, tail: &[] });
+                Node::Branch(b) if head == &packed[..HEAD_LEN] => {
+                    let tail_lo = &packed[HEAD_LEN..];
+                    let tail_hi = prefix_upper(tail_lo, prefix.is_even());
+                    b.range::<[u8], _>((Bound::Included(tail_lo), anchor_ref(&tail_hi)))
+                        .next()
+                        .is_some()
                 }
-                Node::Branch(b) => {
-                    // Seek the largest level-2 key still below hi. Only the
-                    // hi-boundary branch (head == hi's 23-byte prefix) is cut by
-                    // the tail; any earlier branch is wholly below hi.
-                    let l2_hi: Bound<&[u8]> = match hi {
-                        Bound::Excluded(h) if h.len() > HEAD_LEN && head == &h[..HEAD_LEN] => {
-                            Bound::Excluded(&h[HEAD_LEN..])
-                        }
-                        Bound::Included(h) if h.len() > HEAD_LEN && head == &h[..HEAD_LEN] => {
-                            Bound::Included(&h[HEAD_LEN..])
-                        }
-                        _ => Bound::Unbounded,
-                    };
-                    if let Some((l2, _)) =
-                        b.range::<[u8], _>((Bound::Unbounded, l2_hi)).next_back()
-                    {
-                        return (cmp_composite(head, l2, lo) != Ordering::Less)
-                            .then_some(Composite { head, tail: l2.as_slice() });
-                    }
-                    // No level-2 key below hi here; fall through to the previous node.
-                }
+                _ => false,
+            }
+        } else {
+            // Prefix lies within the head: the first node ≥ the prefix carries it
+            // iff its head does — a leaf's whole key, or a (never-empty) branch's
+            // shared head. If not, nothing sorted after it does either. No level-2
+            // probe needed (this is the common case in the child walk).
+            under_prefix(prefix, head, &[])
+        }
+    }
+
+    /// Last key carrying `prefix`, or `None` if none. A **native reverse
+    /// traversal** driven by the prefix: the lower bound is borrowed
+    /// (`packed()`), and the two reverse-seek anchors (level-1 head ceiling,
+    /// level-2 tail ceiling) are computed inline into an [`Anchor`] — no heap,
+    /// no `(lo, hi)` byte pair. Bounded by the prefix's ceiling, so `next_back`
+    /// starts just below it: `O(log n)` per level, never a scan from the map's
+    /// global maximum.
+    pub(crate) fn prefix_last(&self, prefix: NibbleRef) -> Option<Composite<'_>> {
+        let packed = prefix.packed();
+        let l1_lo = &packed[..packed.len().min(HEAD_LEN)];
+        // A prefix reaching past the 23-byte head pins a single level-1 node
+        // (`head == packed[..23]`) and cuts its tails; a shorter prefix selects a
+        // run of whole level-1 nodes.
+        let into_tail = packed.len() > HEAD_LEN;
+        let l1_hi = if into_tail {
+            byte_successor(&packed[..HEAD_LEN])
+        } else {
+            prefix_upper(packed, prefix.is_even())
+        };
+        // The seek range holds only prefix-carrying level-1 nodes, so its top —
+        // one `next_back` — is the answer: regime-2 bounds it to a single node,
+        // and regime-1's highest node always yields the max key. No scan.
+        let (p, node) = self
+            .map
+            .range::<[u8], _>((Bound::Included(l1_lo), anchor_ref(&l1_hi)))
+            .next_back()?;
+        let head = p.as_slice();
+        match node {
+            Node::Leaf(_) => {
+                under_prefix(prefix, head, &[]).then_some(Composite { head, tail: &[] })
+            }
+            Node::Branch(b) if into_tail => {
+                // Boundary branch: its largest tail under `packed[23..]`.
+                let tail_lo = &packed[HEAD_LEN..];
+                let tail_hi = prefix_upper(tail_lo, prefix.is_even());
+                b.range::<[u8], _>((Bound::Included(tail_lo), anchor_ref(&tail_hi)))
+                    .next_back()
+                    .map(|(l2, _)| Composite { head, tail: l2.as_slice() })
+            }
+            Node::Branch(b) => {
+                // Whole branch is under the prefix → its largest tail wins.
+                b.iter()
+                    .next_back()
+                    .map(|(l2, _)| Composite { head, tail: l2.as_slice() })
             }
         }
-        None
     }
 }
 
-/// Forward flattening iterator over `[lo, hi)`: walks level-1 nodes, expanding
-/// each branch's level-2 map in order. Stops as soon as a key reaches `hi`.
-pub(crate) struct RangeFwd<'a, 'b, V> {
+/// Forward flattening iterator over the entries carrying a nibble prefix (or,
+/// when `prefix` is `None`, every entry): walks level-1 nodes, expanding each
+/// branch's level-2 map in order, and stops at the first key past the prefix.
+/// The prefix is borrowed (`'b`); it materializes no byte bounds.
+pub(crate) struct PrefixRange<'a, 'b, V> {
     l1: btree_map::Range<'a, Prefix23, Node<V>>,
     branch: Option<(&'a [u8], btree_map::Range<'a, Level2Key, V>)>,
-    lo: &'b [u8],
-    hi: Bound<&'b [u8]>,
+    prefix: Option<NibbleRef<'b>>,
     done: bool,
 }
 
-impl<'a, 'b, V> Iterator for RangeFwd<'a, 'b, V> {
+impl<'a, 'b, V> Iterator for PrefixRange<'a, 'b, V> {
     type Item = (Composite<'a>, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -443,20 +550,11 @@ impl<'a, 'b, V> Iterator for RangeFwd<'a, 'b, V> {
                 let head = *head;
                 match bi.next() {
                     Some((l2, v)) => {
-                        if cmp_composite(head, l2, self.lo) == Ordering::Less {
-                            continue; // below lo (only in the first, boundary branch)
-                        }
-                        if !below_hi(head, l2, self.hi) {
+                        if self.prefix.is_some_and(|p| !under_prefix(p, head, l2)) {
                             self.done = true;
                             return None;
                         }
-                        return Some((
-                            Composite {
-                                head,
-                                tail: l2.as_slice(),
-                            },
-                            v,
-                        ));
+                        return Some((Composite { head, tail: l2.as_slice() }, v));
                     }
                     None => self.branch = None,
                 }
@@ -464,10 +562,7 @@ impl<'a, 'b, V> Iterator for RangeFwd<'a, 'b, V> {
             match self.l1.next()? {
                 (p, Node::Leaf(v)) => {
                     let head = p.as_slice();
-                    if head < self.lo {
-                        continue;
-                    }
-                    if !below_hi(head, &[], self.hi) {
+                    if self.prefix.is_some_and(|px| !under_prefix(px, head, &[])) {
                         self.done = true;
                         return None;
                     }
@@ -475,20 +570,32 @@ impl<'a, 'b, V> Iterator for RangeFwd<'a, 'b, V> {
                 }
                 (p, Node::Branch(b)) => {
                     let head = p.as_slice();
-                    // Whole branch already ≥ hi? then all following keys are too.
-                    if !below_hi(head, &[], self.hi) {
-                        self.done = true;
-                        return None;
-                    }
-                    // Seek level-2 to the lo tail only for the boundary branch.
-                    let l2_lo: Bound<&[u8]> = if self.lo.len() > HEAD_LEN && head == &self.lo[..HEAD_LEN]
-                    {
-                        Bound::Included(&self.lo[HEAD_LEN..])
-                    } else {
-                        Bound::Unbounded
+                    // Decide whether this branch carries matching keys, and the
+                    // level-2 lower bound (the tail floor for a boundary branch).
+                    let l2_lo: Bound<&[u8]> = match self.prefix {
+                        None => Bound::Unbounded,
+                        Some(px) => {
+                            let packed = px.packed();
+                            if packed.len() > HEAD_LEN {
+                                // Prefix reaches into the tail: only the node
+                                // `head == packed[..23]` qualifies; seek level-2
+                                // to the tail floor. Any other head is past it.
+                                if head == &packed[..HEAD_LEN] {
+                                    Bound::Included(&packed[HEAD_LEN..])
+                                } else {
+                                    self.done = true;
+                                    return None;
+                                }
+                            } else if under_prefix(px, head, &[]) {
+                                // Prefix lies within the head → whole branch matches.
+                                Bound::Unbounded
+                            } else {
+                                self.done = true;
+                                return None;
+                            }
+                        }
                     };
-                    self.branch =
-                        Some((head, b.range::<[u8], _>((l2_lo, Bound::Unbounded))));
+                    self.branch = Some((head, b.range::<[u8], _>((l2_lo, Bound::Unbounded))));
                 }
             }
         }
@@ -602,48 +709,58 @@ mod tests {
         let want: Vec<(Vec<u8>, u32)> = oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
         assert_eq!(got, want, "iteration");
 
-        // range endpoints for many byte-prefix bounds
+        // prefix_first / prefix_last / prefix_exists / prefix_range for EVERY
+        // nibble prefix (even AND odd) of many sample keys. The odd lengths
+        // exercise the packed half-nibble bound (incl. the nibble-15 carry).
+        let expand = |k: &[u8]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(k.len() * 2);
+            for b in k {
+                v.push(b >> 4);
+                v.push(b & 0x0f);
+            }
+            v
+        };
         let sample_keys: Vec<Vec<u8>> = oracle.keys().cloned().collect();
         for probe in sample_keys.iter().step_by(37).chain(std::iter::once(&shared)) {
-            for plen in 0..=probe.len() {
-                let lo = &probe[..plen];
-                // exclusive upper = prefix successor
-                let mut upper = lo.to_vec();
-                let hi = loop {
-                    match upper.last().copied() {
-                        None => break Bound::Unbounded,
-                        Some(0xff) => {
-                            upper.pop();
-                        }
-                        Some(b) => {
-                            *upper.last_mut().unwrap() = b + 1;
-                            break Bound::Excluded(upper.clone());
-                        }
+            let pnib = expand(probe);
+            for nlen in 0..=pnib.len() {
+                let buf = crate::nibbles::pack_nibbles(Nibbles::from_bytes(probe).sub(0, nlen));
+                let prefix = NibbleRef::new(&buf);
+                // Oracle: keys whose nibble expansion carries `pnib[..nlen]`,
+                // already in byte-sorted order (BTreeMap iteration).
+                let want: Vec<&Vec<u8>> = oracle
+                    .keys()
+                    .filter(|k| {
+                        let e = expand(k);
+                        e.len() >= nlen && e[..nlen] == pnib[..nlen]
+                    })
+                    .collect();
+
+                assert_eq!(
+                    ent.prefix_exists(prefix),
+                    !want.is_empty(),
+                    "prefix_exists n={nlen} probe={probe:?}"
+                );
+
+                let got: Vec<Vec<u8>> = ent
+                    .prefix_range(prefix)
+                    .map(|(c, _)| [c.head, c.tail].concat())
+                    .collect();
+                let want_v: Vec<Vec<u8>> = want.iter().map(|k| (*k).clone()).collect();
+                assert_eq!(got, want_v, "prefix_range n={nlen} probe={probe:?}");
+
+                match (want.first(), want.last()) {
+                    (None, _) => {
+                        assert!(ent.prefix_first(prefix).is_none(), "first empty n={nlen}");
+                        assert!(ent.prefix_last(prefix).is_none(), "last empty n={nlen}");
                     }
-                };
-                let hi_ref = match &hi {
-                    Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-                    Bound::Included(v) => Bound::Included(v.as_slice()),
-                    Bound::Unbounded => Bound::Unbounded,
-                };
-                let want: Vec<&Vec<u8>> = oracle.keys().filter(|k| k.starts_with(lo)).collect();
-                let first = ent.range_first(lo, hi_ref);
-                let last = ent.range_last(lo, hi_ref);
-                match want.first() {
-                    None => {
-                        assert!(first.is_none(), "range_first should be empty for {lo:?}");
-                        assert!(last.is_none(), "range_last should be empty for {lo:?}");
+                    (Some(w0), Some(wl)) => {
+                        let f = ent.prefix_first(prefix).expect("first present");
+                        assert_eq!(&[f.head, f.tail].concat(), *w0, "prefix_first n={nlen}");
+                        let l = ent.prefix_last(prefix).expect("last present");
+                        assert_eq!(&[l.head, l.tail].concat(), *wl, "prefix_last n={nlen}");
                     }
-                    Some(w0) => {
-                        let f = first.expect("range_first present");
-                        assert_eq!(&[f.head, f.tail].concat(), *w0, "range_first {lo:?}");
-                        let l = last.expect("range_last present");
-                        assert_eq!(
-                            &[l.head, l.tail].concat(),
-                            *want.last().unwrap(),
-                            "range_last {lo:?}"
-                        );
-                    }
+                    _ => unreachable!(),
                 }
             }
         }

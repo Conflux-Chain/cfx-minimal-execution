@@ -50,7 +50,9 @@
 
 use crate::codec::{read_len_prefixed, read_u64_le};
 use crate::entries::{Composite, Entries};
-use crate::nibbles::{NibblePrefix, Nibbles};
+use crate::nibbles::{
+    empty_prefix_buf, pack_nibbles, push_nibble, NibblePrefix, NibbleRef, Nibbles,
+};
 use crate::trie::{compute_node_merkle, compute_path_merkle, MptValue, TrieValue, CHILDREN};
 use crate::types::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
@@ -254,7 +256,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
             }
         }
         s.n_cache = self.cache.len();
-        s.cache_key_bytes = self.cache.keys().map(|p| p.nibble_len() as u64).sum();
+        s.cache_key_bytes = self.cache.keys().map(|p| p.as_ref().nibble_len() as u64).sum();
         s.n_level1 = self.entries.level1_len();
         s.l2_size_hist = self.entries.group_size_hist();
         s
@@ -273,14 +275,17 @@ impl<V: TrieValue> IncrementalTrie<V> {
             return MERKLE_NULL_NODE;
         }
         // Evict every prefix of every dirty key, so no stale subtree hash can
-        // survive (see module docs). Build each key's prefixes nibble-by-nibble.
+        // survive (see module docs). Each key's prefixes are built by extending a
+        // single reused stack buffer one nibble at a time (no per-nibble alloc),
+        // and the cache is evicted by the borrowed `&[u8]` key.
         for key in &self.dirty {
-            let nibbles = Nibbles::from_bytes(key);
-            let mut p = NibblePrefix::empty();
-            self.cache.remove(&p);
-            for i in 0..nibbles.len() {
-                p = p.push(nibbles.at(i));
-                self.cache.remove(&p);
+            let mut buf = empty_prefix_buf();
+            self.cache.remove(&buf[..]); // the empty (root) prefix
+            for &byte in key.iter() {
+                push_nibble(&mut buf, byte >> 4);
+                self.cache.remove(&buf[..]);
+                push_nibble(&mut buf, byte & 0x0f);
+                self.cache.remove(&buf[..]);
             }
         }
         self.dirty.clear();
@@ -297,7 +302,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
                 .collect();
             let t = std::time::Instant::now();
             let (root, cache_entries) =
-                memo_node_rebuild(&entries, &NibblePrefix::empty(), false, cache_policy);
+                memo_node_rebuild(&entries, NibbleRef::empty(), false, cache_policy);
             if timing {
                 eprintln!(
                     "[recover] snapshot_hash elapsed={}ms cache_entries={}",
@@ -319,7 +324,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
         } else {
             memo_node(
                 &self.entries,
-                &NibblePrefix::empty(),
+                NibbleRef::empty(),
                 false,
                 &mut self.cache,
                 cache_policy,
@@ -422,10 +427,9 @@ impl<V: TrieValue> IncrementalTrie<V> {
     /// All `(canonical key, value)` pairs whose canonical key starts with
     /// `canonical_prefix` (snapshot prefix scan).
     pub fn snapshot_scan_prefix(&self, canonical_prefix: &[u8]) -> Vec<(Vec<u8>, Box<[u8]>)> {
-        let prefix = NibblePrefix::from_nibbles(Nibbles::from_bytes(canonical_prefix));
-        let (lo, hi) = prefix.key_bounds();
+        let buf = pack_nibbles(Nibbles::from_bytes(canonical_prefix));
         self.entries
-            .range(&lo, crate::nibbles::hi_bound_ref(&hi))
+            .prefix_range(NibbleRef::new(&buf))
             .filter_map(|(c, value)| {
                 value
                     .visible_value()
@@ -479,17 +483,15 @@ impl<V: TrieValue> IncrementalTrie<V> {
 /// frontier, not the delta size. Serial only (the cache is `&mut`).
 fn memo_node<V: TrieValue>(
     entries: &Entries<V>,
-    rp: &NibblePrefix,
+    rp: NibbleRef,
     allow_path_compression: bool,
     cache: &mut Cache,
     cache_policy: CachePolicy,
 ) -> H256 {
-    if let Some(hash) = cache.get(rp) {
+    if let Some(hash) = cache.get(rp.as_bytes()) {
         return *hash;
     }
     let depth = rp.nibble_len();
-    let (lo, hi) = rp.key_bounds();
-    let hi_ref = crate::nibbles::hi_bound_ref(&hi);
 
     // The node's key block is the contiguous key range for `rp`. It is non-empty:
     // the root is non-empty and this fn only descends into children proven to
@@ -497,9 +499,9 @@ fn memo_node<V: TrieValue>(
     // compression the node absorbs the longest prefix shared by the whole block,
     // which — the block being sorted — is the common prefix of just its first
     // (min) and last (max) key.
-    let first_key = entries.range_first(&lo, hi_ref).expect("non-empty node");
+    let first_key = entries.prefix_first(rp).expect("non-empty node");
     let last_key = if allow_path_compression || cache_policy == CachePolicy::SkipSingleton {
-        entries.range_last(&lo, hi_ref).expect("non-empty node")
+        entries.prefix_last(rp).expect("non-empty node")
     } else {
         first_key
     };
@@ -512,29 +514,30 @@ fn memo_node<V: TrieValue>(
         0
     };
     let node_depth = depth + common;
-    let full_prefix = NibblePrefix::from_nibbles(first.sub(0, node_depth));
+    // The node's full routing prefix, built once on the stack.
+    let full_buf = pack_nibbles(first.sub(0, node_depth));
+    let full = NibbleRef::new(&full_buf);
 
-    // A key ending exactly at this node can only be `full_prefix` itself (and
-    // only when it lands on a byte boundary — see `as_canonical_key`).
-    let maybe_value = full_prefix
+    // A key ending exactly at this node can only be `full` itself (and only when
+    // it lands on a byte boundary — see `as_canonical_key`).
+    let maybe_value = full
         .as_canonical_key()
         .and_then(|ck| entries.get(ck))
         .map(|value| value.merkle_value());
 
-    // Resolve all 16 child slots left-to-right. A cache hit reuses the clean
-    // subtree's hash without touching `entries`; on a miss, one range probe
-    // decides — a present (dirty) child recurses, an absent one stays null.
+    // Resolve all 16 child slots left-to-right. Each child routing key is `full`
+    // extended by one nibble into a fresh stack buffer (no heap): a cache hit
+    // reuses the clean subtree's hash; on a miss, one range probe decides — a
+    // present (dirty) child recurses, an absent one stays null.
     let children: [H256; CHILDREN] = std::array::from_fn(|c| {
-        let child_rp = full_prefix.push(c as u8);
-        if let Some(hash) = cache.get(&child_rp) {
+        let mut child_buf = full_buf.clone();
+        push_nibble(&mut child_buf, c as u8);
+        if let Some(hash) = cache.get(&child_buf[..]) {
             return *hash;
         }
-        let (clo, chi) = child_rp.key_bounds();
-        if entries
-            .range_first(&clo, crate::nibbles::hi_bound_ref(&chi))
-            .is_some()
-        {
-            memo_node(entries, &child_rp, true, cache, cache_policy)
+        let child = NibbleRef::new(&child_buf);
+        if entries.prefix_exists(child) {
+            memo_node(entries, child, true, cache, cache_policy)
         } else {
             MERKLE_NULL_NODE
         }
@@ -546,7 +549,7 @@ fn memo_node<V: TrieValue>(
     let hash = compute_path_merkle(&path, depth, node_hash);
 
     if cache_policy == CachePolicy::Full || !is_singleton {
-        cache.insert(rp.clone(), hash);
+        cache.insert(NibblePrefix::from_bytes(rp.as_bytes()), hash);
     }
     hash
 }
@@ -581,7 +584,7 @@ impl<'a> EntryRef<'a> {
 /// hash map once after all parallel work joins.
 fn memo_node_rebuild(
     entries: &[EntryRef<'_>],
-    rp: &NibblePrefix,
+    rp: NibbleRef,
     allow_path_compression: bool,
     cache_policy: CachePolicy,
 ) -> (H256, Vec<(NibblePrefix, H256)>) {
@@ -597,19 +600,20 @@ fn memo_node_rebuild(
         0
     };
     let node_depth = depth + common;
-    let full_prefix = NibblePrefix::from_nibbles(first.sub(0, node_depth));
+    let full_buf = pack_nibbles(first.sub(0, node_depth));
 
     let maybe_value = entries
         .iter()
         .find(|entry| entry.nibble_len() == node_depth)
         .map(|entry| entry.value);
 
-    // Recompute one child subtree: build its routing prefix, recurse over its
-    // slice, and return `(child index, hash, its cache entries)`.
+    // Recompute one child subtree: build its routing key on the stack, recurse
+    // over its slice, and return `(child index, hash, its cache entries)`.
     let recurse = |&(child, start, end): &(usize, usize, usize)| {
-        let child_rp = full_prefix.push(child as u8);
+        let mut child_buf = full_buf.clone();
+        push_nibble(&mut child_buf, child as u8);
         let (hash, cache_entries) =
-            memo_node_rebuild(&entries[start..end], &child_rp, true, cache_policy);
+            memo_node_rebuild(&entries[start..end], NibbleRef::new(&child_buf), true, cache_policy);
         (child, hash, cache_entries)
     };
 
@@ -639,7 +643,7 @@ fn memo_node_rebuild(
     let hash = compute_path_merkle(&path, depth, node_hash);
 
     if cache_policy == CachePolicy::Full || !is_singleton {
-        cache_entries.push((rp.clone(), hash));
+        cache_entries.push((NibblePrefix::from_bytes(rp.as_bytes()), hash));
     }
     (hash, cache_entries)
 }
