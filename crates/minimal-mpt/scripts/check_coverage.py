@@ -1,13 +1,47 @@
 #!/usr/bin/env python3
+"""Line-coverage scope gates. Usage: check_coverage.py {fuzz|oracle}
+
+Deliberately line-number-pinned: each group lists lines on the branch-taken
+side of a semantic branch, so the gate proves the corpus/test exercises the
+path rather than merely entering the function. The pins are brittle across
+refactors — only scripts/verify.sh's coverage tier runs them.
+"""
 from pathlib import Path
 import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LCOV = ROOT / "target/coverage/oracle-cfx-storage/lcov.info"
 
+# Re-pinned 2026-07-07 after the state refactor moved snapshot.rs to
+# src/state/layers/. Each group's lines were cross-checked against a fresh
+# layered_state_ops lcov (all hit) and include the branch-taken side (the
+# `continue` skips, the tombstone arm/remove) so the gate keeps proving the
+# corpus exercises those paths rather than merely entering the function.
+FUZZ_REQUIRED = {
+    "src/state/layers/snapshot.rs": {
+        # apply_updates owns the insert/remove branch split used by commit
+        # rollover; 75/76 are the Some/Tombstone arms.
+        "snapshot batch update insert/remove": [73, 74, 75, 76],
+    },
+    "src/state/rotation.rs": {
+        # absorb intermediate into snapshot before re-rooting (33/34 = loop
+        # body, i.e. a non-empty intermediate was materialized)
+        "commit rollover materializes old intermediate": [32, 33, 34, 36, 39],
+        # rotate delta -> intermediate, re-derive the delta padding, rotate caches
+        "commit rollover promotes delta and updates padding": [55, 57, 58, 59, 65],
+    },
+    "src/state/prefix.rs": {
+        "delta address-prefix read skip": [30, 31],
+        "intermediate address-prefix read skip": [41, 42],
+        "delta address-prefix delete skip": [90, 91, 95],
+        "intermediate address-prefix delete skip": [105, 106, 110],
+        "intermediate tombstone/result handling": [112, 113, 115, 116, 117],
+    },
+}
 
-REQUIRED_LINES = {
+# Line numbers pin sources in the oracle/conflux-rust submodule on the
+# `minimal-execution-oracle` branch; re-pin whenever that branch moves.
+ORACLE_REQUIRED = {
     "crates/dbs/storage/src/state_manager.rs": {
         "StateIndex height and next-epoch construction": [56, 62, 82, 87, 102, 107],
     },
@@ -41,6 +75,17 @@ REQUIRED_LINES = {
     },
 }
 
+GATES = {
+    "fuzz": {
+        "lcov": ROOT / "target/coverage/fuzz-layered_state_ops/lcov.info",
+        "required": FUZZ_REQUIRED,
+    },
+    "oracle": {
+        "lcov": ROOT / "target/coverage/oracle-cfx-storage/lcov.info",
+        "required": ORACLE_REQUIRED,
+    },
+}
+
 
 def load_lcov(path: Path):
     files = {}
@@ -63,13 +108,19 @@ def find_file(files, suffix):
 
 
 def main():
-    if not LCOV.exists():
-        print(f"missing oracle coverage lcov: {LCOV}", file=sys.stderr)
+    if len(sys.argv) != 2 or sys.argv[1] not in GATES:
+        print(f"usage: {sys.argv[0]} {{fuzz|oracle}}", file=sys.stderr)
+        return 2
+    kind = sys.argv[1]
+    lcov = GATES[kind]["lcov"]
+
+    if not lcov.exists():
+        print(f"missing {kind} coverage lcov: {lcov}", file=sys.stderr)
         return 2
 
-    files = load_lcov(LCOV)
+    files = load_lcov(lcov)
     failures = []
-    for suffix, groups in REQUIRED_LINES.items():
+    for suffix, groups in GATES[kind]["required"].items():
         file_name = find_file(files, suffix)
         coverage = files[file_name]
         for group, lines in groups.items():
@@ -78,12 +129,12 @@ def main():
                 failures.append(f"{suffix}: {group}: missing lines {missing}")
 
     if failures:
-        print("oracle coverage scope check failed:", file=sys.stderr)
+        print(f"{kind} coverage scope check failed:", file=sys.stderr)
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         return 1
 
-    print("oracle coverage scope check passed")
+    print(f"{kind} coverage scope check passed")
     return 0
 
 

@@ -23,21 +23,15 @@ cd "$ORACLE_DIR"
 cargo llvm-cov clean --workspace
 rm -rf "$REPORT_DIR"
 mkdir -p "$REPORT_DIR"
+# Single instrumented test run; summary and html are re-rendered from its
+# profdata via `llvm-cov report` instead of re-running the test.
 CFX_MINIMAL_MPT_EXPECTED="$EXPECTED" \
   cargo llvm-cov test --release -p cfx-storage \
   minimal_mpt_oracle_compare_get_set_delete_commit \
-  --features testonly_code --summary-only | tee "$REPORT_DIR/summary.txt"
-CFX_MINIMAL_MPT_EXPECTED="$EXPECTED" \
-  cargo llvm-cov test --release -p cfx-storage \
-  minimal_mpt_oracle_compare_get_set_delete_commit \
-  --features testonly_code --lcov --output-path "$REPORT_DIR/lcov.info" >/dev/null
-cd "$CRATE_ROOT"
-"$CRATE_ROOT/scripts/check_oracle_coverage.py"
-cd "$ORACLE_DIR"
-CFX_MINIMAL_MPT_EXPECTED="$EXPECTED" \
-  cargo llvm-cov test --release -p cfx-storage \
-  minimal_mpt_oracle_compare_get_set_delete_commit \
-  --features testonly_code --html --output-dir "$REPORT_DIR" >/dev/null
+  --features testonly_code --lcov --output-path "$REPORT_DIR/lcov.info"
+cargo llvm-cov report --release --summary-only | tee "$REPORT_DIR/summary.txt"
+cargo llvm-cov report --release --html --output-dir "$REPORT_DIR" >/dev/null
+"$CRATE_ROOT/scripts/check_coverage.py" oracle
 echo "coverage summary: $REPORT_DIR/summary.txt"
 echo "lcov report: $REPORT_DIR/lcov.info"
 echo "html report: $REPORT_DIR/html/index.html"
