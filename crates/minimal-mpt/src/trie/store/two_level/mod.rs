@@ -21,8 +21,10 @@
 //! Flattened (level 1 in order, each branch's level 2 in order) this yields the
 //! exact same sorted `(full key, V)` sequence as a flat `BTreeMap<Box<[u8]>, V>`,
 //! but without the per-entry prefix duplication or per-key heap allocation.
-//! Keys are surfaced to the trie walk as a [`Composite`] (`head` + `tail` slices)
-//! read through [`Nibbles::from_composite`] — never reassembled into one buffer.
+//! Keys are surfaced to the trie walk as a [`Nibbles`] view over the internal
+//! `head` + `tail` slices (see `Composite`) via [`Nibbles::from_composite`] —
+//! never reassembled into one buffer, and the split representation never escapes
+//! this module.
 
 use crate::nibbles::{NibbleRef, Nibbles};
 use smallvec::SmallVec;
@@ -105,32 +107,22 @@ fn prefix23_of(key: &[u8]) -> Prefix23 {
     Prefix23::new(&key[..key.len().min(HEAD_LEN)])
 }
 
-/// A key surfaced from the store as `head ++ tail`, without reassembly. For a
-/// leaf `tail` is empty; for a branch entry `head` is the 23-byte prefix and
-/// `tail` the remainder.
+/// A key held internally as `head ++ tail`, without reassembly. For a leaf `tail`
+/// is empty; for a branch entry `head` is the 23-byte prefix and `tail` the
+/// remainder. This is a **two_level-private** representation: the store hands the
+/// key back to the trie walk as a [`Nibbles`] view (via [`Composite::nibbles`]),
+/// so no caller outside this module ever names it.
 #[derive(Clone, Copy)]
-pub(crate) struct Composite<'a> {
-    pub(crate) head: &'a [u8],
-    pub(crate) tail: &'a [u8],
+struct Composite<'a> {
+    head: &'a [u8],
+    tail: &'a [u8],
 }
 
 impl<'a> Composite<'a> {
+    /// The nibble view of this split key — the store's only key-surfacing form.
     #[inline]
-    pub(crate) fn nibbles(&self) -> Nibbles<'a> {
+    fn nibbles(&self) -> Nibbles<'a> {
         Nibbles::from_composite(self.head, self.tail)
-    }
-
-    #[inline]
-    pub(crate) fn byte_len(&self) -> usize {
-        self.head.len() + self.tail.len()
-    }
-
-    /// Whether two composites denote the same full key. Cheap: for entries from
-    /// the same store, equal `head` slices share the same level-1 node, so this
-    /// is a length-guarded slice compare, not a reassembly.
-    #[inline]
-    pub(crate) fn same_key(&self, other: &Composite<'_>) -> bool {
-        self.head == other.head && self.tail == other.tail
     }
 }
 
@@ -411,9 +403,10 @@ impl<V> Entries<V> {
         }
     }
 
-    /// First key carrying `prefix`, or `None` if none. Zero-alloc.
-    pub(crate) fn prefix_first(&self, prefix: NibbleRef) -> Option<Composite<'_>> {
-        self.prefix_range(prefix).next().map(|(c, _)| c)
+    /// First key carrying `prefix`, or `None` if none, as a [`Nibbles`] view.
+    /// Zero-alloc.
+    pub(crate) fn prefix_first(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
+        self.prefix_range(prefix).next().map(|(n, _)| n)
     }
 
     /// Whether any key carries `prefix`. The trie walk's per-child existence
@@ -459,7 +452,7 @@ impl<V> Entries<V> {
     /// no `(lo, hi)` byte pair. Bounded by the prefix's ceiling, so `next_back`
     /// starts just below it: `O(log n)` per level, never a scan from the map's
     /// global maximum.
-    pub(crate) fn prefix_last(&self, prefix: NibbleRef) -> Option<Composite<'_>> {
+    pub(crate) fn prefix_last(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
         let packed = prefix.packed();
         let l1_lo = &packed[..packed.len().min(HEAD_LEN)];
         // A prefix reaching past the 23-byte head pins a single level-1 node
@@ -479,7 +472,7 @@ impl<V> Entries<V> {
             .range::<[u8], _>((Bound::Included(l1_lo), anchor_ref(&l1_hi)))
             .next_back()?;
         let head = p.as_slice();
-        match node {
+        let last = match node {
             Node::Leaf(_) => {
                 under_prefix(prefix, head, &[]).then_some(Composite { head, tail: &[] })
             }
@@ -497,7 +490,8 @@ impl<V> Entries<V> {
                     .next_back()
                     .map(|(l2, _)| Composite { head, tail: l2.as_slice() })
             }
-        }
+        };
+        last.map(|c| c.nibbles())
     }
 }
 
@@ -513,7 +507,7 @@ pub(crate) struct PrefixRange<'a, 'b, V> {
 }
 
 impl<'a, 'b, V> Iterator for PrefixRange<'a, 'b, V> {
-    type Item = (Composite<'a>, &'a V);
+    type Item = (Nibbles<'a>, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -528,7 +522,7 @@ impl<'a, 'b, V> Iterator for PrefixRange<'a, 'b, V> {
                             self.done = true;
                             return None;
                         }
-                        return Some((Composite { head, tail: l2.as_slice() }, v));
+                        return Some((Composite { head, tail: l2.as_slice() }.nibbles(), v));
                     }
                     None => self.branch = None,
                 }
@@ -540,7 +534,7 @@ impl<'a, 'b, V> Iterator for PrefixRange<'a, 'b, V> {
                         self.done = true;
                         return None;
                     }
-                    return Some((Composite { head, tail: &[] }, v));
+                    return Some((Composite { head, tail: &[] }.nibbles(), v));
                 }
                 (p, Node::Branch(b)) => {
                     let head = p.as_slice();
@@ -616,7 +610,7 @@ mod tests {
             via_insert.insert(k, *v);
         }
         let want: Vec<(Vec<u8>, u32)> =
-            via_insert.iter().map(|(c, v)| ([c.head, c.tail].concat(), *v)).collect();
+            via_insert.iter().map(|(n, v)| (n.to_canonical_bytes(), *v)).collect();
 
         for w in [1usize, 3, 1023, 6001, kv.len()] {
             let mut via_bulk: Entries<u32> = Entries::new();
@@ -625,7 +619,7 @@ mod tests {
             }
             assert_eq!(via_bulk.len(), via_insert.len(), "len mismatch at W={w}");
             let got: Vec<(Vec<u8>, u32)> =
-                via_bulk.iter().map(|(c, v)| ([c.head, c.tail].concat(), *v)).collect();
+                via_bulk.iter().map(|(n, v)| (n.to_canonical_bytes(), *v)).collect();
             assert_eq!(got, want, "iteration mismatch at W={w}");
         }
     }
@@ -678,7 +672,7 @@ mod tests {
         // full iteration order + values
         let got: Vec<(Vec<u8>, u32)> = ent
             .iter()
-            .map(|(c, v)| ([c.head, c.tail].concat(), *v))
+            .map(|(n, v)| (n.to_canonical_bytes(), *v))
             .collect();
         let want: Vec<(Vec<u8>, u32)> = oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
         assert_eq!(got, want, "iteration");
@@ -718,7 +712,7 @@ mod tests {
 
                 let got: Vec<Vec<u8>> = ent
                     .prefix_range(prefix)
-                    .map(|(c, _)| [c.head, c.tail].concat())
+                    .map(|(n, _)| n.to_canonical_bytes())
                     .collect();
                 let want_v: Vec<Vec<u8>> = want.iter().map(|k| (*k).clone()).collect();
                 assert_eq!(got, want_v, "prefix_range n={nlen} probe={probe:?}");
@@ -730,9 +724,9 @@ mod tests {
                     }
                     (Some(w0), Some(wl)) => {
                         let f = ent.prefix_first(prefix).expect("first present");
-                        assert_eq!(&[f.head, f.tail].concat(), *w0, "prefix_first n={nlen}");
+                        assert_eq!(&f.to_canonical_bytes(), *w0, "prefix_first n={nlen}");
                         let l = ent.prefix_last(prefix).expect("last present");
-                        assert_eq!(&[l.head, l.tail].concat(), *wl, "prefix_last n={nlen}");
+                        assert_eq!(&l.to_canonical_bytes(), *wl, "prefix_last n={nlen}");
                     }
                     _ => unreachable!(),
                 }

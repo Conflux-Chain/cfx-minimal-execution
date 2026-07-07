@@ -48,7 +48,7 @@
 //! always means "content unchanged since cached" — no per-node dirty check is
 //! needed during the walk.
 
-use crate::entries::{Composite, Entries};
+use crate::entries::Entries;
 use crate::nibbles::{
     empty_prefix_buf, pack_nibbles, push_nibble, NibblePrefix, NibbleRef, Nibbles,
 };
@@ -182,7 +182,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
                 .entries
                 .iter()
                 .map(|(key, value)| EntryRef {
-                    key,
+                    key, // Nibbles view surfaced by the store
                     value: value.merkle_value(),
                 })
                 .collect();
@@ -229,8 +229,8 @@ impl<V: TrieValue> IncrementalTrie<V> {
             let oracle_owned: Vec<(Vec<u8>, MptValue)> = self
                 .entries
                 .iter()
-                .map(|(c, v)| {
-                    let key: Vec<u8> = [c.head, c.tail].concat();
+                .map(|(n, v)| {
+                    let key: Vec<u8> = n.to_canonical_bytes();
                     let nibbles = crate::trie::bytes_to_nibbles(&key);
                     let mv = match v.visible_value() {
                         Some(b) => MptValue::Some(Box::from(b)),
@@ -289,10 +289,10 @@ impl<V: TrieValue> IncrementalTrie<V> {
         let buf = pack_nibbles(Nibbles::from_bytes(canonical_prefix));
         self.entries
             .prefix_range(NibbleRef::new(&buf))
-            .filter_map(|(c, value)| {
+            .filter_map(|(n, value)| {
                 value
                     .visible_value()
-                    .map(|v| ([c.head, c.tail].concat(), Box::from(v)))
+                    .map(|v| (n.to_canonical_bytes(), Box::from(v)))
             })
             .collect()
     }
@@ -301,10 +301,10 @@ impl<V: TrieValue> IncrementalTrie<V> {
     pub fn to_canonical_map(&self) -> BTreeMap<Vec<u8>, Box<[u8]>> {
         self.entries
             .iter()
-            .filter_map(|(c, value)| {
+            .filter_map(|(n, value)| {
                 value
                     .visible_value()
-                    .map(|v| ([c.head, c.tail].concat(), Box::from(v)))
+                    .map(|v| (n.to_canonical_bytes(), Box::from(v)))
             })
             .collect()
     }
@@ -322,7 +322,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
     pub fn iter_canonical(&self) -> impl Iterator<Item = (Vec<u8>, &[u8])> + '_ {
         self.entries
             .iter()
-            .filter_map(|(c, value)| value.visible_value().map(|v| ([c.head, c.tail].concat(), v)))
+            .filter_map(|(n, value)| value.visible_value().map(|v| (n.to_canonical_bytes(), v)))
     }
 
     /// Number of stored entries (used by merge instrumentation).
@@ -358,15 +358,15 @@ fn memo_node<V: TrieValue>(
     // compression the node absorbs the longest prefix shared by the whole block,
     // which — the block being sorted — is the common prefix of just its first
     // (min) and last (max) key.
-    let first_key = entries.prefix_first(rp).expect("non-empty node");
-    let last_key = if allow_path_compression || cache_policy == CachePolicy::SkipSingleton {
+    let first = entries.prefix_first(rp).expect("non-empty node");
+    let last = if allow_path_compression || cache_policy == CachePolicy::SkipSingleton {
         entries.prefix_last(rp).expect("non-empty node")
     } else {
-        first_key
+        first
     };
-    let first = first_key.nibbles();
-    let last = last_key.nibbles();
-    let is_singleton = first_key.same_key(&last_key);
+    // Value equality of the nibble path (not representation identity): a single
+    // key spans the whole node iff its first and last key are the same sequence.
+    let is_singleton = first.logical_eq(&last);
     let common = if allow_path_compression {
         first.common_prefix_len_from(&last, depth)
     } else {
@@ -413,25 +413,25 @@ fn memo_node<V: TrieValue>(
     hash
 }
 
-/// One entry fed to the cold [`memo_node_rebuild`]: a **canonical byte** key plus
-/// its precomputed **merkle bytes** (empty for a tombstone). The rebuild only
-/// ever needs the merkle bytes, so callers flatten `TrieValue::merkle_value` up
-/// front — keeping the rebuild independent of the value type. Nibble routing is
-/// derived from the canonical key via [`Nibbles`].
+/// One entry fed to the cold [`memo_node_rebuild`]: the key as a [`Nibbles`] view
+/// (surfaced by the store) plus its precomputed **merkle bytes** (empty for a
+/// tombstone). The rebuild only ever needs the merkle bytes, so callers flatten
+/// `TrieValue::merkle_value` up front — keeping the rebuild independent of the
+/// value type. All nibble routing goes through the [`Nibbles`] view.
 #[derive(Clone, Copy)]
 struct EntryRef<'a> {
-    key: Composite<'a>,
+    key: Nibbles<'a>,
     value: &'a [u8],
 }
 
 impl<'a> EntryRef<'a> {
     #[inline]
     fn nibbles(&self) -> Nibbles<'a> {
-        self.key.nibbles()
+        self.key
     }
     #[inline]
     fn nibble_len(&self) -> usize {
-        self.key.byte_len() * 2
+        self.key.len()
     }
 }
 
@@ -452,7 +452,7 @@ fn memo_node_rebuild(
     let depth = rp.nibble_len();
     let first = entries[0].nibbles();
     let last = entries[entries.len() - 1].nibbles();
-    let is_singleton = entries[0].key.same_key(&entries[entries.len() - 1].key);
+    let is_singleton = first.logical_eq(&last);
     let common = if allow_path_compression {
         first.common_prefix_len_from(&last, depth)
     } else {

@@ -137,6 +137,28 @@ impl<'a> Nibbles<'a> {
     pub(crate) fn to_expanded(&self) -> Vec<u8> {
         self.nibbles_from(0).collect()
     }
+
+    /// Repack an **even-length** nibble view into its canonical byte key. For an
+    /// entry surfaced from the store as `head ++ tail` this reproduces the exact
+    /// concatenation `[head, tail].concat()` (byte-aligned keys only), letting the
+    /// snapshot read/persist paths reassemble the key from the nibble view without
+    /// naming the store's internal split representation.
+    pub(crate) fn to_canonical_bytes(&self) -> Vec<u8> {
+        use itertools::Itertools;
+        debug_assert!(self.len() % 2 == 0, "canonical key must be byte-aligned");
+        self.nibbles_from(0)
+            .tuples()
+            .map(|(hi, lo)| (hi << 4) | lo)
+            .collect()
+    }
+
+    /// **Value** equality of the nibble path: `true` iff `self` and `other` yield
+    /// the same nibble sequence (same length, same nibbles), independent of
+    /// backing buffer or offset. Not representation identity — the singleton-node
+    /// check relies on this comparing the logical key, not the split.
+    pub(crate) fn logical_eq(&self, other: &Nibbles<'_>) -> bool {
+        self.len() == other.len() && self.nibbles_from(0).eq(other.nibbles_from(0))
+    }
 }
 
 /// A routing nibble prefix, in the `[parity] ++ packed_pairs` byte layout:
