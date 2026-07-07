@@ -26,11 +26,16 @@
 //! never reassembled into one buffer, and the split representation never escapes
 //! this module.
 
+mod prefix23;
+mod range;
+
 use crate::nibbles::{NibbleRef, Nibbles};
 use crate::trie::reader::{TrieReader, TrieStore};
 use crate::trie::TrieValue;
+use prefix23::{Composite, Node, Prefix23};
+use range::{byte_successor, prefix_upper, PrefixRange};
 use smallvec::SmallVec;
-use std::collections::{btree_map, BTreeMap};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 
 /// Bytes of a key held in the level-1 key. Keys this long or shorter are leaves;
@@ -50,82 +55,10 @@ fn level2_key(bytes: &[u8]) -> Level2Key {
     v
 }
 
-/// A level-1 key: up to [`HEAD_LEN`] key bytes plus their length. The length as
-/// the last (least-significant) field makes `#[derive(Ord)]` reproduce
-/// slice-lexicographic order (zero-padded data compares first, then a shorter
-/// key — a prefix — sorts before its longer extensions).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) struct Prefix23 {
-    data: [u8; HEAD_LEN],
-    len: u8,
-}
-
-impl Prefix23 {
-    fn new(bytes: &[u8]) -> Self {
-        debug_assert!(bytes.len() <= HEAD_LEN);
-        let mut data = [0u8; HEAD_LEN];
-        data[..bytes.len()].copy_from_slice(bytes);
-        Self {
-            data,
-            len: bytes.len() as u8,
-        }
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len as usize]
-    }
-}
-
-// `Borrow<[u8]>` (order-consistent with the derived `Ord`, verified for all
-// lengths) lets level-1 lookups and ranges use a `&[u8]` slice directly — no
-// throwaway `Prefix23` construction for reads.
-impl std::borrow::Borrow<[u8]> for Prefix23 {
-    fn borrow(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl AsRef<[u8]> for Prefix23 {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl PartialEq<[u8]> for Prefix23 {
-    fn eq(&self, other: &[u8]) -> bool {
-        self.as_slice() == other
-    }
-}
-
-enum Node<V> {
-    Leaf(V),
-    Branch(BTreeMap<Level2Key, V>),
-}
-
 /// The level-1 key of a canonical key: its first ≤23 bytes (a ≤22B key is its
 /// own whole leaf prefix; a ≥23B key contributes its first 23 bytes).
 fn prefix23_of(key: &[u8]) -> Prefix23 {
     Prefix23::new(&key[..key.len().min(HEAD_LEN)])
-}
-
-/// A key held internally as `head ++ tail`, without reassembly. For a leaf `tail`
-/// is empty; for a branch entry `head` is the 23-byte prefix and `tail` the
-/// remainder. This is a **two_level-private** representation: the store hands the
-/// key back to the trie walk as a [`Nibbles`] view (via [`Composite::nibbles`]),
-/// so no caller outside this module ever names it.
-#[derive(Clone, Copy)]
-struct Composite<'a> {
-    head: &'a [u8],
-    tail: &'a [u8],
-}
-
-impl<'a> Composite<'a> {
-    /// The nibble view of this split key — the store's only key-surfacing form.
-    #[inline]
-    fn nibbles(&self) -> Nibbles<'a> {
-        Nibbles::from_composite(self.head, self.tail)
-    }
 }
 
 /// Does the split key `head ++ tail` start with the byte slice `p`, without
@@ -178,44 +111,6 @@ fn under_prefix(prefix: NibbleRef, head: &[u8], tail: &[u8]) -> bool {
 /// Inline capacity for a reverse-seek anchor: canonical keys are ≤57 bytes, so
 /// level-1 heads (≤23 B) and level-2 tails (≤34 B) both fit with no heap.
 type Anchor = SmallVec<u8, 48>;
-
-/// Smallest byte string strictly greater than every string having `p` as a
-/// prefix: increment the last non-`0xff` byte, dropping trailing `0xff`. An
-/// all-`0xff` (or empty) `p` has no successor → the range is open-ended.
-fn byte_successor(p: &[u8]) -> Bound<Anchor> {
-    let mut v = Anchor::new();
-    v.extend_from_slice(p);
-    while let Some(&last) = v.last() {
-        if last == 0xff {
-            v.pop();
-        } else {
-            let n = v.len();
-            v[n - 1] = last + 1;
-            return Bound::Excluded(v);
-        }
-    }
-    Bound::Unbounded
-}
-
-/// Exclusive upper byte-bound of the packed prefix `packed` (parity `even`): the
-/// first canonical key NOT under it. Parity-aware — an odd prefix's trailing
-/// half-nibble `h` ends the range at high-nibble `h + 1`, carrying out of the
-/// byte when `h == 15`.
-fn prefix_upper(packed: &[u8], even: bool) -> Bound<Anchor> {
-    if even {
-        return byte_successor(packed);
-    }
-    let (last, rest) = packed.split_last().expect("odd prefix has ≥1 byte");
-    let h = last >> 4;
-    if h < 15 {
-        let mut u = Anchor::new();
-        u.extend_from_slice(rest);
-        u.push((h + 1) << 4);
-        Bound::Excluded(u)
-    } else {
-        byte_successor(rest)
-    }
-}
 
 /// Borrow an [`Anchor`] bound as a slice bound for `BTreeMap::range`.
 fn anchor_ref(b: &Bound<Anchor>) -> Bound<&[u8]> {
@@ -565,81 +460,6 @@ impl<V: TrieValue> TrieStore for Entries<V> {
     #[inline]
     fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
         self.bulk_extend_sorted(batch);
-    }
-}
-
-/// Forward flattening iterator over the entries carrying a nibble prefix (or,
-/// when `prefix` is `None`, every entry): walks level-1 nodes, expanding each
-/// branch's level-2 map in order, and stops at the first key past the prefix.
-/// The prefix is borrowed (`'b`); it materializes no byte bounds.
-pub(crate) struct PrefixRange<'a, 'b, V> {
-    l1: btree_map::Range<'a, Prefix23, Node<V>>,
-    branch: Option<(&'a [u8], btree_map::Range<'a, Level2Key, V>)>,
-    prefix: Option<NibbleRef<'b>>,
-    done: bool,
-}
-
-impl<'a, 'b, V> Iterator for PrefixRange<'a, 'b, V> {
-    type Item = (Nibbles<'a>, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        loop {
-            if let Some((head, bi)) = self.branch.as_mut() {
-                let head = *head;
-                match bi.next() {
-                    Some((l2, v)) => {
-                        if self.prefix.is_some_and(|p| !under_prefix(p, head, l2)) {
-                            self.done = true;
-                            return None;
-                        }
-                        return Some((Composite { head, tail: l2.as_slice() }.nibbles(), v));
-                    }
-                    None => self.branch = None,
-                }
-            }
-            match self.l1.next()? {
-                (p, Node::Leaf(v)) => {
-                    let head = p.as_slice();
-                    if self.prefix.is_some_and(|px| !under_prefix(px, head, &[])) {
-                        self.done = true;
-                        return None;
-                    }
-                    return Some((Composite { head, tail: &[] }.nibbles(), v));
-                }
-                (p, Node::Branch(b)) => {
-                    let head = p.as_slice();
-                    // Decide whether this branch carries matching keys, and the
-                    // level-2 lower bound (the tail floor for a boundary branch).
-                    let l2_lo: Bound<&[u8]> = match self.prefix {
-                        None => Bound::Unbounded,
-                        Some(px) => {
-                            let packed = px.packed();
-                            if packed.len() > HEAD_LEN {
-                                // Prefix reaches into the tail: only the node
-                                // `head == packed[..23]` qualifies; seek level-2
-                                // to the tail floor. Any other head is past it.
-                                if head == &packed[..HEAD_LEN] {
-                                    Bound::Included(&packed[HEAD_LEN..])
-                                } else {
-                                    self.done = true;
-                                    return None;
-                                }
-                            } else if under_prefix(px, head, &[]) {
-                                // Prefix lies within the head → whole branch matches.
-                                Bound::Unbounded
-                            } else {
-                                self.done = true;
-                                return None;
-                            }
-                        }
-                    };
-                    self.branch = Some((head, b.range::<[u8], _>((l2_lo, Bound::Unbounded))));
-                }
-            }
-        }
     }
 }
 
