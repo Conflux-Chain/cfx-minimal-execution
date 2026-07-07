@@ -15,12 +15,9 @@ smallvec = "2.0.0-alpha.12"
 itertools = "0.14"
 arbitrary = { version = "1.4", features = ["derive"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
-heed = { version = "0.20", optional = true }
-tempfile = { workspace = true, optional = true }
 
 [features]
 verify-incremental = []
-snapshot-lmdb = ["dep:heed", "dep:tempfile"]
 # Off-the-production-path instrumentation: the read-only memory survey used by
 # the `ckpt-mem-survey` diagnostic bin. Compiled out of default/production builds.
 mem-survey = []
