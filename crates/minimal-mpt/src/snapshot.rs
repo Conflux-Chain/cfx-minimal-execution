@@ -59,11 +59,6 @@ impl SnapshotTrie {
         self.inner.remove(key);
     }
 
-    #[cfg(feature = "mem-survey")]
-    pub(crate) fn memory_survey(&self) -> crate::incremental::MemorySurvey {
-        self.inner.memory_survey()
-    }
-
     pub(crate) fn apply_updates(&mut self, updates: Vec<(Vec<u8>, MptValue)>) {
         for (key, value) in updates {
             match value {

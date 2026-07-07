@@ -285,32 +285,6 @@ impl<V> Entries<V> {
         self.len
     }
 
-    /// Number of level-1 nodes (distinct 23-byte prefixes). If this ≈ total
-    /// entries, level-2 maps are ~singletons and the fill waste lives in level-1.
-    #[cfg(feature = "mem-survey")]
-    pub(crate) fn level1_len(&self) -> usize {
-        self.map.len()
-    }
-
-    /// Histogram of level-2 group sizes (1,2,3,4,5-8,9-16,17-32,33-64,65-256,
-    /// 257-1024,1025-4096,4097+). A leaf counts as size 1.
-    #[cfg(feature = "mem-survey")]
-    pub(crate) fn group_size_hist(&self) -> [u64; 12] {
-        let mut h = [0u64; 12];
-        for node in self.map.values() {
-            let s = match node {
-                Node::Leaf(_) => 1,
-                Node::Branch(b) => b.len(),
-            };
-            let idx = match s {
-                1 => 0, 2 => 1, 3 => 2, 4 => 3, 5..=8 => 4, 9..=16 => 5, 17..=32 => 6,
-                33..=64 => 7, 65..=256 => 8, 257..=1024 => 9, 1025..=4096 => 10, _ => 11,
-            };
-            h[idx] += 1;
-        }
-        h
-    }
-
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0

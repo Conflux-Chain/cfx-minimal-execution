@@ -258,14 +258,6 @@ impl NibblePrefix {
         }
     }
 
-    /// Borrow as a [`NibbleRef`] for the shared read ops. (Only the memory survey
-    /// reads a cache key back as a prefix; the hot walk uses [`NibbleRef`] end to
-    /// end and never round-trips through the owned key.)
-    #[cfg_attr(not(feature = "mem-survey"), allow(dead_code))]
-    #[inline]
-    pub(crate) fn as_ref(&self) -> NibbleRef<'_> {
-        NibbleRef(&self.buf)
-    }
 }
 
 // The cache can look up / evict by a borrowed `&[u8]` key (the walk's stack

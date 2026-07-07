@@ -18,9 +18,6 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 
 [features]
 verify-incremental = []
-# Off-the-production-path instrumentation: the read-only memory survey used by
-# the `ckpt-mem-survey` diagnostic bin. Compiled out of default/production builds.
-mem-survey = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
@@ -28,8 +25,3 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 [[bin]]
 name = "trace_standalone"
 path = "src/bin/trace_standalone.rs"
-
-[[bin]]
-name = "ckpt-mem-survey"
-path = "src/bin/ckpt-mem-survey.rs"
-required-features = ["mem-survey"]

@@ -298,13 +298,6 @@ impl State {
         }
     }
 
-    /// Read-only single-pass memory survey of the (dominant) snapshot trie —
-    /// for the memory-optimization study. See [`crate::MemorySurvey`].
-    #[cfg(feature = "mem-survey")]
-    pub fn memory_survey(&self) -> crate::MemorySurvey {
-        self.snapshot.memory_survey()
-    }
-
     pub fn put_intermediate_raw(&mut self, raw_key: Vec<u8>, value: MptValue) {
         self.intermediate.insert(raw_key, value);
         self.intermediate_root = trie_root(&self.intermediate);
