@@ -48,7 +48,6 @@
 //! always means "content unchanged since cached" — no per-node dirty check is
 //! needed during the walk.
 
-use crate::persist::wire::{read_len_prefixed, read_u64_le};
 use crate::entries::{Composite, Entries};
 use crate::nibbles::{
     empty_prefix_buf, pack_nibbles, push_nibble, NibblePrefix, NibbleRef, Nibbles,
@@ -58,7 +57,6 @@ use crate::primitives::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read};
 
 pub(crate) const PARALLEL_REBUILD_THRESHOLD: usize = 4096;
 
@@ -269,37 +267,14 @@ impl<V: TrieValue> IncrementalTrie<V> {
         }
     }
 
-    /// Stream a snapshot trie from a bincode-encoded
-    /// `BTreeMap<Vec<u8>, Box<[u8]>>` (`u64 count` then `count` × `(key, value)`
-    /// length-prefixed) without ever materializing an intermediate map: each
-    /// entry is inserted (canonical key, converted value) as it is read. Cache
-    /// starts empty; the first `root` recomputes it.
-    pub(crate) fn from_snapshot_reader(reader: &mut impl Read) -> io::Result<Self> {
-        let count = read_u64_le(reader)? as usize;
-        // On-disk keys are ascending, so build the store densely: read fixed-size
-        // sorted batches of `W` and hand each to `bulk_extend_sorted` (dense
-        // level-2 leaves) instead of monotonic per-entry `insert` (~half-full
-        // leaves). The reader stays oblivious to the two-level layout; peak
-        // transient is one batch. `W` is env-tunable for profiling.
-        let w = crate::diag::bulk_w();
-        let mut entries = Entries::new();
-        let mut batch: Vec<(Vec<u8>, V)> = Vec::with_capacity(w.min(count));
-        for _ in 0..count {
-            let key = read_len_prefixed(reader)?;
-            let value = read_len_prefixed(reader)?;
-            batch.push((key, V::from_value_bytes(&value)));
-            if batch.len() >= w {
-                entries.bulk_extend_sorted(std::mem::replace(&mut batch, Vec::with_capacity(w)));
-            }
-        }
-        if !batch.is_empty() {
-            entries.bulk_extend_sorted(batch);
-        }
-        Ok(Self {
-            entries,
-            cache: Cache::default(),
-            dirty: BTreeSet::new(),
-        })
+    /// Feed an **ascending, sorted** in-memory batch (keys all greater than any
+    /// already present) straight into the entry store — a dense level-2 build.
+    /// Pure memory: the checkpoint loader in [`crate::persist::stream`] reads
+    /// batches off disk and calls this, so the trie itself never touches a
+    /// reader. Cache/dirty are left untouched (empty on a fresh build; the first
+    /// `root` recomputes the cache).
+    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
+        self.entries.bulk_extend_sorted(batch);
     }
 
     /// Point lookup by canonical byte key (snapshot read path). Returns the live

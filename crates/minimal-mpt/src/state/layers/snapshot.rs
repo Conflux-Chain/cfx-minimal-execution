@@ -36,12 +36,22 @@ impl SnapshotTrie {
         }
     }
 
-    /// Stream the snapshot trie from a checkpoint reader, converting keys to
-    /// nibbles on the fly — no byte-keyed `BTreeMap` is ever built.
-    pub(crate) fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
-        Ok(Self {
-            inner: crate::incremental::IncrementalTrie::from_snapshot_reader(reader)?,
-        })
+    /// Bulk-feed an **ascending** batch of `(canonical key, value bytes)` whose
+    /// keys are all greater than any already present (dense level-2 build).
+    /// Values are converted to the snapshot's inline type. Pure memory: the
+    /// checkpoint loader in [`crate::persist::stream`] reads batches off disk and
+    /// calls this — the snapshot layer never touches a reader.
+    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, Vec<u8>)>) {
+        let converted: Vec<(Vec<u8>, SnapshotValue)> = batch
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    <SnapshotValue as crate::trie::TrieValue>::from_value_bytes(&v),
+                )
+            })
+            .collect();
+        self.inner.bulk_extend_sorted(converted);
     }
 
     pub(crate) fn insert(&mut self, key: &[u8], value: MptValue) {

@@ -10,7 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-mod layers;
+pub(crate) mod layers;
 mod prefix;
 mod rotation;
 
@@ -216,48 +216,30 @@ impl State {
         }
     }
 
-    /// Reconstruct a `State` by streaming the serialized `PersistedState`
-    /// fields directly from `reader`. The wire layout (field order + framing) is
-    /// defined once in [`crate::persist::format`] — this reader must follow it.
-    /// The snapshot is streamed into its backing store without ever materializing
-    /// the byte-keyed `BTreeMap`; the remaining (small) fields are read via
-    /// bincode. This is the load-side counterpart to `write_streaming`.
-    pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
-        let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
-        let timing = crate::diag::recover_timing();
-
-        // 1. snapshot — streamed straight into the snapshot store.
-        let t = std::time::Instant::now();
-        let mut snapshot_inc = SnapshotTrie::from_reader(reader)?;
-        if timing {
-            eprintln!(
-                "[recover] stream_read_snapshot entries={} elapsed={}ms",
-                snapshot_inc.len(),
-                t.elapsed().as_millis()
-            );
-        }
-        // 2-3. intermediate / delta — small, plain bincode.
-        let intermediate: BTreeMap<Vec<u8>, MptValue> =
-            bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        let delta: BTreeMap<Vec<u8>, MptValue> =
-            bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        // 4-8. scalar tail.
-        let intermediate_mpt_key_padding: [u8; 32] =
-            bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        let delta_mpt_key_padding: [u8; 32] =
-            bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        let height: u64 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        let snapshot_epoch_count: u32 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
-        let last_root: Option<CommitRoot> = bincode::deserialize_from(&mut *reader).map_err(bin)?;
-
-        let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
+    /// Construct a `State` from already-built layers, paddings and scalars
+    /// (pure memory — no I/O). The derived roots (`snapshot_root` via the
+    /// incremental snapshot root, `intermediate_root` via the stateless oracle)
+    /// and the incremental delta trie are computed here. This is the
+    /// reconstruction entry point used by [`crate::persist::stream::load_state`]
+    /// after it has streamed the on-disk sections into memory.
+    pub(crate) fn from_parts(
+        mut snapshot: SnapshotTrie,
+        intermediate: BTreeMap<Vec<u8>, MptValue>,
+        delta: BTreeMap<Vec<u8>, MptValue>,
+        intermediate_mpt_key_padding: [u8; 32],
+        delta_mpt_key_padding: [u8; 32],
+        height: u64,
+        snapshot_epoch_count: u32,
+        last_root: Option<CommitRoot>,
+    ) -> Self {
+        let snapshot_root = snapshot.root_with_policy(CachePolicy::SkipSingleton);
         let intermediate_root = trie_root(&intermediate);
         let intermediate_padding = DeltaMptKeyPadding(intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(delta_mpt_key_padding);
         let delta_inc = crate::incremental::IncrementalTrie::from_delta(&delta);
 
-        Ok(Self {
-            snapshot: snapshot_inc,
+        Self {
+            snapshot,
             intermediate,
             delta,
             snapshot_root,
@@ -274,44 +256,60 @@ impl State {
             delta_inc,
             delta_account_cache: Default::default(),
             intermediate_account_cache: Default::default(),
-        })
+        }
     }
 
-    /// Stream this state in the on-disk wire layout defined once in
-    /// [`crate::persist::format`] (field order + snapshot framing), which
-    /// `from_reader` consumes.
+    /// Reconstruct a `State` from a streamed checkpoint. Thin forwarder to
+    /// [`crate::persist::stream::load_state`], which owns the I/O; `State` itself
+    /// no longer reads. Kept for existing callers (`ckpt-bench`,
+    /// replay-checkpoint, tests).
+    pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        crate::persist::load_state(reader)
+    }
+
+    /// Stream this state to a checkpoint. Thin forwarder to
+    /// [`crate::persist::stream::save_state`], which owns the I/O; `State` itself
+    /// no longer writes. Kept for existing callers (`ckpt-bench`,
+    /// replay-checkpoint, tests).
     pub fn write_streaming(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        use crate::persist::wire::{write_len_prefixed, write_u64_le};
+        crate::persist::save_state(self, w)
+    }
 
-        let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+    // --- Pure-memory accessors used by `persist::stream` to stream each layer ---
 
-        let expected_entries = self.snapshot.live_entry_count();
-        write_u64_le(w, expected_entries as u64)?;
-        let mut entries_written = 0usize;
-        self.snapshot.for_each_canonical(|key, value| {
-            write_len_prefixed(w, &key)?;
-            write_len_prefixed(w, value)?;
-            entries_written += 1;
-            Ok(())
-        })?;
-        if entries_written != expected_entries {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "snapshot entry count changed during write: expected {expected_entries}, wrote {entries_written}"
-                ),
-            ));
-        }
+    /// Number of live (non-tombstone) snapshot entries — the count framed ahead
+    /// of the snapshot section on disk.
+    pub(crate) fn snapshot_live_entry_count(&self) -> usize {
+        self.snapshot.live_entry_count()
+    }
 
-        bincode::serialize_into(&mut *w, &self.intermediate).map_err(bin)?;
-        bincode::serialize_into(&mut *w, &self.delta).map_err(bin)?;
-        bincode::serialize_into(&mut *w, &self.intermediate_padding.0).map_err(bin)?;
-        bincode::serialize_into(&mut *w, &self.delta_padding.0).map_err(bin)?;
-        bincode::serialize_into(&mut *w, &self.height).map_err(bin)?;
-        bincode::serialize_into(&mut *w, &self.snapshot_epoch_count).map_err(bin)?;
-        bincode::serialize_into(&mut *w, &self.last_root).map_err(bin)?;
+    /// Visit each live snapshot entry as `(canonical key, value bytes)` in
+    /// ascending key order.
+    pub(crate) fn for_each_snapshot_entry(
+        &self,
+        f: impl FnMut(Vec<u8>, &[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.snapshot.for_each_canonical(f)
+    }
 
-        Ok(())
+    pub(crate) fn intermediate_entries(&self) -> &BTreeMap<Vec<u8>, MptValue> {
+        &self.intermediate
+    }
+
+    pub(crate) fn delta_entries(&self) -> &BTreeMap<Vec<u8>, MptValue> {
+        &self.delta
+    }
+
+    pub(crate) fn intermediate_padding_bytes(&self) -> [u8; 32] {
+        self.intermediate_padding.0
+    }
+
+    pub(crate) fn delta_padding_bytes(&self) -> [u8; 32] {
+        self.delta_padding.0
+    }
+
+    pub(crate) fn last_root(&self) -> &Option<CommitRoot> {
+        &self.last_root
     }
 
     pub fn persisted(&self) -> PersistedState {

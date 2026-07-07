@@ -1,5 +1,8 @@
 pub(crate) mod format;
+pub(crate) mod stream;
 pub(crate) mod wire;
+
+pub use stream::{load_state, save_state};
 
 use std::{fmt, io};
 
