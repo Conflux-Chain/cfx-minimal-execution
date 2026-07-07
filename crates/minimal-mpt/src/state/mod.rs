@@ -1,5 +1,6 @@
-use crate::state::layers::delta::DeltaLayer;
-use crate::state::layers::intermediate::IntermediateLayer;
+use crate::diag::profile;
+use crate::state::layers::delta::DeltaTrie;
+use crate::state::layers::intermediate::IntermediateTrie;
 use crate::state::layers::snapshot::SnapshotTrie;
 use crate::{
     keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
@@ -11,8 +12,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub(crate) mod layers;
 mod commit;
+pub(crate) mod layers;
 mod prefix;
 mod rotation;
 
@@ -49,12 +50,6 @@ impl CommitRoot {
     }
 }
 
-/// Env-gated (`MMPT_DELTA_TIMING=1`) accumulator for time spent in the
-/// incremental delta-root call, so a replay run can report real per-commit delta
-/// cost in isolation from the snapshot merge. Zero overhead when disabled.
-static DELTA_ROOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static DELTA_ROOT_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub trait StateTrait {
     fn get(&self, key: StorageKeyWithSpace) -> Result<Option<Box<[u8]>>>;
     fn set(&mut self, key: StorageKeyWithSpace, value: Box<[u8]>) -> Result<()>;
@@ -68,19 +63,19 @@ pub trait StateTrait {
 
 #[derive(Debug)]
 pub struct State {
-    /// The snapshot as a single `IncrementalTrie`: it serves snapshot reads and
+    /// The snapshot as a single two-level incremental trie: it serves snapshot reads and
     /// owns the persistent subtree-hash cache, so the boundary merge re-roots it
     /// incrementally **in place**. Read-only during a period; only
     /// `advance_after_commit` mutates it, at boundaries. No clone, no double
     /// buffer: the incremental root is cheap enough to do synchronously.
     snapshot: SnapshotTrie,
-    /// The frozen intermediate layer: a `FlatStore` plus its remembered
-    /// intermediate-delta root (see [`IntermediateLayer`]).
-    intermediate: IntermediateLayer,
-    /// The in-flight delta layer: a single `AuthenticatedTrie<FlatStore>` that is
+    /// The frozen intermediate trie: a `BTreeStore` plus its remembered
+    /// intermediate-delta root (see [`IntermediateTrie`]).
+    intermediate: IntermediateTrie,
+    /// The in-flight delta trie: a single `AuthenticatedTrie<BTreeStore>` that is
     /// *both* the point-read/prefix store and the incremental delta root — one
-    /// copy, not the old `BTreeMap` + `delta_inc` pair (see [`DeltaLayer`]).
-    delta: DeltaLayer,
+    /// copy, not the old `BTreeMap` + `delta_inc` pair (see [`DeltaTrie`]).
+    delta: DeltaTrie,
     snapshot_root: H256,
     intermediate_padding: DeltaMptKeyPadding,
     delta_padding: DeltaMptKeyPadding,
@@ -106,8 +101,8 @@ impl State {
     pub fn new() -> Self {
         Self {
             snapshot: SnapshotTrie::default(),
-            intermediate: IntermediateLayer::default(),
-            delta: DeltaLayer::default(),
+            intermediate: IntermediateTrie::default(),
+            delta: DeltaTrie::default(),
             snapshot_root: MERKLE_NULL_NODE,
             intermediate_padding: DeltaMptKeyPadding::genesis(),
             delta_padding: DeltaMptKeyPadding::genesis(),
@@ -139,62 +134,41 @@ impl State {
     }
 
     pub fn from_persisted(state: PersistedState) -> Self {
-        let recover_timing = crate::diag::recover_timing();
-        let recover_total = std::time::Instant::now();
+        let total = crate::diag::event("recover.from_persisted_total");
+
         let snapshot_entries = state.snapshot.len();
         let intermediate_entries = state.intermediate.len();
         let delta_entries = state.delta.len();
 
         let intermediate_map = state.intermediate;
         let delta_map = state.delta;
-        let t = std::time::Instant::now();
+
+        let t = crate::diag::event("recover.snapshot_build");
         let mut snapshot_inc = SnapshotTrie::from_snapshot(&state.snapshot);
-        if recover_timing {
-            eprintln!(
-                "[recover] snapshot_build entries={} elapsed={}ms",
-                snapshot_entries,
-                t.elapsed().as_millis()
-            );
-        }
-        let t = std::time::Instant::now();
+        t.finish(format_args!("entries={snapshot_entries}"));
+
+        let t = crate::diag::event("recover.snapshot_root");
         let snapshot_root = snapshot_inc.root();
-        if recover_timing {
-            eprintln!(
-                "[recover] snapshot_root entries={} elapsed={}ms",
-                snapshot_entries,
-                t.elapsed().as_millis()
-            );
-        }
-        let t = std::time::Instant::now();
+        t.finish(format_args!("entries={snapshot_entries}"));
+
+        let t = crate::diag::event("recover.intermediate_root");
         let intermediate_root = trie_root(&intermediate_map);
-        if recover_timing {
-            eprintln!(
-                "[recover] intermediate_root entries={} elapsed={}ms",
-                intermediate_entries,
-                t.elapsed().as_millis()
-            );
-        }
-        let intermediate = IntermediateLayer::from_map(&intermediate_map, intermediate_root);
+        t.finish(format_args!("entries={intermediate_entries}"));
+
+        let intermediate = IntermediateTrie::from_map(&intermediate_map, intermediate_root);
         let intermediate_padding = DeltaMptKeyPadding(state.intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(state.delta_mpt_key_padding);
+
         // Build the single delta store from the loaded delta (one flat pass; the
         // first `root` warms the cache).
-        let t = std::time::Instant::now();
-        let delta = DeltaLayer::from_map(&delta_map);
-        if recover_timing {
-            eprintln!(
-                "[recover] delta_build entries={} elapsed={}ms",
-                delta_entries,
-                t.elapsed().as_millis()
-            );
-            eprintln!(
-                "[recover] from_persisted_total snapshot={} intermediate={} delta={} elapsed={}ms",
-                snapshot_entries,
-                intermediate_entries,
-                delta_entries,
-                recover_total.elapsed().as_millis()
-            );
-        }
+        let t = crate::diag::event("recover.delta_build");
+        let delta = DeltaTrie::from_map(&delta_map);
+        t.finish(format_args!("entries={delta_entries}"));
+
+        total.finish(format_args!(
+            "snapshot={snapshot_entries} intermediate={intermediate_entries} delta={delta_entries}"
+        ));
+
         Self {
             snapshot: snapshot_inc,
             intermediate,
@@ -230,10 +204,20 @@ impl State {
         snapshot_epoch_count: u32,
         last_root: Option<CommitRoot>,
     ) -> Self {
+        let t = crate::diag::event("recover.snapshot_root");
         let snapshot_root = snapshot.root();
+        t.finish(format_args!("entries={}", snapshot.len()));
+
+        let t = crate::diag::event("recover.intermediate_root");
         let intermediate_root = trie_root(&intermediate);
-        let intermediate = IntermediateLayer::from_map(&intermediate, intermediate_root);
-        let delta = DeltaLayer::from_map(&delta);
+        t.finish(format_args!("entries={}", intermediate.len()));
+
+        let intermediate = IntermediateTrie::from_map(&intermediate, intermediate_root);
+
+        let t = crate::diag::event("recover.delta_build");
+        let delta = DeltaTrie::from_map(&delta);
+        t.finish(format_args!("entries={}", delta.len()));
+
         let intermediate_padding = DeltaMptKeyPadding(intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(delta_mpt_key_padding);
 
@@ -333,6 +317,8 @@ impl State {
 
 impl StateTrait for State {
     fn get(&self, key: StorageKeyWithSpace) -> Result<Option<Box<[u8]>>> {
+        let _t = profile::op(profile::Op::Read);
+
         let delta_key = {
             let mut cache = self.delta_account_cache.borrow_mut();
             key.to_delta_mpt_key_bytes(&self.delta_padding, Some(&mut *cache))?
@@ -347,10 +333,14 @@ impl StateTrait for State {
         if let Some(value) = self.intermediate.get(&intermediate_key) {
             return Ok(value.visible_value().map(Box::from));
         }
-        Ok(self.snapshot.snapshot_get_owned(&key.to_key_bytes()?))
+        let bytes = key.to_key_bytes()?;
+        let _s = profile::op(profile::Op::SnapGet);
+        Ok(self.snapshot.snapshot_get_owned(&bytes))
     }
 
     fn set(&mut self, key: StorageKeyWithSpace, value: Box<[u8]>) -> Result<()> {
+        let _t = profile::op(profile::Op::Write);
+
         let raw = key.to_delta_mpt_key_bytes(
             &self.delta_padding,
             Some(self.delta_account_cache.get_mut()),

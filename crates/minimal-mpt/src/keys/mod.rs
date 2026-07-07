@@ -7,8 +7,8 @@ mod account_cache;
 mod canonical;
 mod delta;
 
-pub use delta::DeltaMptKeyPadding;
 pub(crate) use account_cache::AccountKeyCache;
+pub use delta::DeltaMptKeyPadding;
 
 /// Key-codec sub-error: a storage key whose bytes could not be encoded or
 /// decoded (wrong length, unknown suffix/marker). Folded into the crate-root

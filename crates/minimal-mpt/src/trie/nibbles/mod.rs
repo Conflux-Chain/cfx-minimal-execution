@@ -13,21 +13,21 @@
 //!   even nibble sequence packed 2-per-byte *is exactly the original canonical
 //!   byte key*, and nibble-lexicographic order over even keys equals byte order.
 //!   So entry keys need no dedicated type at all: the map is keyed directly on
-//!   canonical bytes (`Box<[u8]>`), and [`Nibbles`] is a zero-cost borrowed view
+//!   canonical bytes (`Box<[u8]>`), and [`NibbleCursor`] is a zero-cost borrowed view
 //!   used only for the routing/compression reads.
 //!
 //! * **Routing prefixes / cache keys can land at an odd nibble depth.** Packing
 //!   an odd-length sequence leaves the last byte's low nibble unused — and a bare
 //!   byte buffer can't tell "trailing real 0 nibble" from "unused padding". So
-//!   [`NibblePrefix`] carries one **parity byte** to disambiguate (the buffer's
+//!   [`PrefixKey`] carries one **parity byte** to disambiguate (the buffer's
 //!   own length already gives the packed byte count, so a single byte suffices).
 //!   The cache is a `HashMap`, so this type needs only `Hash`/`Eq`, never `Ord`.
 
 mod prefix;
 
-pub(crate) use prefix::{empty_prefix_buf, pack_nibbles, push_nibble, NibblePrefix, NibbleRef};
+pub(crate) use prefix::{empty_prefix_buf, pack_nibbles, push_nibble, PrefixKey, PrefixRef};
 
-/// The byte backing of a [`Nibbles`] view: either one contiguous slice, or two
+/// The byte backing of a [`NibbleCursor`] view: either one contiguous slice, or two
 /// slices to be read as their concatenation. The two-level entries store keeps a
 /// key as `head` (shared prefix, ≤23 B) + `tail` (per-entry remainder), and this
 /// lets the nibble routing read that split key with no allocation.
@@ -54,13 +54,13 @@ impl Backing<'_> {
 /// nibbles `[start, end)`. Zero-cost: it holds the backing and two offsets. All
 /// the "split into nibbles / take a prefix" logic lives here.
 #[derive(Clone, Copy)]
-pub(crate) struct Nibbles<'a> {
+pub(crate) struct NibbleCursor<'a> {
     bytes: Backing<'a>,
     start: usize,
     end: usize,
 }
 
-impl<'a> Nibbles<'a> {
+impl<'a> NibbleCursor<'a> {
     /// View the full (even-length) nibble sequence of a canonical byte key.
     #[inline]
     pub(crate) fn from_bytes(bytes: &'a [u8]) -> Self {
@@ -99,20 +99,23 @@ impl<'a> Nibbles<'a> {
 
     /// Sub-view over logical nibbles `[a, b)` of this view.
     #[inline]
-    pub(crate) fn sub(&self, a: usize, b: usize) -> Nibbles<'a> {
+    pub(crate) fn sub(&self, a: usize, b: usize) -> NibbleCursor<'a> {
         debug_assert!(a <= b && self.start + b <= self.end);
-        Nibbles {
+        NibbleCursor {
             bytes: self.bytes,
             start: self.start + a,
             end: self.start + b,
         }
     }
 
-    /// Nibbles of this view from logical index `from` to the end, reading each
+    /// NibbleCursor of this view from logical index `from` to the end, reading each
     /// backing byte **once** (splitting it into its two nibbles) rather than
     /// re-dispatching through `byte_at` per nibble. The batch primitive the
     /// expansion/comparison helpers below build on.
-    pub(in crate::trie::nibbles) fn nibbles_from(self, from: usize) -> impl Iterator<Item = u8> + 'a {
+    pub(in crate::trie::nibbles) fn nibbles_from(
+        self,
+        from: usize,
+    ) -> impl Iterator<Item = u8> + 'a {
         let (s, e) = (self.start + from, self.end);
         (s / 2..e.div_ceil(2))
             .flat_map(move |bi| {
@@ -125,7 +128,7 @@ impl<'a> Nibbles<'a> {
 
     /// Number of nibbles `self` and `other` share starting at index `depth`
     /// (both compared from their own offset `depth`).
-    pub(crate) fn common_prefix_len_from(&self, other: &Nibbles<'_>, depth: usize) -> usize {
+    pub(crate) fn common_prefix_len_from(&self, other: &NibbleCursor<'_>, depth: usize) -> usize {
         self.nibbles_from(depth)
             .zip(other.nibbles_from(depth))
             .take_while(|(a, b)| a == b)
@@ -157,7 +160,7 @@ impl<'a> Nibbles<'a> {
     /// the same nibble sequence (same length, same nibbles), independent of
     /// backing buffer or offset. Not representation identity — the singleton-node
     /// check relies on this comparing the logical key, not the split.
-    pub(crate) fn logical_eq(&self, other: &Nibbles<'_>) -> bool {
+    pub(crate) fn logical_eq(&self, other: &NibbleCursor<'_>) -> bool {
         self.len() == other.len() && self.nibbles_from(0).eq(other.nibbles_from(0))
     }
 }
@@ -179,7 +182,7 @@ mod tests {
     #[test]
     fn nibble_view_matches_expansion() {
         let key = [0x12u8, 0xab, 0xff, 0x00];
-        let n = Nibbles::from_bytes(&key);
+        let n = NibbleCursor::from_bytes(&key);
         let exp = expand(&key);
         assert_eq!(n.len(), exp.len());
         for i in 0..n.len() {
@@ -212,13 +215,13 @@ mod tests {
                 }
                 b
             };
-            let view = Nibbles {
+            let view = NibbleCursor {
                 bytes: Backing::One(&bytes),
                 start: 0,
                 end: raw.len(),
             };
             let buf = pack_nibbles(view);
-            let p = NibbleRef::new(&buf);
+            let p = PrefixRef::new(&buf);
             assert_eq!(p.nibble_len(), raw.len(), "len for {raw:?}");
             let packed = p.packed();
             let back: Vec<u8> = (0..p.nibble_len())
@@ -254,25 +257,28 @@ mod tests {
                 }
                 b
             };
-            let expect = pack_nibbles(Nibbles {
+            let expect = pack_nibbles(NibbleCursor {
                 bytes: Backing::One(&bytes),
                 start: 0,
                 end: i + 1,
             });
             assert_eq!(buf, expect, "push mismatch at len {}", i + 1);
-            assert_eq!(NibbleRef::new(&buf).nibble_len(), i + 1);
+            assert_eq!(PrefixRef::new(&buf).nibble_len(), i + 1);
         }
     }
 
     #[test]
     fn as_canonical_key_even_only() {
-        let mut buf = pack_nibbles(Nibbles::from_bytes(&[0xab, 0xcd]));
-        assert_eq!(NibbleRef::new(&buf).as_canonical_key(), Some(&[0xab, 0xcd][..]));
+        let mut buf = pack_nibbles(NibbleCursor::from_bytes(&[0xab, 0xcd]));
+        assert_eq!(
+            PrefixRef::new(&buf).as_canonical_key(),
+            Some(&[0xab, 0xcd][..])
+        );
         push_nibble(&mut buf, 7);
-        assert_eq!(NibbleRef::new(&buf).as_canonical_key(), None);
+        assert_eq!(PrefixRef::new(&buf).as_canonical_key(), None);
         push_nibble(&mut buf, 9);
         assert_eq!(
-            NibbleRef::new(&buf).as_canonical_key(),
+            PrefixRef::new(&buf).as_canonical_key(),
             Some(&[0xab, 0xcd, 0x79][..])
         );
     }

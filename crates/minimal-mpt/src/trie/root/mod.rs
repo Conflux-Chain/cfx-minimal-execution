@@ -37,8 +37,8 @@
 //! nibbles per byte reproduces the canonical byte key exactly. The entries store
 //! is therefore keyed directly on canonical bytes — half the heap of the old
 //! one-nibble-per-byte form — and nibble-level routing goes through the zero-cost
-//! [`crate::nibbles::Nibbles`] view. Routing prefixes / cache keys can be odd
-//! length, so they use [`crate::nibbles::NibblePrefix`] (packed + a parity byte).
+//! [`crate::nibbles::NibbleCursor`] view. Routing prefixes / cache keys can be odd
+//! length, so they use [`crate::nibbles::PrefixKey`] (packed + a parity byte).
 //!
 //! ## Cache key and eviction
 //!

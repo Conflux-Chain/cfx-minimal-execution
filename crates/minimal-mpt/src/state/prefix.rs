@@ -6,6 +6,7 @@
 //! since the delta-mpt prefix is coarser than the address prefix.
 
 use super::{State, StateTrait};
+use crate::diag::profile;
 use crate::{
     keys::{StorageKey, StorageKeyWithSpace},
     primitives::MptKeyValue,
@@ -16,6 +17,8 @@ use std::collections::HashSet;
 
 impl State {
     pub(super) fn read_prefix(&self, prefix: StorageKeyWithSpace) -> Result<Vec<MptKeyValue>> {
+        let mut t = profile::op(profile::Op::Scan);
+
         let canonical_prefix = prefix.to_key_bytes()?;
         let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding, None)?;
         let intermediate_prefix =
@@ -25,7 +28,7 @@ impl State {
         let mut result = Vec::new();
         let mut seen = HashSet::new();
 
-        // Delta then intermediate: same (delta-mpt-padded, `FlatStore`-backed)
+        // Delta then intermediate: same (delta-mpt-padded, `BTreeStore`-backed)
         // representation, so one parameterized pass each with delta-over-
         // intermediate precedence (first layer to claim a canonical key wins).
         collect_layer_prefix(
@@ -47,6 +50,7 @@ impl State {
             }
         }
 
+        t.entries = result.len() as u64;
         Ok(result)
     }
 
@@ -54,6 +58,8 @@ impl State {
         &mut self,
         prefix: StorageKeyWithSpace,
     ) -> Result<Vec<MptKeyValue>> {
+        let mut t = profile::op(profile::Op::Scan);
+
         let canonical_prefix = prefix.to_key_bytes()?;
         let delta_prefix = prefix.to_delta_mpt_key_bytes(&self.delta_padding, None)?;
         let intermediate_prefix =
@@ -123,6 +129,7 @@ impl State {
             }
         }
 
+        t.entries = result.len() as u64;
         Ok(result)
     }
 }

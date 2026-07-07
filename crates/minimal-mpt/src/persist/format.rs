@@ -81,37 +81,28 @@ mod tests {
         // Variant 0 = Some(bytes): u32 tag `0` + u64 len + raw bytes.
         let cases: &[(MptValue, Vec<u8>)] = &[
             // Some([1, 2, 3])
-            (
-                MptValue::Some(Box::from([1u8, 2, 3])),
-                {
-                    let mut v = Vec::new();
-                    v.extend_from_slice(&0u32.to_le_bytes());
-                    v.extend_from_slice(&3u64.to_le_bytes());
-                    v.extend_from_slice(&[1u8, 2, 3]);
-                    v
-                },
-            ),
+            (MptValue::Some(Box::from([1u8, 2, 3])), {
+                let mut v = Vec::new();
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&3u64.to_le_bytes());
+                v.extend_from_slice(&[1u8, 2, 3]);
+                v
+            }),
             // Some([]) — present-but-empty is distinct from a tombstone.
-            (
-                MptValue::Some(Box::from([])),
-                {
-                    let mut v = Vec::new();
-                    v.extend_from_slice(&0u32.to_le_bytes());
-                    v.extend_from_slice(&0u64.to_le_bytes());
-                    v
-                },
-            ),
+            (MptValue::Some(Box::from([])), {
+                let mut v = Vec::new();
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&0u64.to_le_bytes());
+                v
+            }),
             // Some(0xff) — single high byte, guards against sign/width slips.
-            (
-                MptValue::Some(Box::from([0xffu8])),
-                {
-                    let mut v = Vec::new();
-                    v.extend_from_slice(&0u32.to_le_bytes());
-                    v.extend_from_slice(&1u64.to_le_bytes());
-                    v.push(0xff);
-                    v
-                },
-            ),
+            (MptValue::Some(Box::from([0xffu8])), {
+                let mut v = Vec::new();
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&1u64.to_le_bytes());
+                v.push(0xff);
+                v
+            }),
             // Variant 1 = Tombstone: u32 tag `1`, no payload.
             (MptValue::Tombstone, 1u32.to_le_bytes().to_vec()),
         ];
@@ -158,7 +149,10 @@ mod tests {
         state.set(key(3), Box::from([6u8, 7, 8])).unwrap(); // key(3) stays in delta
 
         let before = state.persisted();
-        assert!(!before.snapshot.is_empty(), "snapshot layer must be exercised");
+        assert!(
+            !before.snapshot.is_empty(),
+            "snapshot layer must be exercised"
+        );
         assert!(
             !before.intermediate.is_empty(),
             "intermediate layer must be exercised"

@@ -5,16 +5,18 @@
 //! lookup, prefix existence / endpoints, and a full ordered iteration. Capturing
 //! exactly those in [`TrieReader`] lets the traversal be generic over the store
 //! and — crucially — makes the engine side see only **merkle bytes**, never the
-//! stored value type `V`: every `V`-specific flattening (`TrieValue::merkle_value`)
-//! happens inside the impl, behind the trait.
+//! store's value type: each store flattens its own value (`MptValue` for the
+//! flat delta store, `SnapshotValue` for the two-level snapshot store) inside
+//! the impl, behind the trait.
 //!
-//! Routing **prefixes** stay the packed `[parity ++ packed]` [`NibbleRef`] view
-//! the walk builds on the stack (re-expressing them as [`Nibbles`] would force a
+//! Routing **prefixes** stay the packed `[parity ++ packed]` [`PrefixRef`] view
+//! the walk builds on the stack (re-expressing them as [`NibbleCursor`] would force a
 //! re-pack and defeat the store's zero-alloc range design); surfaced **keys**
-//! come back as a borrowed [`Nibbles`] view. The sole implementor today is the
-//! two-level store ([`super::store::two_level::Entries`]).
+//! come back as a borrowed [`NibbleCursor`] view. The implementors are the two-level
+//! snapshot store ([`super::store::two_level::TwoLevelStore`]) and the flat delta
+//! store ([`super::store::btree::BTreeStore`]).
 
-use crate::nibbles::{NibbleRef, Nibbles};
+use crate::nibbles::{NibbleCursor, PrefixRef};
 
 /// What the root/memo traversal needs from an entry store. Every method mirrors,
 /// byte-for-byte in semantics, the concrete store method it abstracts — this is
@@ -31,29 +33,29 @@ pub(crate) trait TrieReader {
     /// Merkle bytes of the value terminating **exactly** at `key`, or `None` if
     /// no key ends there (only an even / byte-aligned `key` can carry a value).
     /// A tombstone yields an empty slice — the stored value type never surfaces.
-    fn get_merkle(&self, key: NibbleRef) -> Option<&[u8]>;
+    fn get_merkle(&self, key: PrefixRef) -> Option<&[u8]>;
 
     /// Whether any stored key carries the nibble `prefix`.
-    fn prefix_exists(&self, prefix: NibbleRef) -> bool;
+    fn prefix_exists(&self, prefix: PrefixRef) -> bool;
 
     /// First (smallest) stored key carrying `prefix`, as a nibble view.
-    fn prefix_first(&self, prefix: NibbleRef) -> Option<Nibbles<'_>>;
+    fn prefix_first(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>>;
 
     /// Last (largest) stored key carrying `prefix`, as a nibble view.
-    fn prefix_last(&self, prefix: NibbleRef) -> Option<Nibbles<'_>>;
+    fn prefix_last(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>>;
 
     /// All entries in sorted key order as `(key nibbles, merkle bytes)`. The
     /// cold rebuild consumes this; the value type stays behind the trait.
-    fn iter_merkle(&self) -> impl Iterator<Item = (Nibbles<'_>, &[u8])>;
+    fn iter_merkle(&self) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])>;
 }
 
 /// The mutating side of an entry store, used by [`super::AuthenticatedTrie`] to
 /// keep store and [`super::root::RootEngine`] in lock-step ("a write marks
-/// dirty"). The stored value type is an associated type so the combinator can
-/// forward writes without the *engine* ever naming `V` — only the combinator
-/// (which owns both halves) does. Every method mirrors, byte-for-byte in
-/// semantics, the concrete store method it abstracts. The sole implementor today
-/// is the two-level store ([`super::store::two_level::Entries`]).
+/// dirty"). The stored value type is an associated type (each store pins its
+/// own: `SnapshotValue` for the two-level store, `MptValue` for the flat store)
+/// so the combinator can forward writes without the *engine* ever naming it.
+/// Every method mirrors, byte-for-byte in semantics, the concrete store method
+/// it abstracts.
 pub(crate) trait TrieStore: TrieReader {
     /// The stored value type.
     type Value;

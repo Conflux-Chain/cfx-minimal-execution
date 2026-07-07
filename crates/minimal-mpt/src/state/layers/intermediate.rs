@@ -1,6 +1,6 @@
 //! The intermediate layer.
 //!
-//! A FROZEN [`FlatStore`] plus the delta root it carried when it rotated down out
+//! A FROZEN [`BTreeStore`] plus the delta root it carried when it rotated down out
 //! of the delta position. Within a period the intermediate is read-only and never
 //! recomputes its root: the value is the delta root remembered from the last
 //! commit before rotation (or, at checkpoint load, computed once via the stateless
@@ -10,33 +10,33 @@
 
 use crate::primitives::{H256, MERKLE_NULL_NODE};
 use crate::trie::reader::TrieStore;
-use crate::trie::store::flat::FlatStore;
+use crate::trie::store::btree::BTreeStore;
 use crate::trie::MptValue;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
-pub(crate) struct IntermediateLayer {
-    store: FlatStore<MptValue>,
+pub(crate) struct IntermediateTrie {
+    store: BTreeStore,
     /// Remembered root — never recomputed (see module docs).
     root: H256,
 }
 
 /// Genesis intermediate: empty store, `MERKLE_NULL_NODE` root (NOT `H256::zero`,
 /// so a derived `Default` would be wrong here).
-impl Default for IntermediateLayer {
+impl Default for IntermediateTrie {
     fn default() -> Self {
         Self {
-            store: FlatStore::new(),
+            store: BTreeStore::new(),
             root: MERKLE_NULL_NODE,
         }
     }
 }
 
-impl IntermediateLayer {
+impl IntermediateTrie {
     /// Build from a persisted byte-keyed intermediate and its root (computed once
     /// via the stateless oracle by the caller — checkpoint load path).
     pub(crate) fn from_map(map: &BTreeMap<Vec<u8>, MptValue>, root: H256) -> Self {
-        let mut store = FlatStore::new();
+        let mut store = BTreeStore::new();
         for (k, v) in map {
             store.insert(k, v.clone());
         }
@@ -46,7 +46,7 @@ impl IntermediateLayer {
     /// Adopt a just-finished delta's store as-is and remember its delta root as
     /// this layer's frozen root (rotation path — no re-materialization, no
     /// re-hash).
-    pub(crate) fn from_store(store: FlatStore<MptValue>, root: H256) -> Self {
+    pub(crate) fn from_store(store: BTreeStore, root: H256) -> Self {
         Self { store, root }
     }
 
@@ -83,7 +83,7 @@ impl IntermediateLayer {
         self.store.to_value_map()
     }
 
-    /// Consume the layer, yielding each `(raw delta-mpt key, value)` in ascending
+    /// Consume the trie, yielding each `(raw delta-mpt key, value)` in ascending
     /// key order — the snapshot-absorb pass at a period boundary.
     pub(crate) fn into_entries(self) -> impl Iterator<Item = (Box<[u8]>, MptValue)> {
         self.store.into_entries().into_iter()

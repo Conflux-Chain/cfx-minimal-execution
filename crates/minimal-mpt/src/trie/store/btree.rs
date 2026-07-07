@@ -13,17 +13,18 @@
 //!
 //! This store is the delta layer's backing (a delta is small and hot, so the
 //! two-level prefix factoring buys nothing there): [`crate::state::layers::delta`]
-//! and [`crate::state::layers::intermediate`] are both `FlatStore<MptValue>`,
-//! collapsing the historical `State.delta` `BTreeMap` + `delta_inc` two-level
-//! duplicate into this one store.
+//! and [`crate::state::layers::intermediate`] are both [`BTreeStore`]s, collapsing
+//! the historical `State.delta` `BTreeMap` + `delta_inc` two-level duplicate into
+//! this one store. The value type is pinned to [`MptValue`] — the delta is the
+//! layer where tombstones are meaningful.
 //!
-//! Keys are surfaced to the walk as a [`Nibbles`] view over the stored byte key
-//! ([`Nibbles::from_bytes`]) — semantically identical to the two-level store's
+//! Keys are surfaced to the walk as a [`NibbleCursor`] view over the stored byte key
+//! ([`NibbleCursor::from_bytes`]) — semantically identical to the two-level store's
 //! `head ++ tail` composite view, since both express the same canonical key.
 
-use crate::nibbles::{NibbleRef, Nibbles};
+use crate::nibbles::{NibbleCursor, PrefixRef};
 use crate::trie::reader::{TrieReader, TrieStore};
-use crate::trie::TrieValue;
+use crate::trie::MptValue;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
@@ -74,35 +75,22 @@ fn anchor_ref(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
     }
 }
 
-/// A flat `BTreeMap` entry store: canonical byte key → value.
-pub(crate) struct FlatStore<V> {
-    map: BTreeMap<Box<[u8]>, V>,
+/// A flat `BTreeMap` entry store: canonical byte key → [`MptValue`].
+#[derive(Clone, Default)]
+pub(crate) struct BTreeStore {
+    map: BTreeMap<Box<[u8]>, MptValue>,
 }
 
-impl<V> Default for FlatStore<V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Manual Clone/Debug so callers don't need `V: Debug` (mirrors `Entries`).
-impl<V: Clone> Clone for FlatStore<V> {
-    fn clone(&self) -> Self {
-        Self {
-            map: self.map.clone(),
-        }
-    }
-}
-
-impl<V> std::fmt::Debug for FlatStore<V> {
+// Manual Debug: a summary (size), never the entries (mirrors `TwoLevelStore`).
+impl std::fmt::Debug for BTreeStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FlatStore")
+        f.debug_struct("BTreeStore")
             .field("len", &self.map.len())
             .finish()
     }
 }
 
-impl<V> FlatStore<V> {
+impl BTreeStore {
     pub(crate) fn new() -> Self {
         Self {
             map: BTreeMap::new(),
@@ -113,7 +101,7 @@ impl<V> FlatStore<V> {
     /// keys carrying nibble `prefix`. Keys are byte-aligned, so byte order equals
     /// nibble order and this range is exactly the prefix's key set — no per-key
     /// membership test needed.
-    fn prefix_bounds(prefix: NibbleRef<'_>) -> (Bound<&[u8]>, Bound<Vec<u8>>) {
+    fn prefix_bounds(prefix: PrefixRef<'_>) -> (Bound<&[u8]>, Bound<Vec<u8>>) {
         let lo = prefix.packed();
         let hi = prefix_upper(lo, prefix.is_even());
         (Bound::Included(lo), hi)
@@ -131,23 +119,23 @@ impl<V> FlatStore<V> {
 
     /// Point lookup by exact byte key.
     #[inline]
-    pub(crate) fn get(&self, key: &[u8]) -> Option<&V> {
+    pub(crate) fn get(&self, key: &[u8]) -> Option<&MptValue> {
         self.map.get(key)
     }
 
     /// The inner map, for direct (bincode) serialization of the layer — a
-    /// `BTreeMap<Box<[u8]>, V>` serializes byte-for-byte identically to the
-    /// historical `BTreeMap<Vec<u8>, V>` (same sort order, same `[u8]` seq
+    /// `BTreeMap<Box<[u8]>, MptValue>` serializes byte-for-byte identically to the
+    /// historical `BTreeMap<Vec<u8>, MptValue>` (same sort order, same `[u8]` seq
     /// encoding of each key), so the checkpoint bytes are unchanged.
     #[inline]
-    pub(crate) fn raw_entries(&self) -> &BTreeMap<Box<[u8]>, V> {
+    pub(crate) fn raw_entries(&self) -> &BTreeMap<Box<[u8]>, MptValue> {
         &self.map
     }
 
     /// Consume the store, yielding its inner map (used to MOVE a finished delta's
     /// store into the intermediate layer at rotation, with no re-materialization).
     #[inline]
-    pub(crate) fn into_entries(self) -> BTreeMap<Box<[u8]>, V> {
+    pub(crate) fn into_entries(self) -> BTreeMap<Box<[u8]>, MptValue> {
         self.map
     }
 
@@ -159,30 +147,31 @@ impl<V> FlatStore<V> {
     pub(crate) fn scan_byte_prefix<'a>(
         &'a self,
         prefix: &'a [u8],
-    ) -> impl Iterator<Item = (&'a [u8], &'a V)> {
+    ) -> impl Iterator<Item = (&'a [u8], &'a MptValue)> {
         self.map
             .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
             .take_while(move |(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (&k[..], v))
     }
 
-    /// Materialize a `BTreeMap<Vec<u8>, V>` copy of the store (for the checkpoint
-    /// `PersistedState` image and the `verify-incremental` oracle cross-check).
-    pub(crate) fn to_value_map(&self) -> BTreeMap<Vec<u8>, V>
-    where
-        V: Clone,
-    {
-        self.map.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect()
+    /// Materialize a `BTreeMap<Vec<u8>, MptValue>` copy of the store (for the
+    /// checkpoint `PersistedState` image and the `verify-incremental` oracle
+    /// cross-check).
+    pub(crate) fn to_value_map(&self) -> BTreeMap<Vec<u8>, MptValue> {
+        self.map
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.clone()))
+            .collect()
     }
 }
 
 /// The flat store as seen by the root/memo traversal. Every method has the same
 /// semantics as the two-level store's [`TrieReader`] impl — same nibble views,
 /// same merkle bytes, same prefix/singleton behaviour — which is what lets the
-/// engine produce identical roots regardless of backend. `V` is flattened to
-/// merkle bytes at the two `V`-touching points (`get_merkle`, `iter_merkle`), so
-/// the engine never names the value type.
-impl<V: TrieValue> TrieReader for FlatStore<V> {
+/// engine produce identical roots regardless of backend. The value is flattened
+/// to merkle bytes at the two value-touching points (`get_merkle`,
+/// `iter_merkle`), so the engine never names the value type.
+impl TrieReader for BTreeStore {
     #[inline]
     fn len(&self) -> usize {
         self.map.len()
@@ -193,13 +182,13 @@ impl<V: TrieValue> TrieReader for FlatStore<V> {
         self.map.is_empty()
     }
 
-    fn get_merkle(&self, key: NibbleRef) -> Option<&[u8]> {
+    fn get_merkle(&self, key: PrefixRef) -> Option<&[u8]> {
         key.as_canonical_key()
             .and_then(|ck| self.map.get(ck))
             .map(|v| v.merkle_value())
     }
 
-    fn prefix_exists(&self, prefix: NibbleRef) -> bool {
+    fn prefix_exists(&self, prefix: PrefixRef) -> bool {
         let (lo, hi) = Self::prefix_bounds(prefix);
         self.map
             .range::<[u8], _>((lo, anchor_ref(&hi)))
@@ -207,35 +196,35 @@ impl<V: TrieValue> TrieReader for FlatStore<V> {
             .is_some()
     }
 
-    fn prefix_first(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
+    fn prefix_first(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>> {
         let (lo, hi) = Self::prefix_bounds(prefix);
         self.map
             .range::<[u8], _>((lo, anchor_ref(&hi)))
             .next()
-            .map(|(k, _)| Nibbles::from_bytes(&k[..]))
+            .map(|(k, _)| NibbleCursor::from_bytes(&k[..]))
     }
 
-    fn prefix_last(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
+    fn prefix_last(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>> {
         let (lo, hi) = Self::prefix_bounds(prefix);
         self.map
             .range::<[u8], _>((lo, anchor_ref(&hi)))
             .next_back()
-            .map(|(k, _)| Nibbles::from_bytes(&k[..]))
+            .map(|(k, _)| NibbleCursor::from_bytes(&k[..]))
     }
 
-    fn iter_merkle(&self) -> impl Iterator<Item = (Nibbles<'_>, &[u8])> {
+    fn iter_merkle(&self) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])> {
         self.map
             .iter()
-            .map(|(k, v)| (Nibbles::from_bytes(&k[..]), v.merkle_value()))
+            .map(|(k, v)| (NibbleCursor::from_bytes(&k[..]), v.merkle_value()))
     }
 }
 
 /// The flat store's write side — a thin wrapper over the inner `BTreeMap`.
-impl<V: TrieValue> TrieStore for FlatStore<V> {
-    type Value = V;
+impl TrieStore for BTreeStore {
+    type Value = MptValue;
 
     #[inline]
-    fn insert(&mut self, key: &[u8], value: V) {
+    fn insert(&mut self, key: &[u8], value: MptValue) {
         self.map.insert(Box::from(key), value);
     }
 
@@ -250,7 +239,7 @@ impl<V: TrieValue> TrieStore for FlatStore<V> {
     }
 
     #[inline]
-    fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
+    fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, MptValue)>) {
         // The batch is ascending and disjoint from what's present, so a plain
         // extend inserts each key once (no reordering work for a `BTreeMap`).
         self.map
@@ -272,7 +261,7 @@ mod tests {
         }
     }
 
-    /// Drive an `AuthenticatedTrie<FlatStore<..>>` through a random insert/remove
+    /// Drive an `AuthenticatedTrie<BTreeStore>` through a random insert/remove
     /// op sequence and assert its incremental `root()` equals the from-scratch
     /// stateless `trie_root` oracle — mirroring the two-level store's oracle
     /// tests. Proves the flat backend computes correct roots through the engine.
@@ -285,7 +274,7 @@ mod tests {
         };
 
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        let mut trie = AuthenticatedTrie::<FlatStore<MptValue>>::default();
+        let mut trie = AuthenticatedTrie::<BTreeStore>::default();
 
         for op_i in 0..4000 {
             // Keys share prefixes to exercise path compression split/merge.
@@ -326,7 +315,7 @@ mod tests {
             (seed >> 33) as u32
         };
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        let mut trie = AuthenticatedTrie::<FlatStore<MptValue>>::default();
+        let mut trie = AuthenticatedTrie::<BTreeStore>::default();
         for op_i in 0..4000 {
             let klen = 1 + (next() % 5) as usize;
             let key: Vec<u8> = (0..klen).map(|_| (next() % 6) as u8).collect();
@@ -338,7 +327,11 @@ mod tests {
                 map.insert(key.clone(), val(v));
                 trie.insert(&key, val(v));
             }
-            assert_eq!(trie.root(), trie_root(&map), "diverged at op {op_i} key={key:?}");
+            assert_eq!(
+                trie.root(),
+                trie_root(&map),
+                "diverged at op {op_i} key={key:?}"
+            );
         }
     }
 
@@ -353,7 +346,7 @@ mod tests {
             (seed >> 24) as u8
         };
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        let mut trie = AuthenticatedTrie::<FlatStore<MptValue>>::default();
+        let mut trie = AuthenticatedTrie::<BTreeStore>::default();
         let account: Vec<u8> = (0..20).map(|_| next()).collect();
         for _ in 0..3000 {
             let mut key = account.clone();
@@ -368,6 +361,39 @@ mod tests {
             trie.insert(&key, v.clone());
             map.insert(key, v);
         }
+        assert_eq!(trie.root(), trie_root(&map));
+    }
+
+    /// Cold parallel-rebuild path (>= threshold entries, empty cache, >1 child at
+    /// the root — via `from_store`) with tombstones interleaved. Proves a terminal
+    /// tombstone still hashes as `Some(&[])` (the `b'v'` marker in
+    /// `compute_node_merkle`) — byte-identical to the stateless oracle. The
+    /// Some/None distinction is carried by key-presence (`find` on nibble
+    /// length), which the flattening to merkle bytes does not touch;
+    /// `merkle_value()` collapses tombstone and empty `Some` to the same `&[]`,
+    /// exactly as the oracle does.
+    #[test]
+    fn parallel_rebuild_with_tombstones_matches_oracle() {
+        use crate::trie::root::PARALLEL_REBUILD_THRESHOLD;
+        let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
+        let mut store = BTreeStore::new();
+        for i in 0u32..8000 {
+            let key = vec![(i & 0xff) as u8, (i >> 8) as u8, ((i >> 3) & 0xff) as u8];
+            // Every 5th entry is a tombstone (some become terminal-value nodes);
+            // one real entry is deliberately an empty value to exercise the
+            // tombstone-vs-empty-`Some` collapse.
+            let v = if i % 5 == 0 {
+                MptValue::Tombstone
+            } else if i % 5 == 1 {
+                MptValue::Some(Box::from([]))
+            } else {
+                MptValue::Some(Box::from([(i as u8) | 1]))
+            };
+            store.insert(&key, v.clone());
+            map.insert(key, v);
+        }
+        assert!(map.len() >= PARALLEL_REBUILD_THRESHOLD);
+        let mut trie = AuthenticatedTrie::from_store(store);
         assert_eq!(trie.root(), trie_root(&map));
     }
 }

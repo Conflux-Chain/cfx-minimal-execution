@@ -3,7 +3,7 @@
 // a BufReader straight over the file, exactly like `Checkpoint::load_streaming`
 // (NO `fs::read` of the whole file into RAM) — so the measured peak RSS is the
 // real resident state, not a benchmark artifact. Then re-serialises via
-// `write_streaming`. Run with MMPT_RECOVER_TIMING=1 for the per-phase breakdown.
+// `write_streaming`. Run with MMPT_TIMING=1 for the per-phase breakdown.
 //
 // Usage: ckpt-bench <ckpt.bin> [tmp_save_path]
 use cfx_minimal_mpt::State;
@@ -44,12 +44,18 @@ fn mbps(bytes: u64, secs: f64) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let ckpt = std::env::args().nth(1).expect("usage: ckpt-bench <ckpt.bin> [tmp]");
+    let ckpt = std::env::args()
+        .nth(1)
+        .expect("usage: ckpt-bench <ckpt.bin> [tmp]");
     let tmp = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "/tmp/mmpt_stream_bench.bin".to_string());
     let file_len = std::fs::metadata(&ckpt)?.len();
-    eprintln!("ckpt file: {} bytes  start RSS={:.1}GiB", file_len, rss_gib());
+    eprintln!(
+        "ckpt file: {} bytes  start RSS={:.1}GiB",
+        file_len,
+        rss_gib()
+    );
 
     // ---- STREAMING LOAD, production-style: BufReader straight over the file. ----
     // NO fs::read of the whole file — the only large resident object is the State.
@@ -61,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (_ver, _height): (u32, u64) = bincode::deserialize_from(&mut r)?;
     let prefix = r.n;
     let t = Instant::now();
-    let state = State::from_reader(&mut r)?; // [recover] stream_read + snapshot_hash + cache_extend under MMPT_RECOVER_TIMING
+    let state = State::from_reader(&mut r)?; // [mmpt] recover.* + rebuild.* events under MMPT_TIMING
     let load_secs = t.elapsed().as_secs_f64();
     let mmpt_bytes = r.n - prefix;
     drop(r); // release the BufReader

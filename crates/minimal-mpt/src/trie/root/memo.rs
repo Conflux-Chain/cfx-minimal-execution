@@ -8,7 +8,7 @@
 //! unchanged.
 
 use super::engine::{Cache, CachePolicy};
-use crate::nibbles::{pack_nibbles, push_nibble, NibblePrefix, NibbleRef};
+use crate::nibbles::{pack_nibbles, push_nibble, PrefixKey, PrefixRef};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
 use crate::trie::reader::TrieReader;
 use crate::trie::{compute_node_merkle, compute_path_merkle, CHILDREN};
@@ -25,7 +25,7 @@ use crate::trie::{compute_node_merkle, compute_path_merkle, CHILDREN};
 /// frontier, not the delta size. Serial only (the cache is `&mut`).
 pub(super) fn memo_node<S: TrieReader>(
     store: &S,
-    rp: NibbleRef,
+    rp: PrefixRef,
     allow_path_compression: bool,
     cache: &mut Cache,
     cache_policy: CachePolicy,
@@ -58,7 +58,7 @@ pub(super) fn memo_node<S: TrieReader>(
     let node_depth = depth + common;
     // The node's full routing prefix, built once on the stack.
     let full_buf = pack_nibbles(first.sub(0, node_depth));
-    let full = NibbleRef::new(&full_buf);
+    let full = PrefixRef::new(&full_buf);
 
     // A key ending exactly at this node can only be `full` itself (and only when
     // it lands on a byte boundary — see `as_canonical_key`). The store flattens
@@ -75,7 +75,7 @@ pub(super) fn memo_node<S: TrieReader>(
         if let Some(hash) = cache.get(&child_buf[..]) {
             return *hash;
         }
-        let child = NibbleRef::new(&child_buf);
+        let child = PrefixRef::new(&child_buf);
         if store.prefix_exists(child) {
             memo_node(store, child, true, cache, cache_policy)
         } else {
@@ -89,7 +89,7 @@ pub(super) fn memo_node<S: TrieReader>(
     let hash = compute_path_merkle(&path, depth, node_hash);
 
     if cache_policy == CachePolicy::Full || !is_singleton {
-        cache.insert(NibblePrefix::from_bytes(rp.as_bytes()), hash);
+        cache.insert(PrefixKey::from_bytes(rp.as_bytes()), hash);
     }
     hash
 }

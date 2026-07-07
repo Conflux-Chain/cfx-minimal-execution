@@ -3,7 +3,8 @@
 //! [`byte_successor`] / [`prefix_upper`]. Split out of `two_level/mod.rs`.
 
 use super::{under_prefix, Anchor, Composite, Level2Key, Node, Prefix23, HEAD_LEN};
-use crate::nibbles::{NibbleRef, Nibbles};
+use crate::nibbles::{NibbleCursor, PrefixRef};
+use crate::trie::SnapshotValue;
 use std::collections::btree_map;
 use std::ops::Bound;
 
@@ -49,15 +50,15 @@ pub(super) fn prefix_upper(packed: &[u8], even: bool) -> Bound<Anchor> {
 /// when `prefix` is `None`, every entry): walks level-1 nodes, expanding each
 /// branch's level-2 map in order, and stops at the first key past the prefix.
 /// The prefix is borrowed (`'b`); it materializes no byte bounds.
-pub(crate) struct PrefixRange<'a, 'b, V> {
-    pub(super) l1: btree_map::Range<'a, Prefix23, Node<V>>,
-    pub(super) branch: Option<(&'a [u8], btree_map::Range<'a, Level2Key, V>)>,
-    pub(super) prefix: Option<NibbleRef<'b>>,
+pub(crate) struct PrefixRange<'a, 'b> {
+    pub(super) l1: btree_map::Range<'a, Prefix23, Node>,
+    pub(super) branch: Option<(&'a [u8], btree_map::Range<'a, Level2Key, SnapshotValue>)>,
+    pub(super) prefix: Option<PrefixRef<'b>>,
     pub(super) done: bool,
 }
 
-impl<'a, 'b, V> Iterator for PrefixRange<'a, 'b, V> {
-    type Item = (Nibbles<'a>, &'a V);
+impl<'a> Iterator for PrefixRange<'a, '_> {
+    type Item = (NibbleCursor<'a>, &'a SnapshotValue);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -72,7 +73,14 @@ impl<'a, 'b, V> Iterator for PrefixRange<'a, 'b, V> {
                             self.done = true;
                             return None;
                         }
-                        return Some((Composite { head, tail: l2.as_slice() }.nibbles(), v));
+                        return Some((
+                            Composite {
+                                head,
+                                tail: l2.as_slice(),
+                            }
+                            .nibbles(),
+                            v,
+                        ));
                     }
                     None => self.branch = None,
                 }

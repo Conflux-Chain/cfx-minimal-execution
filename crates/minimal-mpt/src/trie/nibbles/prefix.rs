@@ -1,11 +1,11 @@
 //! Routing-prefix representations built on the packed nibble layout.
 //!
-//! Split out of `nibbles/mod.rs`: the borrowed [`NibbleRef`] read view, the owned
-//! [`NibblePrefix`] cache key, the stack [`PrefixBuf`], and the `[parity ++ packed]`
+//! Split out of `nibbles/mod.rs`: the borrowed [`PrefixRef`] read view, the owned
+//! [`PrefixKey`] cache key, the stack [`PrefixBuf`], and the `[parity ++ packed]`
 //! construction/mutation helpers ([`pack_nibbles`], [`empty_prefix_buf`],
-//! [`push_nibble`]). `Nibbles` itself stays in the parent module.
+//! [`push_nibble`]). `NibbleCursor` itself stays in the parent module.
 
-use super::Nibbles;
+use super::NibbleCursor;
 use smallvec::SmallVec;
 use std::borrow::Borrow;
 
@@ -13,27 +13,27 @@ use std::borrow::Borrow;
 /// `parity` is `0` for an even nibble count and `1` for odd, so it resolves the
 /// trailing half-byte ambiguity of the packed pairs (an odd prefix's last byte
 /// holds the final nibble in its high half, `0` in its low). Two representations
-/// share this layout — [`NibblePrefix`] owns it (`Box<[u8]>`, the cache key) and
+/// share this layout — [`PrefixKey`] owns it (`Box<[u8]>`, the cache key) and
 /// [`PrefixBuf`] holds it on the stack (the transient key built during the walk)
-/// — and **all the read ops live on the borrowed [`NibbleRef`]** so both use them
+/// — and **all the read ops live on the borrowed [`PrefixRef`]** so both use them
 /// without copying.
 pub(crate) type PrefixBuf = SmallVec<u8, 64>;
 
 /// A borrowed `[parity ++ packed]` prefix. `Copy`; carries every read op.
 #[derive(Clone, Copy)]
-pub(crate) struct NibbleRef<'a>(&'a [u8]);
+pub(crate) struct PrefixRef<'a>(&'a [u8]);
 
-impl<'a> NibbleRef<'a> {
+impl<'a> PrefixRef<'a> {
     /// View borrowed `[parity ++ packed]` bytes as a prefix.
     #[inline]
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        NibbleRef(bytes)
+        PrefixRef(bytes)
     }
 
     /// The empty prefix (the trie root): parity `0`, no packed bytes.
     #[inline]
     pub(crate) fn empty() -> Self {
-        NibbleRef(&[0u8])
+        PrefixRef(&[0u8])
     }
 
     /// The `[parity ++ packed]` bytes — the cache-lookup key (`get`/`remove`).
@@ -73,7 +73,7 @@ impl<'a> NibbleRef<'a> {
 /// A fresh stack [`PrefixBuf`] holding a nibble view in `[parity ++ packed]`
 /// layout (padding a trailing lone nibble with `0`). No per-nibble `at`:
 /// `nibbles_from` reads each backing byte once, `tuples` pairs the stream.
-pub(crate) fn pack_nibbles(n: Nibbles<'_>) -> PrefixBuf {
+pub(crate) fn pack_nibbles(n: NibbleCursor<'_>) -> PrefixBuf {
     use itertools::Itertools;
     let l = n.len();
     std::iter::once((l % 2) as u8)
@@ -110,15 +110,15 @@ pub(crate) fn push_nibble(buf: &mut PrefixBuf, c: u8) {
 }
 
 /// An owned `[parity ++ packed]` prefix: the routing-cache key. Kept owned only
-/// as a map key; every read goes through [`NibblePrefix::as_ref`] → [`NibbleRef`],
+/// as a map key; every read goes through [`PrefixKey::as_ref`] → [`PrefixRef`],
 /// and lookups borrow it as `&[u8]` (see the [`Borrow`] impl) so the walk never
 /// constructs one just to `get`/`remove`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct NibblePrefix {
+pub(crate) struct PrefixKey {
     buf: Box<[u8]>,
 }
 
-impl NibblePrefix {
+impl PrefixKey {
     /// Own a `[parity ++ packed]` byte layout (e.g. a transient [`PrefixBuf`]) as
     /// a cache key — the only place the walk allocates a prefix, on `insert`.
     #[inline]
@@ -127,14 +127,13 @@ impl NibblePrefix {
             buf: Box::from(bytes),
         }
     }
-
 }
 
 // The cache can look up / evict by a borrowed `&[u8]` key (the walk's stack
-// `PrefixBuf`) instead of an owned `NibblePrefix`. Sound because the derived
+// `PrefixBuf`) instead of an owned `PrefixKey`. Sound because the derived
 // `Hash`/`Eq` act on `buf`, matching `<[u8]>`'s (a `Box<[u8]>` hashes as its
 // slice), so `hash(&self) == hash(self.borrow())`.
-impl Borrow<[u8]> for NibblePrefix {
+impl Borrow<[u8]> for PrefixKey {
     #[inline]
     fn borrow(&self) -> &[u8] {
         &self.buf

@@ -1,11 +1,11 @@
 //! The delta layer.
 //!
 //! The in-flight period's writes live here as a single
-//! `AuthenticatedTrie<FlatStore<MptValue>>` (`Full` cache policy). This is the one
+//! `AuthenticatedTrie<BTreeStore>` (`Full` cache policy). This is the one
 //! source of truth for the delta: the point-read / prefix store and the
 //! incremental delta root are the *same* structure, so there is no second copy.
 //! It replaces the historical pair of `State.delta` (a byte-keyed `BTreeMap`) and
-//! `delta_inc` (a two-level `IncrementalTrie` holding a redundant copy of the same
+//! `delta_inc` (a two-level incremental trie holding a redundant copy of the same
 //! entries alongside the cached subtree hashes) — collapsing P1's double storage.
 //!
 //! Keys are the delta-mpt-padded canonical keys, exactly as the old `State.delta`
@@ -14,21 +14,24 @@
 
 use crate::primitives::H256;
 use crate::trie::reader::TrieStore;
-use crate::trie::store::flat::FlatStore;
+use crate::trie::store::btree::BTreeStore;
 use crate::trie::{AuthenticatedTrie, MptValue};
 use std::collections::BTreeMap;
 
+/// `pub` only for the `incremental_trie` differential fuzz (re-exported under
+/// `#[cfg(fuzzing)]` in `lib.rs`, alongside [`super::snapshot::SnapshotTrie`]);
+/// the enclosing modules are crate-private, so nothing leaks from a normal build.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct DeltaLayer {
-    trie: AuthenticatedTrie<FlatStore<MptValue>>,
+pub struct DeltaTrie {
+    trie: AuthenticatedTrie<BTreeStore>,
 }
 
-impl DeltaLayer {
-    /// Build a delta layer from a persisted byte-keyed delta (checkpoint load).
+impl DeltaTrie {
+    /// Build a delta trie from a persisted byte-keyed delta (checkpoint load).
     /// The store is populated directly (no per-key dirty marking); the first
     /// `root` does a full recompute that warms the cache.
     pub(crate) fn from_map(map: &BTreeMap<Vec<u8>, MptValue>) -> Self {
-        let mut store = FlatStore::new();
+        let mut store = BTreeStore::new();
         for (k, v) in map {
             store.insert(k, v.clone());
         }
@@ -38,12 +41,12 @@ impl DeltaLayer {
     }
 
     /// Insert / overwrite `key` (delta-mpt-padded), marking the subtree dirty.
-    pub(crate) fn insert(&mut self, key: &[u8], value: MptValue) {
+    pub fn insert(&mut self, key: &[u8], value: MptValue) {
         self.trie.insert(key, value);
     }
 
     /// Remove `key`, marking the subtree dirty.
-    pub(crate) fn remove(&mut self, key: &[u8]) {
+    pub fn remove(&mut self, key: &[u8]) {
         self.trie.remove(key);
     }
 
@@ -53,7 +56,7 @@ impl DeltaLayer {
     }
 
     /// Incremental delta root (reuses cached hashes for unchanged subtrees).
-    pub(crate) fn root(&mut self) -> H256 {
+    pub fn root(&mut self) -> H256 {
         self.trie.root()
     }
 
@@ -81,10 +84,10 @@ impl DeltaLayer {
         self.trie.store().to_value_map()
     }
 
-    /// Consume the layer, yielding its store — MOVED into the intermediate layer
+    /// Consume the trie, yielding its store — MOVED into the intermediate trie
     /// at a period boundary with no re-materialization (the cache/dirty engine is
     /// dropped; the intermediate remembers the delta root instead).
-    pub(crate) fn into_store(self) -> FlatStore<MptValue> {
+    pub(crate) fn into_store(self) -> BTreeStore {
         self.trie.into_store()
     }
 }

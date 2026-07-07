@@ -59,7 +59,6 @@ pub fn load_state(reader: &mut impl Read) -> io::Result<State> {
     use crate::persist::wire::{read_len_prefixed, read_u64_le};
 
     let bin = |e: bincode::Error| io::Error::new(io::ErrorKind::InvalidData, e);
-    let timing = crate::diag::recover_timing();
 
     // 1. snapshot — read batch-by-batch and bulk-fed into the snapshot store.
     // On-disk keys are ascending, so build the store densely: read fixed-size
@@ -67,7 +66,7 @@ pub fn load_state(reader: &mut impl Read) -> io::Result<State> {
     // (dense level-2 leaves) instead of monotonic per-entry `insert` (~half-full
     // leaves). The snapshot store stays oblivious to the reader; peak transient
     // is one batch. `W` is env-tunable for profiling.
-    let t = std::time::Instant::now();
+    let t = crate::diag::event("recover.stream_read_snapshot");
     let count = read_u64_le(reader)? as usize;
     let w = crate::diag::bulk_w();
     let mut snapshot = SnapshotTrie::default();
@@ -83,13 +82,7 @@ pub fn load_state(reader: &mut impl Read) -> io::Result<State> {
     if !batch.is_empty() {
         snapshot.bulk_extend_sorted(batch);
     }
-    if timing {
-        eprintln!(
-            "[recover] stream_read_snapshot entries={} elapsed={}ms",
-            snapshot.len(),
-            t.elapsed().as_millis()
-        );
-    }
+    t.finish(format_args!("entries={}", snapshot.len()));
 
     // 2-3. intermediate / delta — small, plain bincode.
     let intermediate: BTreeMap<Vec<u8>, MptValue> =
@@ -99,8 +92,7 @@ pub fn load_state(reader: &mut impl Read) -> io::Result<State> {
     // 4-8. scalar tail.
     let intermediate_mpt_key_padding: [u8; 32] =
         bincode::deserialize_from(&mut *reader).map_err(bin)?;
-    let delta_mpt_key_padding: [u8; 32] =
-        bincode::deserialize_from(&mut *reader).map_err(bin)?;
+    let delta_mpt_key_padding: [u8; 32] = bincode::deserialize_from(&mut *reader).map_err(bin)?;
     let height: u64 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
     let snapshot_epoch_count: u32 = bincode::deserialize_from(&mut *reader).map_err(bin)?;
     let last_root: Option<CommitRoot> = bincode::deserialize_from(&mut *reader).map_err(bin)?;

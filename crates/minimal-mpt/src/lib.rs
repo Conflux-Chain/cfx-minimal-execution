@@ -9,7 +9,6 @@ mod trie;
 use std::{fmt, io};
 
 pub(crate) use trie::nibbles;
-pub(crate) use trie::store::two_level as entries;
 
 pub use keys::{DeltaMptKeyPadding, StorageKey, StorageKeyWithSpace};
 pub use persist::format::PersistedState;
@@ -18,17 +17,18 @@ pub use primitives::{Space, H256, MERKLE_NULL_NODE};
 pub use state::{CommitRoot, State, StateTrait};
 pub use trie::MptValue;
 
-// The fuzz targets drive the trie directly. `IncrementalTrie` is a value-clean
-// newtype over the generic combinator, so its public methods surface no
-// crate-internal store/trait types — the normal public API is unchanged.
+// The `incremental_trie` differential fuzz drives the two production layer
+// wrappers — `SnapshotTrie` (two-level store, `SkipSingleton` policy) and
+// `DeltaTrie` (BTree store, `Full` policy) — through the same op sequence and
+// asserts both match the stateless oracle. The types are `pub` in crate-private
+// modules, so these re-exports exist only under `fuzzing`; the normal public
+// API is unchanged.
+#[cfg(fuzzing)]
+pub use state::layers::delta::DeltaTrie;
+#[cfg(fuzzing)]
+pub use state::layers::snapshot::SnapshotTrie;
 #[cfg(fuzzing)]
 pub use trie::trie_root;
-#[cfg(fuzzing)]
-pub use trie::IncrementalTrie;
-// Flat-backed trie: the differential fuzz drives it alongside `IncrementalTrie`
-// to prove the engine is store-independent (same root over either backend).
-#[cfg(fuzzing)]
-pub use trie::FlatTrie;
 // `MptKeyValue` (the `(key, value)` pair the prefix-scan APIs yield) is named only
 // by the `layered_state_ops` fuzz harness. The `StateTrait` methods that return it
 // stay callable off the public tuple type; downstream crates use their own alias.

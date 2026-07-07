@@ -10,7 +10,7 @@
 //!   byte). The length byte as the least-significant field makes the derived
 //!   `Ord` match slice-lexicographic order exactly (a shorter key sorts before
 //!   its extensions), so the map iterates in true key order.
-//! * A level-1 value is either a **`Leaf(V)`** — for keys ≤22 bytes, which end
+//! * A level-1 value is either a **`Leaf`** — for keys ≤22 bytes, which end
 //!   inside the 23-byte prefix — or a **`Branch`**: a second `BTreeMap` keyed by
 //!   the key *remainder* (`key[23..]`) as a `SmallVec<u8, 40>` (48 B, inline up
 //!   to 40 B — covers the 33/34-byte tails of the dominant keys with no heap
@@ -18,20 +18,25 @@
 //!   ≤22 B can never collide with a 23-byte branch head), so the wrong-variant
 //!   arms are `unreachable`.
 //!
+//! This store backs the **snapshot** layer only (the delta layers use the flat
+//! store), so its value type is pinned to the snapshot's tombstone-free inline
+//! [`SnapshotValue`].
+//!
 //! Flattened (level 1 in order, each branch's level 2 in order) this yields the
-//! exact same sorted `(full key, V)` sequence as a flat `BTreeMap<Box<[u8]>, V>`,
-//! but without the per-entry prefix duplication or per-key heap allocation.
-//! Keys are surfaced to the trie walk as a [`Nibbles`] view over the internal
-//! `head` + `tail` slices (see `Composite`) via [`Nibbles::from_composite`] —
+//! exact same sorted `(full key, value)` sequence as a flat
+//! `BTreeMap<Box<[u8]>, SnapshotValue>`, but without the per-entry prefix
+//! duplication or per-key heap allocation.
+//! Keys are surfaced to the trie walk as a [`NibbleCursor`] view over the internal
+//! `head` + `tail` slices (see `Composite`) via [`NibbleCursor::from_composite`] —
 //! never reassembled into one buffer, and the split representation never escapes
 //! this module.
 
 mod prefix23;
 mod range;
 
-use crate::nibbles::{NibbleRef, Nibbles};
+use crate::nibbles::{NibbleCursor, PrefixRef};
 use crate::trie::reader::{TrieReader, TrieStore};
-use crate::trie::TrieValue;
+use crate::trie::SnapshotValue;
 use prefix23::{Composite, Node, Prefix23};
 use range::{byte_successor, prefix_upper, PrefixRange};
 use smallvec::SmallVec;
@@ -85,7 +90,7 @@ fn composite_byte(head: &[u8], tail: &[u8], i: usize) -> u8 {
 /// **Zero-alloc**: matched directly against the packed prefix bytes + parity —
 /// no byte bound materialized, no key reassembled. This is the membership
 /// predicate that drives every forward prefix scan.
-fn under_prefix(prefix: NibbleRef, head: &[u8], tail: &[u8]) -> bool {
+fn under_prefix(prefix: PrefixRef, head: &[u8], tail: &[u8]) -> bool {
     let qp = prefix.packed();
     if qp.is_empty() {
         return true; // the empty prefix carries every key
@@ -121,47 +126,24 @@ fn anchor_ref(b: &Bound<Anchor>) -> Bound<&[u8]> {
     }
 }
 
-/// The [`Entries`] store: a level-1 `BTreeMap` of [`Prefix23`] → [`Node`].
-pub(crate) struct Entries<V> {
-    map: BTreeMap<Prefix23, Node<V>>,
+/// The [`TwoLevelStore`] store: a level-1 `BTreeMap` of [`Prefix23`] → [`Node`].
+#[derive(Clone, Default)]
+pub(crate) struct TwoLevelStore {
+    map: BTreeMap<Prefix23, Node>,
     len: usize,
 }
 
-impl<V> Default for Entries<V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Manual Clone/Debug so callers don't need `V: Debug` etc. beyond what the trie
-// already requires (the trie derives Clone/Debug on `IncrementalTrie<V>`).
-impl<V: Clone> Clone for Entries<V> {
-    fn clone(&self) -> Self {
-        let map = self
-            .map
-            .iter()
-            .map(|(k, node)| {
-                let node = match node {
-                    Node::Leaf(v) => Node::Leaf(v.clone()),
-                    Node::Branch(b) => Node::Branch(b.clone()),
-                };
-                (*k, node)
-            })
-            .collect();
-        Self { map, len: self.len }
-    }
-}
-
-impl<V> std::fmt::Debug for Entries<V> {
+// Manual Debug: a summary (sizes), never the millions of entries.
+impl std::fmt::Debug for TwoLevelStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Entries")
+        f.debug_struct("TwoLevelStore")
             .field("len", &self.len)
             .field("level1_nodes", &self.map.len())
             .finish()
     }
 }
 
-impl<V> Entries<V> {
+impl TwoLevelStore {
     pub(crate) fn new() -> Self {
         Self {
             map: BTreeMap::new(),
@@ -170,9 +152,8 @@ impl<V> Entries<V> {
     }
 
     // Inherent `len`/`is_empty`: the trie/engine reach these through the
-    // `TrieReader` impl below (which needs `V: TrieValue`); the inherent forms
-    // stay for tests over non-`TrieValue` stores (e.g. `Entries<u32>`), so they
-    // read dead in the lib build alone.
+    // `TrieReader` impl below; the inherent forms are used only by the tests in
+    // this module, so they read dead in the lib build alone.
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
@@ -193,9 +174,13 @@ impl<V> Entries<V> {
         self.len = 0;
     }
 
-    pub(crate) fn insert(&mut self, key: &[u8], value: V) {
+    pub(crate) fn insert(&mut self, key: &[u8], value: SnapshotValue) {
         if key.len() <= LEAF_MAX {
-            if self.map.insert(Prefix23::new(key), Node::Leaf(value)).is_none() {
+            if self
+                .map
+                .insert(Prefix23::new(key), Node::Leaf(value))
+                .is_none()
+            {
                 self.len += 1;
             }
         } else {
@@ -222,7 +207,7 @@ impl<V> Entries<V> {
     /// batch is `append`-merged into its existing level-2. Level-1 stays plain
     /// `insert` (its fill isn't the bottleneck — 99.9% of groups are singletons).
     /// Larger batches split fewer big-contract runs → denser level-2.
-    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
+    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, SnapshotValue)>) {
         use itertools::Itertools;
         let runs = batch.into_iter().chunk_by(|(k, _)| prefix23_of(k));
         for (prefix, run) in &runs {
@@ -233,8 +218,7 @@ impl<V> Entries<V> {
                     self.len += 1;
                 }
             } else {
-                // LLM: 为什么这里 collect 成 BTreeMap，而不是 or_insert_with 之后，根据类型 collect？
-                let mut chunk: BTreeMap<Level2Key, V> =
+                let mut chunk: BTreeMap<Level2Key, SnapshotValue> =
                     run.map(|(k, v)| (level2_key(&k[HEAD_LEN..]), v)).collect();
                 self.len += chunk.len();
                 match self
@@ -265,7 +249,7 @@ impl<V> Entries<V> {
         }
     }
 
-    pub(crate) fn get(&self, key: &[u8]) -> Option<&V> {
+    pub(crate) fn get(&self, key: &[u8]) -> Option<&SnapshotValue> {
         if key.len() <= LEAF_MAX {
             match self.map.get(key)? {
                 Node::Leaf(v) => Some(v),
@@ -281,18 +265,17 @@ impl<V> Entries<V> {
 
     /// Forward iterator over all entries carrying nibble `prefix`, in sorted key
     /// order. **Zero-alloc**: seeks to the prefix's borrowed lower bound
-    /// ([`NibblePrefix::packed`]) and stops at the first key that no longer
+    /// ([`PrefixKey::packed`]) and stops at the first key that no longer
     /// carries the prefix ([`under_prefix`]) — no `(lo, hi)` byte pair is ever
     /// materialized (contrast the old `key_bounds` → `range` path, which
     /// heap-allocated the bounds on every call, 16×/node in the trie walk).
-    pub(crate) fn prefix_range<'a, 'b>(
-        &'a self,
-        prefix: NibbleRef<'b>,
-    ) -> PrefixRange<'a, 'b, V> {
+    pub(crate) fn prefix_range<'a, 'b>(&'a self, prefix: PrefixRef<'b>) -> PrefixRange<'a, 'b> {
         let lo = prefix.packed();
         let l1_lo = &lo[..lo.len().min(HEAD_LEN)];
         PrefixRange {
-            l1: self.map.range::<[u8], _>((Bound::Included(l1_lo), Bound::Unbounded)),
+            l1: self
+                .map
+                .range::<[u8], _>((Bound::Included(l1_lo), Bound::Unbounded)),
             branch: None,
             prefix: Some(prefix),
             done: false,
@@ -300,25 +283,27 @@ impl<V> Entries<V> {
     }
 
     /// Full iterator over all entries in sorted key order.
-    pub(crate) fn iter(&self) -> PrefixRange<'_, 'static, V> {
+    pub(crate) fn iter(&self) -> PrefixRange<'_, 'static> {
         PrefixRange {
-            l1: self.map.range::<[u8], _>((Bound::Included(&[][..]), Bound::Unbounded)),
+            l1: self
+                .map
+                .range::<[u8], _>((Bound::Included(&[][..]), Bound::Unbounded)),
             branch: None,
             prefix: None,
             done: false,
         }
     }
 
-    /// First key carrying `prefix`, or `None` if none, as a [`Nibbles`] view.
+    /// First key carrying `prefix`, or `None` if none, as a [`NibbleCursor`] view.
     /// Zero-alloc.
-    pub(crate) fn prefix_first(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
+    pub(crate) fn prefix_first(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>> {
         self.prefix_range(prefix).next().map(|(n, _)| n)
     }
 
     /// Whether any key carries `prefix`. The trie walk's per-child existence
     /// probe (16×/node), so it does the **least** work: one level-1 seek, and
     /// only for a tail-reaching prefix does it also probe level 2. Zero-alloc.
-    pub(crate) fn prefix_exists(&self, prefix: NibbleRef) -> bool {
+    pub(crate) fn prefix_exists(&self, prefix: PrefixRef) -> bool {
         let packed = prefix.packed();
         let l1_lo = &packed[..packed.len().min(HEAD_LEN)];
         let Some((p, node)) = self
@@ -358,7 +343,7 @@ impl<V> Entries<V> {
     /// no `(lo, hi)` byte pair. Bounded by the prefix's ceiling, so `next_back`
     /// starts just below it: `O(log n)` per level, never a scan from the map's
     /// global maximum.
-    pub(crate) fn prefix_last(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
+    pub(crate) fn prefix_last(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>> {
         let packed = prefix.packed();
         let l1_lo = &packed[..packed.len().min(HEAD_LEN)];
         // A prefix reaching past the 23-byte head pins a single level-1 node
@@ -388,13 +373,17 @@ impl<V> Entries<V> {
                 let tail_hi = prefix_upper(tail_lo, prefix.is_even());
                 b.range::<[u8], _>((Bound::Included(tail_lo), anchor_ref(&tail_hi)))
                     .next_back()
-                    .map(|(l2, _)| Composite { head, tail: l2.as_slice() })
+                    .map(|(l2, _)| Composite {
+                        head,
+                        tail: l2.as_slice(),
+                    })
             }
             Node::Branch(b) => {
                 // Whole branch is under the prefix → its largest tail wins.
-                b.iter()
-                    .next_back()
-                    .map(|(l2, _)| Composite { head, tail: l2.as_slice() })
+                b.iter().next_back().map(|(l2, _)| Composite {
+                    head,
+                    tail: l2.as_slice(),
+                })
             }
         };
         last.map(|c| c.nibbles())
@@ -402,10 +391,11 @@ impl<V> Entries<V> {
 }
 
 /// The two-level store as seen by the root/memo traversal: each method forwards
-/// to the inherent method it abstracts, flattening `V` to merkle bytes at the
-/// two `V`-touching points (`get_merkle`, `iter_merkle`) so the engine never
-/// names the value type. Requires `V: TrieValue` for that flattening.
-impl<V: TrieValue> TrieReader for Entries<V> {
+/// to the inherent method it abstracts, flattening the value to merkle bytes at
+/// the two value-touching points (`get_merkle`, `iter_merkle`) so the engine
+/// never names the value type. A [`SnapshotValue`]'s merkle bytes are simply its
+/// bytes (it is always live — no tombstone variant).
+impl TrieReader for TwoLevelStore {
     #[inline]
     fn len(&self) -> usize {
         self.len
@@ -416,37 +406,37 @@ impl<V: TrieValue> TrieReader for Entries<V> {
         self.len == 0
     }
 
-    fn get_merkle(&self, key: NibbleRef) -> Option<&[u8]> {
+    fn get_merkle(&self, key: PrefixRef) -> Option<&[u8]> {
         key.as_canonical_key()
             .and_then(|ck| self.get(ck))
-            .map(|v| v.merkle_value())
+            .map(|v| v.as_slice())
     }
 
-    fn prefix_exists(&self, prefix: NibbleRef) -> bool {
-        Entries::prefix_exists(self, prefix)
+    fn prefix_exists(&self, prefix: PrefixRef) -> bool {
+        TwoLevelStore::prefix_exists(self, prefix)
     }
 
-    fn prefix_first(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
-        Entries::prefix_first(self, prefix)
+    fn prefix_first(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>> {
+        TwoLevelStore::prefix_first(self, prefix)
     }
 
-    fn prefix_last(&self, prefix: NibbleRef) -> Option<Nibbles<'_>> {
-        Entries::prefix_last(self, prefix)
+    fn prefix_last(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>> {
+        TwoLevelStore::prefix_last(self, prefix)
     }
 
-    fn iter_merkle(&self) -> impl Iterator<Item = (Nibbles<'_>, &[u8])> {
-        self.iter().map(|(n, v)| (n, v.merkle_value()))
+    fn iter_merkle(&self) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])> {
+        self.iter().map(|(n, v)| (n, v.as_slice()))
     }
 }
 
 /// The two-level store's write side: each method forwards to the inherent method
 /// it abstracts (inherent methods win name resolution, so `self.insert(..)` calls
 /// the concrete one, not this trait method).
-impl<V: TrieValue> TrieStore for Entries<V> {
-    type Value = V;
+impl TrieStore for TwoLevelStore {
+    type Value = SnapshotValue;
 
     #[inline]
-    fn insert(&mut self, key: &[u8], value: V) {
+    fn insert(&mut self, key: &[u8], value: SnapshotValue) {
         self.insert(key, value);
     }
 
@@ -461,7 +451,7 @@ impl<V: TrieValue> TrieStore for Entries<V> {
     }
 
     #[inline]
-    fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
+    fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, SnapshotValue)>) {
         self.bulk_extend_sorted(batch);
     }
 }
@@ -469,6 +459,12 @@ impl<V: TrieValue> TrieStore for Entries<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trie::snapshot_value;
+
+    /// A small distinct test value from a `u32` tag.
+    fn sv(x: u32) -> SnapshotValue {
+        snapshot_value(&x.to_le_bytes())
+    }
 
     /// `bulk_extend_sorted` (dense build) must produce a store byte-identical to
     /// repeated `insert`, for every batch size `W` — including tiny W that splits
@@ -498,24 +494,31 @@ mod tests {
         }
         keys.sort();
         keys.dedup();
-        let kv: Vec<(Vec<u8>, u32)> =
-            keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
+        let kv: Vec<(Vec<u8>, SnapshotValue)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), sv(i as u32)))
+            .collect();
 
-        let mut via_insert: Entries<u32> = Entries::new();
+        let mut via_insert = TwoLevelStore::new();
         for (k, v) in &kv {
-            via_insert.insert(k, *v);
+            via_insert.insert(k, v.clone());
         }
-        let want: Vec<(Vec<u8>, u32)> =
-            via_insert.iter().map(|(n, v)| (n.to_canonical_bytes(), *v)).collect();
+        let want: Vec<(Vec<u8>, SnapshotValue)> = via_insert
+            .iter()
+            .map(|(n, v)| (n.to_canonical_bytes(), v.clone()))
+            .collect();
 
         for w in [1usize, 3, 1023, 6001, kv.len()] {
-            let mut via_bulk: Entries<u32> = Entries::new();
+            let mut via_bulk = TwoLevelStore::new();
             for chunk in kv.chunks(w) {
                 via_bulk.bulk_extend_sorted(chunk.to_vec());
             }
             assert_eq!(via_bulk.len(), via_insert.len(), "len mismatch at W={w}");
-            let got: Vec<(Vec<u8>, u32)> =
-                via_bulk.iter().map(|(n, v)| (n.to_canonical_bytes(), *v)).collect();
+            let got: Vec<(Vec<u8>, SnapshotValue)> = via_bulk
+                .iter()
+                .map(|(n, v)| (n.to_canonical_bytes(), v.clone()))
+                .collect();
             assert_eq!(got, want, "iteration mismatch at W={w}");
         }
     }
@@ -530,8 +533,8 @@ mod tests {
             (seed >> 33) as u32
         };
 
-        let mut oracle: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-        let mut ent: Entries<u32> = Entries::new();
+        let mut oracle: BTreeMap<Vec<u8>, SnapshotValue> = BTreeMap::new();
+        let mut ent = TwoLevelStore::new();
 
         // Insert/overwrite/remove a mix of short (leaf) and long (branch) keys,
         // with shared prefixes to populate branches.
@@ -551,8 +554,8 @@ mod tests {
                     ent.remove(&key);
                 }
                 _ => {
-                    let v = next();
-                    oracle.insert(key.clone(), v);
+                    let v = sv(next());
+                    oracle.insert(key.clone(), v.clone());
                     ent.insert(&key, v);
                 }
             }
@@ -566,11 +569,12 @@ mod tests {
         assert_eq!(ent.get(&[0xff, 0xff, 0xff]), None);
 
         // full iteration order + values
-        let got: Vec<(Vec<u8>, u32)> = ent
+        let got: Vec<(Vec<u8>, SnapshotValue)> = ent
             .iter()
-            .map(|(n, v)| (n.to_canonical_bytes(), *v))
+            .map(|(n, v)| (n.to_canonical_bytes(), v.clone()))
             .collect();
-        let want: Vec<(Vec<u8>, u32)> = oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let want: Vec<(Vec<u8>, SnapshotValue)> =
+            oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(got, want, "iteration");
 
         // prefix_first / prefix_last / prefix_exists / prefix_range for EVERY
@@ -585,11 +589,16 @@ mod tests {
             v
         };
         let sample_keys: Vec<Vec<u8>> = oracle.keys().cloned().collect();
-        for probe in sample_keys.iter().step_by(37).chain(std::iter::once(&shared)) {
+        for probe in sample_keys
+            .iter()
+            .step_by(37)
+            .chain(std::iter::once(&shared))
+        {
             let pnib = expand(probe);
             for nlen in 0..=pnib.len() {
-                let buf = crate::nibbles::pack_nibbles(Nibbles::from_bytes(probe).sub(0, nlen));
-                let prefix = NibbleRef::new(&buf);
+                let buf =
+                    crate::nibbles::pack_nibbles(NibbleCursor::from_bytes(probe).sub(0, nlen));
+                let prefix = PrefixRef::new(&buf);
                 // Oracle: keys whose nibble expansion carries `pnib[..nlen]`,
                 // already in byte-sorted order (BTreeMap iteration).
                 let want: Vec<&Vec<u8>> = oracle

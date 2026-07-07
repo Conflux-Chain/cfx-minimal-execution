@@ -6,10 +6,11 @@
 //! only place the snapshot trie mutates.
 
 use super::State;
+use crate::diag::profile;
 use crate::{
     keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
     primitives::H256,
-    state::layers::intermediate::IntermediateLayer,
+    state::layers::intermediate::IntermediateTrie,
     Result,
 };
 
@@ -26,29 +27,24 @@ impl State {
         // no background thread: the incremental root is cheap enough (~tens of
         // ms) to fold straight into the boundary. `take` empties intermediate so
         // the snapshot can be mutated without aliasing it.
-        let timing = crate::diag::merge_timing();
-        let t0 = std::time::Instant::now();
+        let mut m = profile::op(profile::Op::Merge);
+
+        let t = crate::diag::event("merge.apply");
         let old_intermediate = std::mem::take(&mut self.intermediate);
+        m.entries = old_intermediate.len() as u64;
         let mut snapshot_updates = Vec::with_capacity(old_intermediate.len());
         for (raw_key, value) in old_intermediate.into_entries() {
             let canonical = StorageKeyWithSpace::from_delta_mpt_key(&raw_key)?.to_key_bytes()?;
             snapshot_updates.push((canonical, value));
         }
         self.snapshot.apply_updates(snapshot_updates);
-        let apply_ms = t0.elapsed().as_millis();
-        let t1 = std::time::Instant::now();
+        t.finish(format_args!("h={} entries={}", self.height, m.entries));
+
+        let t = crate::diag::event("merge.hash");
         self.snapshot_root = self.snapshot.root();
-        let hash_ms = t1.elapsed().as_millis();
-        if timing {
-            eprintln!(
-                "[merge] h={} N={} apply={}ms hash={}ms merge_total={}ms",
-                self.height,
-                self.snapshot.len(),
-                apply_ms,
-                hash_ms,
-                apply_ms + hash_ms,
-            );
-        }
+        t.finish(format_args!("h={} N={}", self.height, self.snapshot.len()));
+
+        drop(m);
 
         // Rotate: the just-finished delta becomes the new intermediate. Its store
         // is MOVED in as-is (no re-materialization) and the remembered delta root
@@ -56,7 +52,7 @@ impl State {
         // engine — the padding below changes the key space, so the old cached delta
         // subtree hashes could not apply anyway).
         let finished_delta = std::mem::take(&mut self.delta);
-        self.intermediate = IntermediateLayer::from_store(finished_delta.into_store(), delta_root);
+        self.intermediate = IntermediateTrie::from_store(finished_delta.into_store(), delta_root);
         self.intermediate_padding = self.delta_padding.clone();
         self.delta_padding =
             DeltaMptKeyPadding::from_roots(self.snapshot_root, self.intermediate.root());

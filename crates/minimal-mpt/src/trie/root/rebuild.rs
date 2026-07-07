@@ -7,25 +7,26 @@
 
 use super::engine::CachePolicy;
 use super::PARALLEL_REBUILD_THRESHOLD;
-use crate::nibbles::{pack_nibbles, push_nibble, NibblePrefix, NibbleRef, Nibbles};
+use crate::nibbles::{pack_nibbles, push_nibble, NibbleCursor, PrefixKey, PrefixRef};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
 use crate::trie::{compute_node_merkle, compute_path_merkle, CHILDREN};
 use rayon::prelude::*;
 
-/// One entry fed to the cold [`memo_node_rebuild`]: the key as a [`Nibbles`] view
+/// One entry fed to the cold [`memo_node_rebuild`]: the key as a [`NibbleCursor`] view
 /// (surfaced by the store) plus its precomputed **merkle bytes** (empty for a
-/// tombstone). The rebuild only ever needs the merkle bytes, so callers flatten
-/// `TrieValue::merkle_value` up front — keeping the rebuild independent of the
-/// value type. All nibble routing goes through the [`Nibbles`] view.
+/// tombstone). The rebuild only ever needs the merkle bytes, so the store's
+/// [`TrieReader`](crate::trie::reader::TrieReader) impl flattens its value type
+/// up front — keeping the rebuild independent of it. All nibble routing goes
+/// through the [`NibbleCursor`] view.
 #[derive(Clone, Copy)]
 pub(super) struct EntryRef<'a> {
-    pub(super) key: Nibbles<'a>,
+    pub(super) key: NibbleCursor<'a>,
     pub(super) value: &'a [u8],
 }
 
 impl<'a> EntryRef<'a> {
     #[inline]
-    fn nibbles(&self) -> Nibbles<'a> {
+    fn nibbles(&self) -> NibbleCursor<'a> {
         self.key
     }
     #[inline]
@@ -42,10 +43,10 @@ impl<'a> EntryRef<'a> {
 /// hash map once after all parallel work joins.
 pub(super) fn memo_node_rebuild(
     entries: &[EntryRef<'_>],
-    rp: NibbleRef,
+    rp: PrefixRef,
     allow_path_compression: bool,
     cache_policy: CachePolicy,
-) -> (H256, Vec<(NibblePrefix, H256)>) {
+) -> (H256, Vec<(PrefixKey, H256)>) {
     debug_assert!(!entries.is_empty());
 
     let depth = rp.nibble_len();
@@ -70,8 +71,12 @@ pub(super) fn memo_node_rebuild(
     let recurse = |&(child, start, end): &(usize, usize, usize)| {
         let mut child_buf = full_buf.clone();
         push_nibble(&mut child_buf, child as u8);
-        let (hash, cache_entries) =
-            memo_node_rebuild(&entries[start..end], NibbleRef::new(&child_buf), true, cache_policy);
+        let (hash, cache_entries) = memo_node_rebuild(
+            &entries[start..end],
+            PrefixRef::new(&child_buf),
+            true,
+            cache_policy,
+        );
         (child, hash, cache_entries)
     };
 
@@ -81,7 +86,7 @@ pub(super) fn memo_node_rebuild(
     // oversized subtrees — e.g. a large-storage contract — spread across cores.
     // Nested par_iter is fine: rayon work-steals over the shared pool.
     let ranges = child_ranges(entries, node_depth);
-    let results: Vec<(usize, H256, Vec<(NibblePrefix, H256)>)> =
+    let results: Vec<(usize, H256, Vec<(PrefixKey, H256)>)> =
         if entries.len() >= PARALLEL_REBUILD_THRESHOLD && ranges.len() > 1 {
             ranges.par_iter().map(&recurse).collect()
         } else {
@@ -101,13 +106,13 @@ pub(super) fn memo_node_rebuild(
     let hash = compute_path_merkle(&path, depth, node_hash);
 
     if cache_policy == CachePolicy::Full || !is_singleton {
-        cache_entries.push((NibblePrefix::from_bytes(rp.as_bytes()), hash));
+        cache_entries.push((PrefixKey::from_bytes(rp.as_bytes()), hash));
     }
     (hash, cache_entries)
 }
 
 /// Partition a sorted node block into `(child nibble, start, end)` runs, one per
-/// child subtree. Entries whose nibble length equals `node_depth` carry no child
+/// child subtree. TwoLevelStore whose nibble length equals `node_depth` carry no child
 /// nibble and are dropped; the rest — being sorted — group into contiguous runs
 /// sharing their `node_depth`-th nibble.
 fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usize, usize)> {
@@ -115,7 +120,8 @@ fn child_ranges(entries: &[EntryRef<'_>], node_depth: usize) -> Vec<(usize, usiz
         .iter()
         .enumerate()
         .filter_map(|(idx, entry)| {
-            (node_depth < entry.nibble_len()).then(|| (idx, entry.nibbles().at(node_depth) as usize))
+            (node_depth < entry.nibble_len())
+                .then(|| (idx, entry.nibbles().at(node_depth) as usize))
         })
         .fold(Vec::new(), |mut ranges, (idx, child)| {
             match ranges.last_mut() {

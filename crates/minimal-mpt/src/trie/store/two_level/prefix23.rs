@@ -3,7 +3,8 @@
 //! all three stay two_level-internal (`pub(super)`), never named outside the store.
 
 use super::{Level2Key, HEAD_LEN};
-use crate::nibbles::Nibbles;
+use crate::nibbles::NibbleCursor;
+use crate::trie::SnapshotValue;
 use std::collections::BTreeMap;
 
 /// A level-1 key: up to [`HEAD_LEN`] key bytes plus their length. The length as
@@ -54,15 +55,16 @@ impl PartialEq<[u8]> for Prefix23 {
     }
 }
 
-pub(super) enum Node<V> {
-    Leaf(V),
-    Branch(BTreeMap<Level2Key, V>),
+#[derive(Clone)]
+pub(super) enum Node {
+    Leaf(SnapshotValue),
+    Branch(BTreeMap<Level2Key, SnapshotValue>),
 }
 
 /// A key held internally as `head ++ tail`, without reassembly. For a leaf `tail`
 /// is empty; for a branch entry `head` is the 23-byte prefix and `tail` the
 /// remainder. This is a **two_level-private** representation: the store hands the
-/// key back to the trie walk as a [`Nibbles`] view (via [`Composite::nibbles`]),
+/// key back to the trie walk as a [`NibbleCursor`] view (via [`Composite::nibbles`]),
 /// so no caller outside this module ever names it.
 #[derive(Clone, Copy)]
 pub(super) struct Composite<'a> {
@@ -73,7 +75,7 @@ pub(super) struct Composite<'a> {
 impl<'a> Composite<'a> {
     /// The nibble view of this split key — the store's only key-surfacing form.
     #[inline]
-    pub(super) fn nibbles(&self) -> Nibbles<'a> {
-        Nibbles::from_composite(self.head, self.tail)
+    pub(super) fn nibbles(&self) -> NibbleCursor<'a> {
+        NibbleCursor::from_composite(self.head, self.tail)
     }
 }

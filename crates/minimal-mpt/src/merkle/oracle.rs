@@ -1,6 +1,6 @@
 use crate::merkle::rules::{compute_node_merkle, compute_path_merkle, CHILDREN};
-use crate::trie::MptValue;
 use crate::primitives::{H256, MERKLE_NULL_NODE};
+use crate::trie::MptValue;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
@@ -56,14 +56,16 @@ fn merkle_for_node(
     }
 
     let merkle_for_child = |&(child, start, end): &(usize, usize, usize)| {
-        (child, merkle_for_node(&entries[start..end], node_depth + 1, true, true))
+        (
+            child,
+            merkle_for_node(&entries[start..end], node_depth + 1, true, true),
+        )
     };
-    let child_hashes: Vec<_> =
-        if parallel && entries.len() >= PARALLEL_HASH_THRESHOLD {
-            ranges.par_iter().map(merkle_for_child).collect()
-        } else {
-            ranges.iter().map(merkle_for_child).collect()
-        };
+    let child_hashes: Vec<_> = if parallel && entries.len() >= PARALLEL_HASH_THRESHOLD {
+        ranges.par_iter().map(merkle_for_child).collect()
+    } else {
+        ranges.iter().map(merkle_for_child).collect()
+    };
 
     let mut children: [H256; CHILDREN] = [MERKLE_NULL_NODE; CHILDREN];
     for (child, hash) in child_hashes {
@@ -76,7 +78,7 @@ fn merkle_for_node(
 }
 
 fn common_prefix_len(entries: &[(Vec<u8>, &MptValue)], depth: usize) -> usize {
-    // Entries are sorted, so the common prefix equals that of the endpoints.
+    // TwoLevelStore are sorted, so the common prefix equals that of the endpoints.
     match entries {
         [(first, _), .., (last, _)] => first
             .iter()

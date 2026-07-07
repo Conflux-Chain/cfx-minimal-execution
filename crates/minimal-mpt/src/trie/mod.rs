@@ -4,18 +4,19 @@ pub(crate) mod root;
 pub(crate) mod store;
 mod value;
 
-pub use value::{MptValue, TrieValue};
+pub use value::MptValue;
+pub(crate) use value::{snapshot_value, SnapshotValue};
 
 pub use crate::merkle::oracle::trie_root;
 #[cfg(feature = "verify-incremental")]
 pub(crate) use crate::merkle::oracle::{bytes_to_nibbles, root_for_entries};
 pub(crate) use crate::merkle::rules::{compute_node_merkle, compute_path_merkle, keccak, CHILDREN};
 
-use crate::entries::Entries;
 use crate::primitives::H256;
 use reader::TrieStore;
 use root::{CachePolicy, RootEngine};
 use std::collections::BTreeMap;
+use store::two_level::TwoLevelStore;
 
 /// A store composed with an incremental [`RootEngine`], fixing the invariant that
 /// **every write marks the engine dirty**: `insert` / `remove` update both the
@@ -23,11 +24,13 @@ use std::collections::BTreeMap;
 /// subtrees. The engine's [`CachePolicy`] is fixed when the trie is built (delta
 /// layers use `Full`, the snapshot uses `SkipSingleton`); it never varies per
 /// call. The engine sees the store only through [`TrieReader`] (merkle bytes), so
-/// it never names the value type `V`.
+/// it never names the store's value type.
 ///
-/// Generic over the store `S` (the sole store today is the two-level
-/// [`Entries`]); the public [`IncrementalTrie`] newtype pins `S` and keeps the
-/// store/trait bounds out of the crate's public surface.
+/// Generic over the store `S`: the two-level snapshot [`TwoLevelStore`] or the flat
+/// delta [`store::btree::BTreeStore`]. The state layers pin `S` — the snapshot
+/// layer wraps `AuthenticatedTrie<TwoLevelStore>`, the delta layer
+/// `AuthenticatedTrie<BTreeStore>` — and only their value-clean wrappers cross
+/// the crate's public (fuzzing) surface.
 ///
 /// [`RootEngine`]: root::RootEngine
 /// [`TrieReader`]: reader::TrieReader
@@ -78,7 +81,7 @@ impl<S: Default> AuthenticatedTrie<S> {
 
 /// Default trie is a **delta** trie: empty store, `Full` cache policy. The
 /// snapshot layer, which needs `SkipSingleton`, constructs explicitly and never
-/// relies on this default (see `AuthenticatedTrie::<Entries<_>>::empty_snapshot`).
+/// relies on this default (see `AuthenticatedTrie::<TwoLevelStore>::empty_snapshot`).
 impl<S: Default> Default for AuthenticatedTrie<S> {
     fn default() -> Self {
         Self::empty(CachePolicy::Full)
@@ -129,12 +132,12 @@ impl<S: TrieStore> AuthenticatedTrie<S> {
     }
 }
 
-impl<V: TrieValue> AuthenticatedTrie<Entries<V>> {
+impl AuthenticatedTrie<TwoLevelStore> {
     /// An empty **snapshot** trie: `SkipSingleton` cache policy. The snapshot is
     /// the only layer that skips singleton subtree caching.
     pub(crate) fn empty_snapshot() -> Self {
         Self {
-            store: Entries::new(),
+            store: TwoLevelStore::new(),
             engine: RootEngine::new(CachePolicy::SkipSingleton),
         }
     }
@@ -144,9 +147,9 @@ impl<V: TrieValue> AuthenticatedTrie<Entries<V>> {
     /// first `root` is a full recompute that populates it; later (incremental)
     /// merges clone that warm cache.
     pub(crate) fn from_snapshot(snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
-        let mut store = Entries::new();
+        let mut store = TwoLevelStore::new();
         for (k, v) in snapshot {
-            store.insert(k, V::from_value_bytes(v));
+            store.insert(k, snapshot_value(v));
         }
         Self {
             store,
@@ -155,161 +158,28 @@ impl<V: TrieValue> AuthenticatedTrie<Entries<V>> {
     }
 }
 
-impl AuthenticatedTrie<Entries<MptValue>> {
-    /// Build a **delta** trie from an existing byte-keyed delta (e.g. a persisted
-    /// state); `Full` policy. The cache starts empty, so the first `root` is a
-    /// full (correct) recompute that populates it. Delta-only, so it keeps
-    /// `MptValue` (tombstones are meaningful in the delta).
-    // Exercised only by the `from_delta_matches_oracle` test; reads dead in the
-    // lib build alone.
-    #[allow(dead_code)]
-    pub(crate) fn from_delta(delta: &BTreeMap<Vec<u8>, MptValue>) -> Self {
-        let mut store = Entries::new();
-        for (k, v) in delta {
-            store.insert(k, v.clone());
-        }
-        Self {
-            store,
-            engine: RootEngine::new(CachePolicy::Full),
-        }
-    }
-}
-
-/// The two-level-backed incremental trie (the historical `IncrementalTrie`).
-///
-/// A thin newtype over the generic [`AuthenticatedTrie`] combinator pinned to the
-/// two-level [`Entries`] store. It exists to keep the store type and its trait
-/// bounds (`TrieStore` / `TrieReader`, and their `Nibbles` views) **out of the
-/// crate's public surface**: only value-clean signatures (`V`, `H256`, byte
-/// slices) cross this boundary, so the `#[cfg(fuzzing)]` export in `lib.rs` needs
-/// nothing else made public. Delegates every method to the inner combinator.
-///
-/// Generic over the stored value type `V` (default [`MptValue`]): the delta and
-/// intermediate tries keep `MptValue` (which carries `Tombstone`), while the
-/// snapshot — provably tombstone-free — instantiates it with a compact inline
-/// value type to save memory. Only [`TrieValue`] (merkle bytes + visibility) is
-/// required, so the hashing and cache logic are identical across value types.
-#[derive(Clone, Debug)]
-pub struct IncrementalTrie<V: TrieValue = MptValue>(AuthenticatedTrie<Entries<V>>);
-
-/// Delta-trie default: `Full` cache policy (see [`AuthenticatedTrie`]'s default).
-impl<V: TrieValue> Default for IncrementalTrie<V> {
-    fn default() -> Self {
-        Self(AuthenticatedTrie::default())
-    }
-}
-
-impl<V: TrieValue> IncrementalTrie<V> {
-    /// Insert / overwrite the value for `key` (canonical byte mpt key).
-    pub fn insert(&mut self, key: &[u8], value: V) {
-        self.0.insert(key, value);
-    }
-
-    /// Remove `key` (canonical byte form).
-    pub fn remove(&mut self, key: &[u8]) {
-        self.0.remove(key);
-    }
-
-    /// Drop all entries, cached hashes and pending dirty keys.
-    // Public under `fuzzing`; in the lib build it is only reached by the
-    // `empty_after_clear_is_null` test, so it reads dead there.
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    /// Merkle root, reusing cached hashes for unchanged subtrees.
-    pub fn root(&mut self) -> H256 {
-        self.0.root()
-    }
-
-    /// Number of stored entries (tombstones included).
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Feed an **ascending, sorted** in-memory batch straight into the store.
-    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
-        self.0.bulk_extend_sorted(batch);
-    }
-
-    /// Borrow the underlying store for value-typed reads (snapshot layer).
-    pub(crate) fn store(&self) -> &Entries<V> {
-        self.0.store()
-    }
-
-    /// An empty **snapshot** trie (`SkipSingleton` policy).
-    pub(crate) fn empty_snapshot() -> Self {
-        Self(AuthenticatedTrie::empty_snapshot())
-    }
-
-    /// Build a **snapshot** trie from a canonical snapshot map (`SkipSingleton`).
-    pub fn from_snapshot(snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
-        Self(AuthenticatedTrie::from_snapshot(snapshot))
-    }
-}
-
-impl IncrementalTrie<MptValue> {
-    /// Build a **delta** trie from an existing byte-keyed delta (`Full` policy).
-    // Public under `fuzzing`; in the lib build it is only reached by the
-    // `from_delta_matches_oracle` test, so it reads dead there.
-    #[allow(dead_code)]
-    pub fn from_delta(delta: &BTreeMap<Vec<u8>, MptValue>) -> Self {
-        Self(AuthenticatedTrie::from_delta(delta))
-    }
-}
-
-/// A **flat-`BTreeMap`-backed** incremental trie: the generic combinator pinned
-/// to [`store::flat::FlatStore`] instead of the two-level [`Entries`].
-///
-/// A value-clean newtype (like [`IncrementalTrie`]) exposed only under `fuzzing`
-/// so the `incremental_trie` differential fuzz can drive the same op sequence
-/// through **both** stores and assert equal roots — the store-independence the
-/// [`reader::TrieReader`] abstraction promises. It has no production use in this
-/// commit (the delta layer wires `FlatStore` in a later commit); `Full` cache
-/// policy (delta semantics), matching what the differential fuzz needs.
-#[cfg(fuzzing)]
-pub struct FlatTrie<V: TrieValue = MptValue>(AuthenticatedTrie<store::flat::FlatStore<V>>);
-
-#[cfg(fuzzing)]
-impl<V: TrieValue> Default for FlatTrie<V> {
-    fn default() -> Self {
-        Self(AuthenticatedTrie::default())
-    }
-}
-
-#[cfg(fuzzing)]
-impl<V: TrieValue> FlatTrie<V> {
-    /// Insert / overwrite the value for `key` (canonical byte mpt key).
-    pub fn insert(&mut self, key: &[u8], value: V) {
-        self.0.insert(key, value);
-    }
-
-    /// Remove `key` (canonical byte form).
-    pub fn remove(&mut self, key: &[u8]) {
-        self.0.remove(key);
-    }
-
-    /// Merkle root, reusing cached hashes for unchanged subtrees.
-    pub fn root(&mut self) -> H256 {
-        self.0.root()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{IncrementalTrie, MptValue};
+    use super::{snapshot_value, AuthenticatedTrie, MptValue, TwoLevelStore};
     use crate::primitives::MERKLE_NULL_NODE;
     use crate::trie::root::PARALLEL_REBUILD_THRESHOLD;
     use crate::trie::trie_root;
     use std::collections::BTreeMap;
 
-    fn val(b: u8) -> MptValue {
+    /// Live value bytes from a tag byte. `0` yields the empty value — legal in
+    /// the snapshot, and it hashes exactly like a tombstone (`merkle_value` of
+    /// both is `&[]`), keeping that collapse covered here; the tombstone variant
+    /// itself is delta-only and covered by the flat store's tests.
+    fn val(b: u8) -> Vec<u8> {
         if b == 0 {
-            MptValue::Tombstone
+            Vec::new()
         } else {
-            MptValue::Some(Box::from([b]))
+            vec![b]
         }
+    }
+
+    fn oracle_val(b: u8) -> MptValue {
+        MptValue::Some(val(b).into_boxed_slice())
     }
 
     /// Drive a map through a random op sequence, asserting the incremental root
@@ -324,7 +194,7 @@ mod tests {
         };
 
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        let mut inc = IncrementalTrie::default();
+        let mut inc = AuthenticatedTrie::<TwoLevelStore>::empty_snapshot();
 
         for op_i in 0..4000 {
             // Keys share prefixes to exercise path compression split/merge.
@@ -337,8 +207,8 @@ mod tests {
                 inc.remove(&key);
                 "remove"
             } else {
-                map.insert(key.clone(), val(v));
-                inc.insert(&key, val(v));
+                map.insert(key.clone(), oracle_val(v));
+                inc.insert(&key, snapshot_value(&val(v)));
                 "insert"
             };
 
@@ -366,7 +236,7 @@ mod tests {
             (seed >> 33) as u32
         };
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        let mut inc = IncrementalTrie::default();
+        let mut inc = AuthenticatedTrie::<TwoLevelStore>::empty_snapshot();
         for op_i in 0..4000 {
             let klen = 1 + (next() % 5) as usize;
             let key: Vec<u8> = (0..klen).map(|_| (next() % 6) as u8).collect();
@@ -375,8 +245,8 @@ mod tests {
                 map.remove(&key);
                 inc.remove(&key);
             } else {
-                map.insert(key.clone(), val(v));
-                inc.insert(&key, val(v));
+                map.insert(key.clone(), oracle_val(v));
+                inc.insert(&key, snapshot_value(&val(v)));
             }
             assert_eq!(
                 inc.root(),
@@ -388,75 +258,39 @@ mod tests {
 
     #[test]
     fn empty_after_clear_is_null() {
-        let mut inc = IncrementalTrie::default();
+        let mut inc = AuthenticatedTrie::<TwoLevelStore>::empty_snapshot();
         let mut map = BTreeMap::new();
         map.insert(vec![1u8], MptValue::Some(Box::from([1u8])));
-        inc.insert(&[1u8], MptValue::Some(Box::from([1u8])));
+        inc.insert(&[1u8], snapshot_value(&[1u8]));
         assert_eq!(inc.root(), trie_root(&map));
         inc.clear();
         assert_eq!(inc.root(), MERKLE_NULL_NODE);
     }
 
-    /// `from_delta` reproduces the oracle for a preloaded delta.
-    #[test]
-    fn from_delta_matches_oracle() {
-        let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        for b in 0u8..50 {
-            map.insert(vec![b % 7, b % 5, b], val(b | 1));
-        }
-        let mut inc = IncrementalTrie::from_delta(&map);
-        assert_eq!(inc.root(), trie_root(&map));
-    }
-
     /// Force the cold `memo_node_rebuild` PARALLEL fan-out (>= threshold entries,
-    /// empty cache, >1 child at the root) and assert it agrees with the stateless
-    /// oracle — the small-map tests above stay under the serial threshold.
+    /// empty cache via `from_snapshot`, >1 child at the root) and assert it
+    /// agrees with the stateless oracle — the small-map tests above stay under
+    /// the serial threshold. (The same cold path with tombstones interleaved is
+    /// covered by the flat store's tests — the snapshot store cannot hold one.)
     #[test]
     fn parallel_rebuild_matches_oracle() {
+        let mut snapshot: BTreeMap<Vec<u8>, Box<[u8]>> = BTreeMap::new();
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
         for i in 0u32..8000 {
             // First byte = i&0xff spans all 16 top nibbles (root fans out); the
             // first two bytes are a bijection with i, so keys stay distinct.
             let key = vec![(i & 0xff) as u8, (i >> 8) as u8, ((i >> 3) & 0xff) as u8];
-            map.insert(key, val((i as u8) | 1));
+            snapshot.insert(key.clone(), val((i as u8) | 1).into_boxed_slice());
+            map.insert(key, oracle_val((i as u8) | 1));
         }
         assert!(map.len() >= PARALLEL_REBUILD_THRESHOLD);
-        let mut inc = IncrementalTrie::from_delta(&map);
-        assert_eq!(inc.root(), trie_root(&map));
-    }
-
-    /// Same cold parallel-rebuild path, but with tombstones interleaved. Proves
-    /// a terminal tombstone still hashes as `Some(&[])` (the `b'v'` marker in
-    /// `compute_node_merkle`) — byte-identical to the stateless oracle. The
-    /// Some/None distinction is carried by key-presence (`find` on nibble
-    /// length), which the flattening to merkle bytes does not touch;
-    /// `merkle_value()` collapses tombstone and empty `Some` to the same `&[]`,
-    /// exactly as the oracle does.
-    #[test]
-    fn parallel_rebuild_with_tombstones_matches_oracle() {
-        let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        for i in 0u32..8000 {
-            let key = vec![(i & 0xff) as u8, (i >> 8) as u8, ((i >> 3) & 0xff) as u8];
-            // Every 5th entry is a tombstone (some become terminal-value nodes);
-            // one real entry is deliberately an empty value to exercise the
-            // tombstone-vs-empty-`Some` collapse.
-            let v = if i % 5 == 0 {
-                MptValue::Tombstone
-            } else if i % 5 == 1 {
-                MptValue::Some(Box::from([]))
-            } else {
-                MptValue::Some(Box::from([(i as u8) | 1]))
-            };
-            map.insert(key, v);
-        }
-        assert!(map.len() >= PARALLEL_REBUILD_THRESHOLD);
-        let mut inc = IncrementalTrie::from_delta(&map);
+        let mut inc = AuthenticatedTrie::from_snapshot(&snapshot);
         assert_eq!(inc.root(), trie_root(&map));
     }
 
     /// Wide byte-aligned keys (like real 20/57-byte mpt keys) that produce odd
     /// routing depths and long shared prefixes — exercises the packed
-    /// `NibblePrefix` range translation end-to-end against the oracle.
+    /// `PrefixKey` range translation end-to-end against the oracle.
     #[test]
     fn wide_byte_keys_match_oracle() {
         let mut seed: u64 = 0xd1b54a32d192ed03;
@@ -465,22 +299,22 @@ mod tests {
             (seed >> 24) as u8
         };
         let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-        let mut inc = IncrementalTrie::default();
+        let mut inc = AuthenticatedTrie::<TwoLevelStore>::empty_snapshot();
         // A shared 20-byte account prefix + varying storage tails → deep nodes.
         let account: Vec<u8> = (0..20).map(|_| next()).collect();
         for _ in 0..3000 {
             let mut key = account.clone();
             key.extend((0..37).map(|_| next()));
-            let v = MptValue::Some(Box::from([next(), next()]));
-            inc.insert(&key, v.clone());
-            map.insert(key, v);
+            let v = [next(), next()];
+            inc.insert(&key, snapshot_value(&v));
+            map.insert(key, MptValue::Some(Box::from(v)));
         }
         // Plus some entirely independent keys.
         for _ in 0..500 {
             let key: Vec<u8> = (0..(1 + (next() % 30) as usize)).map(|_| next()).collect();
-            let v = MptValue::Some(Box::from([next()]));
-            inc.insert(&key, v.clone());
-            map.insert(key, v);
+            let v = [next()];
+            inc.insert(&key, snapshot_value(&v));
+            map.insert(key, MptValue::Some(Box::from(v)));
         }
         assert_eq!(inc.root(), trie_root(&map));
     }
@@ -500,10 +334,10 @@ mod tests {
         for &n in &[2000usize, 6000] {
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
             let mut map: BTreeMap<Vec<u8>, MptValue> = BTreeMap::new();
-            let mut inc = IncrementalTrie::default();
+            let mut inc = AuthenticatedTrie::<TwoLevelStore>::empty_snapshot();
             for _ in 0..n {
                 let key: Vec<u8> = (0..40).map(|_| (lcg(&mut seed) & 0xff) as u8).collect();
-                inc.insert(&key, MptValue::Some(Box::from([1u8])));
+                inc.insert(&key, snapshot_value(&[1u8]));
                 map.insert(key.clone(), MptValue::Some(Box::from([1u8])));
                 keys.push(key);
             }
@@ -516,9 +350,9 @@ mod tests {
                 for _ in 0..4 {
                     s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let k = &keys[(s >> 33) as usize % keys.len()];
-                    let v = MptValue::Some(Box::from([(s >> 40) as u8]));
-                    inc.insert(k, v.clone());
-                    map.insert(k.clone(), v);
+                    let v = [(s >> 40) as u8];
+                    inc.insert(k, snapshot_value(&v));
+                    map.insert(k.clone(), MptValue::Some(Box::from(v)));
                 }
                 let _ = inc.root();
             }

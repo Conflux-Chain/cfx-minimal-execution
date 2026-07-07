@@ -12,7 +12,7 @@
 use super::memo::memo_node;
 use super::rebuild::{memo_node_rebuild, EntryRef};
 use super::PARALLEL_REBUILD_THRESHOLD;
-use crate::nibbles::{empty_prefix_buf, push_nibble, NibblePrefix, NibbleRef};
+use crate::nibbles::{empty_prefix_buf, push_nibble, PrefixKey, PrefixRef};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
 use crate::trie::reader::TrieReader;
 use rustc_hash::FxHashMap;
@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 /// Cache keyed by a node's routing nibble prefix. FxHash, not SipHash: these
 /// short packed keys are hashed on every node visit and SipHash showed up
 /// prominently in profiles.
-pub(crate) type Cache = FxHashMap<NibblePrefix, H256>;
+pub(crate) type Cache = FxHashMap<PrefixKey, H256>;
 
 /// Controls which subtree hashes are retained after a root walk.
 ///
@@ -106,39 +106,29 @@ impl RootEngine {
         self.dirty.clear();
 
         let result = if self.cache.is_empty() && store.len() >= PARALLEL_REBUILD_THRESHOLD {
-            let timing = crate::diag::recover_timing();
             let entries: Vec<EntryRef<'_>> = store
                 .iter_merkle()
                 .map(|(key, value)| EntryRef {
-                    key,   // Nibbles view surfaced by the store
+                    key,   // NibbleCursor view surfaced by the store
                     value, // precomputed merkle bytes (value type stays behind the trait)
                 })
                 .collect();
-            let t = std::time::Instant::now();
+
+            let t = crate::diag::event("rebuild.hash");
             let (root, cache_entries) =
-                memo_node_rebuild(&entries, NibbleRef::empty(), false, cache_policy);
-            if timing {
-                eprintln!(
-                    "[recover] snapshot_hash elapsed={}ms cache_entries={}",
-                    t.elapsed().as_millis(),
-                    cache_entries.len()
-                );
-            }
-            let t = std::time::Instant::now();
+                memo_node_rebuild(&entries, PrefixRef::empty(), false, cache_policy);
+            t.finish(format_args!("cache_entries={}", cache_entries.len()));
+
+            let t = crate::diag::event("rebuild.cache_extend");
             self.cache.reserve(cache_entries.len());
             self.cache.extend(cache_entries);
-            if timing {
-                eprintln!(
-                    "[recover] snapshot_cache_extend elapsed={}ms cache_len={}",
-                    t.elapsed().as_millis(),
-                    self.cache.len()
-                );
-            }
+            t.finish(format_args!("cache_len={}", self.cache.len()));
+
             root
         } else {
             memo_node(
                 store,
-                NibbleRef::empty(),
+                PrefixRef::empty(),
                 false,
                 &mut self.cache,
                 cache_policy,

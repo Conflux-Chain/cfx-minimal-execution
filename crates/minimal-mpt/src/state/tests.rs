@@ -111,7 +111,10 @@ fn write_streaming_roundtrips_persisted_state() {
     state.set(key(3), Box::from([6u8, 7, 8])).unwrap(); // key(3) stays in delta
 
     let before = state.persisted();
-    assert!(!before.snapshot.is_empty(), "snapshot layer must be exercised");
+    assert!(
+        !before.snapshot.is_empty(),
+        "snapshot layer must be exercised"
+    );
     assert!(
         !before.intermediate.is_empty(),
         "intermediate layer must be exercised"
