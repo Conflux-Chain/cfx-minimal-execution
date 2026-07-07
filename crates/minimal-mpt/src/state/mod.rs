@@ -52,11 +52,6 @@ impl CommitRoot {
 /// cost in isolation from the snapshot merge. Zero overhead when disabled.
 static DELTA_ROOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DELTA_ROOT_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-fn delta_timing_on() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MMPT_DELTA_TIMING").is_some())
-}
 
 pub trait StateTrait {
     fn get(&self, key: StorageKeyWithSpace) -> Result<Option<Box<[u8]>>>;
@@ -145,7 +140,7 @@ impl State {
     }
 
     pub fn from_persisted(state: PersistedState) -> Self {
-        let recover_timing = std::env::var_os("MMPT_RECOVER_TIMING").is_some();
+        let recover_timing = crate::diag::recover_timing();
         let recover_total = std::time::Instant::now();
         let snapshot_entries = state.snapshot.len();
         let intermediate_entries = state.intermediate.len();
@@ -230,7 +225,7 @@ impl State {
     /// This is the load-side counterpart to the executor's `save_streaming`.
     pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
         let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
-        let timing = std::env::var_os("MMPT_RECOVER_TIMING").is_some();
+        let timing = crate::diag::recover_timing();
 
         // 1. snapshot — streamed straight into the snapshot store.
         let t = std::time::Instant::now();
@@ -390,7 +385,7 @@ impl StateTrait for State {
     }
 
     fn commit(&mut self) -> Result<CommitRoot> {
-        let delta_root = if delta_timing_on() {
+        let delta_root = if crate::diag::delta_timing() {
             use std::sync::atomic::Ordering::Relaxed;
             let t = std::time::Instant::now();
             let r = self.delta_inc.root();

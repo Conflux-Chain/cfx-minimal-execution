@@ -179,7 +179,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
         self.dirty.clear();
 
         let result = if self.cache.is_empty() && self.entries.len() >= PARALLEL_REBUILD_THRESHOLD {
-            let timing = std::env::var_os("MMPT_RECOVER_TIMING").is_some();
+            let timing = crate::diag::recover_timing();
             let entries: Vec<EntryRef<'_>> = self
                 .entries
                 .iter()
@@ -281,11 +281,7 @@ impl<V: TrieValue> IncrementalTrie<V> {
         // level-2 leaves) instead of monotonic per-entry `insert` (~half-full
         // leaves). The reader stays oblivious to the two-level layout; peak
         // transient is one batch. `W` is env-tunable for profiling.
-        let w = std::env::var("MMPT_BULK_W")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&w| w > 0)
-            .unwrap_or(1_000_000);
+        let w = crate::diag::bulk_w();
         let mut entries = Entries::new();
         let mut batch: Vec<(Vec<u8>, V)> = Vec::with_capacity(w.min(count));
         for _ in 0..count {

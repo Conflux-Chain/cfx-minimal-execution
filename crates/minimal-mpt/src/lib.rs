@@ -1,3 +1,4 @@
+mod diag;
 mod keys;
 mod merkle;
 mod persist;
@@ -41,15 +42,37 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+// `Error` is the crate-root aggregate: it folds the internal `keys::KeyError`
+// and `persist::PersistError` sub-errors (and their underlying `io`/`bincode`
+// sources) into a single flat type. `Display` and the `From` conversions below
+// are wired so every case prints exactly as before — the sub-error layering is
+// purely internal.
+impl From<keys::KeyError> for Error {
+    fn from(value: keys::KeyError) -> Self {
+        match value {
+            keys::KeyError::InvalidKey(msg) => Self::InvalidKey(msg),
+        }
+    }
+}
+
+impl From<persist::PersistError> for Error {
+    fn from(value: persist::PersistError) -> Self {
+        match value {
+            persist::PersistError::Io(e) => Self::Io(e),
+            persist::PersistError::Codec(e) => Self::Codec(e),
+        }
+    }
+}
+
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Self::Io(value)
+        persist::PersistError::from(value).into()
     }
 }
 
 impl From<Box<bincode::ErrorKind>> for Error {
     fn from(value: Box<bincode::ErrorKind>) -> Self {
-        Self::Codec(value)
+        persist::PersistError::from(value).into()
     }
 }
 

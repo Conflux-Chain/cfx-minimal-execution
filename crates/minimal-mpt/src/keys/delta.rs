@@ -2,7 +2,7 @@ use super::account_cache::{new_account_key, AccountKeyCache};
 use super::*;
 use crate::primitives::{Space, H256, MERKLE_NULL_NODE};
 use crate::trie::keccak;
-use crate::{Error, Result};
+use crate::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +98,7 @@ impl StorageKeyWithSpace {
         let has_space = raw[ACCOUNT_KEYPART_BYTES] & 0x80 != 0;
         let (space, rest) = if has_space {
             if raw[ACCOUNT_KEYPART_BYTES] != EVM_SPACE_TYPE {
-                return Err(Error::InvalidKey("unknown delta space marker"));
+                return Err(KeyError::InvalidKey("unknown delta space marker").into());
             }
             (Space::Ethereum, &raw[ACCOUNT_KEYPART_BYTES + 1..])
         } else {
@@ -110,9 +110,10 @@ impl StorageKeyWithSpace {
                 StorageKey::StorageRoot(address)
             } else {
                 if rest.len() < KEY_PADDING_BYTES {
-                    return Err(Error::InvalidKey(
+                    return Err(KeyError::InvalidKey(
                         "storage delta key missing padded storage key",
-                    ));
+                    )
+                    .into());
                 }
                 StorageKey::Storage {
                     address,
@@ -134,7 +135,7 @@ impl StorageKeyWithSpace {
         } else if rest.starts_with(VOTE_LIST_PREFIX) {
             StorageKey::VoteList(address)
         } else {
-            return Err(Error::InvalidKey("unknown delta key suffix"));
+            return Err(KeyError::InvalidKey("unknown delta key suffix").into());
         };
         Ok(Self { key, space })
     }

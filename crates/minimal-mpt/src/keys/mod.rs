@@ -1,6 +1,7 @@
 use crate::primitives::Space;
-use crate::{Error, Result};
+use crate::Result;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 mod account_cache;
 mod canonical;
@@ -8,6 +9,25 @@ mod delta;
 
 pub use delta::DeltaMptKeyPadding;
 pub(crate) use account_cache::AccountKeyCache;
+
+/// Key-codec sub-error: a storage key whose bytes could not be encoded or
+/// decoded (wrong length, unknown suffix/marker). Folded into the crate-root
+/// [`crate::Error`] aggregate via `From`; `Display` matches the aggregate's
+/// legacy output for this case exactly.
+#[derive(Debug)]
+pub(crate) enum KeyError {
+    InvalidKey(&'static str),
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidKey(msg) => write!(f, "invalid key: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}
 
 const ACCOUNT_BYTES: usize = 20;
 const ACCOUNT_KEYPART_BYTES: usize = 32;
@@ -65,7 +85,7 @@ fn checked_address(address: &[u8]) -> Result<&[u8]> {
     if address.len() == ACCOUNT_BYTES {
         Ok(address)
     } else {
-        Err(Error::InvalidKey("address must be 20 bytes"))
+        Err(KeyError::InvalidKey("address must be 20 bytes").into())
     }
 }
 

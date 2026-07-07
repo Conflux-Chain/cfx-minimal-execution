@@ -1,6 +1,6 @@
 use super::*;
 use crate::primitives::Space;
-use crate::{Error, Result};
+use crate::Result;
 
 impl StorageKeyWithSpace {
     pub fn to_key_bytes(&self) -> Result<Vec<u8>> {
@@ -92,7 +92,7 @@ impl StorageKeyWithSpace {
         } else if rest == VOTE_LIST_PREFIX {
             StorageKey::VoteList(address)
         } else {
-            return Err(Error::InvalidKey("unknown snapshot key suffix"));
+            return Err(KeyError::InvalidKey("unknown snapshot key suffix").into());
         };
         Ok(Self { key, space })
     }

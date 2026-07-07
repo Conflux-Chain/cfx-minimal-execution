@@ -13,14 +13,6 @@ use crate::{
     Result,
 };
 
-/// Env-gated (`MMPT_MERGE_TIMING=1`) switch for the in-place `[merge]`
-/// instrumentation in [`State::advance_after_commit`]. Cached; zero overhead
-/// when unset.
-static MMPT_TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-fn timing_on() -> bool {
-    *MMPT_TIMING.get_or_init(|| std::env::var_os("MMPT_MERGE_TIMING").is_some())
-}
-
 impl State {
     pub(super) fn advance_after_commit(&mut self, delta_root: H256) -> Result<()> {
         if self.height == 0 || !self.height.is_multiple_of(self.snapshot_epoch_count as u64) {
@@ -34,7 +26,7 @@ impl State {
         // no background thread: the incremental root is cheap enough (~tens of
         // ms) to fold straight into the boundary. `take` empties intermediate so
         // the snapshot can be mutated without aliasing it.
-        let timing = timing_on();
+        let timing = crate::diag::merge_timing();
         let t0 = std::time::Instant::now();
         let mut snapshot_updates = Vec::with_capacity(self.intermediate.len());
         for (raw_key, value) in std::mem::take(&mut self.intermediate) {
