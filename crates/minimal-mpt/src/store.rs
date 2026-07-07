@@ -1,9 +1,6 @@
-use crate::{
-    trie::MptValue,
-    types::{CommitRoot, Result},
-};
+use crate::{trie::MptValue, types::CommitRoot};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -29,63 +26,6 @@ impl Default for PersistedState {
             snapshot_epoch_count: crate::state::DEFAULT_SNAPSHOT_EPOCH_COUNT,
             last_root: None,
         }
-    }
-}
-
-pub trait StateStore {
-    fn load_latest(&self) -> Result<Option<PersistedState>>;
-    fn save_latest(&mut self, state: &PersistedState) -> Result<()>;
-}
-
-#[derive(Default)]
-pub struct MemoryStore {
-    state: Option<PersistedState>,
-}
-
-impl MemoryStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl StateStore for MemoryStore {
-    fn load_latest(&self) -> Result<Option<PersistedState>> {
-        Ok(self.state.clone())
-    }
-
-    fn save_latest(&mut self, state: &PersistedState) -> Result<()> {
-        self.state = Some(state.clone());
-        Ok(())
-    }
-}
-
-pub struct FileStore {
-    path: PathBuf,
-}
-
-impl FileStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-impl StateStore for FileStore {
-    fn load_latest(&self) -> Result<Option<PersistedState>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let bytes = fs::read(&self.path)?;
-        Ok(Some(bincode::deserialize(&bytes)?))
-    }
-
-    fn save_latest(&mut self, state: &PersistedState) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, bincode::serialize(state)?)?;
-        fs::rename(tmp, &self.path)?;
-        Ok(())
     }
 }
 

@@ -10,8 +10,8 @@ mod trie;
 mod types;
 
 pub use key_codec::{DeltaMptKeyPadding, StorageKey, StorageKeyWithSpace};
-pub use state::{State, StateManager, StateTrait};
-pub use store::{FileStore, MemoryStore, PersistedState, StateStore};
+pub use state::{State, StateTrait};
+pub use store::PersistedState;
 pub use trie::MptValue;
 pub use types::{CommitRoot, Error, MptKeyValue, Result, Space, H256, MERKLE_NULL_NODE};
 

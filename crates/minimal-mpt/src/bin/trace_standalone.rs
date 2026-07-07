@@ -1,6 +1,5 @@
 use cfx_minimal_mpt::{
-    CommitRoot, DeltaMptKeyPadding, MemoryStore, Space, State, StateManager, StateTrait,
-    StorageKey, StorageKeyWithSpace, H256,
+    CommitRoot, DeltaMptKeyPadding, Space, State, StateTrait, StorageKey, StorageKeyWithSpace, H256,
 };
 
 fn main() {
@@ -194,7 +193,7 @@ fn trace_snapshot_rollover() {
     let key_b = account_key(0x22);
     let key_c = account_key(0x23);
     let key_d = account_key(0x20);
-    let mut state = StateManager::with_snapshot_epoch_count(MemoryStore::new(), 2).unwrap();
+    let mut state = State::with_snapshot_epoch_count(2);
 
     state.set(key_a.clone(), Box::from([0xa1])).unwrap();
     println!("ROLL1 {}", format_root(&state.commit().unwrap()));
@@ -287,7 +286,7 @@ fn trace_intermediate_prefix_bug() {
     let full_storage_key = [prefix.as_slice(), &[0x33; 30]].concat();
     let key = storage_key(9, full_storage_key, Space::Native);
     let prefix_key = storage_key(9, prefix, Space::Native);
-    let mut state = StateManager::with_snapshot_epoch_count(MemoryStore::new(), 2).unwrap();
+    let mut state = State::with_snapshot_epoch_count(2);
 
     state.set(key.clone(), Box::from([0x77])).unwrap();
     state.commit().unwrap();
@@ -312,7 +311,7 @@ fn trace_intermediate_prefix_bug() {
 }
 
 fn trace_intermediate_account_prefix() {
-    let mut state = StateManager::with_snapshot_epoch_count(MemoryStore::new(), 2).unwrap();
+    let mut state = State::with_snapshot_epoch_count(2);
     for id in 0u8..4 {
         state
             .set(short_account(&[0x61, id]), vec![id + 1].into_boxed_slice())
@@ -379,7 +378,7 @@ fn trace_address_prefix_filter() {
 }
 
 fn trace_intermediate_address_prefix_filter() {
-    let mut state = StateManager::with_snapshot_epoch_count(MemoryStore::new(), 2).unwrap();
+    let mut state = State::with_snapshot_epoch_count(2);
     let keep = short_account(&[0x52, 0x02]);
     let delete = short_account(&[0x51, 0x02]);
     let prefix = StorageKeyWithSpace {

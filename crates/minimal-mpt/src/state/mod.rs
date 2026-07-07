@@ -2,7 +2,7 @@ use crate::{
     incremental::CachePolicy,
     key_codec::{DeltaMptKeyPadding, StorageKeyWithSpace},
     snapshot::SnapshotTrie,
-    store::{PersistedState, StateStore},
+    store::PersistedState,
     trie::{trie_root, MptValue},
     types::{CommitRoot, MptKeyValue, Result, H256, MERKLE_NULL_NODE},
 };
@@ -298,13 +298,6 @@ impl State {
         }
     }
 
-    pub fn put_intermediate_raw(&mut self, raw_key: Vec<u8>, value: MptValue) {
-        self.intermediate.insert(raw_key, value);
-        self.intermediate_root = trie_root(&self.intermediate);
-        self.delta_padding =
-            DeltaMptKeyPadding::from_roots(self.snapshot_root, self.intermediate_root);
-    }
-
     pub fn height(&self) -> u64 {
         self.height
     }
@@ -403,66 +396,6 @@ impl StateTrait for State {
         self.height += 1;
         self.advance_after_commit(delta_root)?;
         Ok(root)
-    }
-}
-
-pub struct StateManager<S: StateStore> {
-    state: State,
-    store: S,
-}
-
-impl<S: StateStore> StateManager<S> {
-    pub fn new(store: S) -> Result<Self> {
-        let state = store
-            .load_latest()?
-            .map(State::from_persisted)
-            .unwrap_or_default();
-        Ok(Self { state, store })
-    }
-
-    pub fn with_snapshot_epoch_count(store: S, snapshot_epoch_count: u32) -> Result<Self> {
-        let mut manager = Self::new(store)?;
-        manager.state.snapshot_epoch_count = snapshot_epoch_count.max(1);
-        Ok(manager)
-    }
-
-    pub fn state(&self) -> &State {
-        &self.state
-    }
-
-    pub fn state_mut(&mut self) -> &mut State {
-        &mut self.state
-    }
-
-    pub fn commit(&mut self) -> Result<CommitRoot> {
-        let root = self.state.commit()?;
-        self.store.save_latest(&self.state.persisted())?;
-        Ok(root)
-    }
-}
-
-impl<S: StateStore> StateTrait for StateManager<S> {
-    fn get(&self, key: StorageKeyWithSpace) -> Result<Option<Box<[u8]>>> {
-        self.state.get(key)
-    }
-
-    fn set(&mut self, key: StorageKeyWithSpace, value: Box<[u8]>) -> Result<()> {
-        self.state.set(key, value)
-    }
-
-    fn get_all_by_prefix(&self, prefix: StorageKeyWithSpace) -> Result<Option<Vec<MptKeyValue>>> {
-        self.state.get_all_by_prefix(prefix)
-    }
-
-    fn delete_all_by_prefix(
-        &mut self,
-        prefix: StorageKeyWithSpace,
-    ) -> Result<Option<Vec<MptKeyValue>>> {
-        self.state.delete_all_by_prefix(prefix)
-    }
-
-    fn commit(&mut self) -> Result<CommitRoot> {
-        StateManager::commit(self)
     }
 }
 

@@ -1,6 +1,5 @@
 use super::*;
-use crate::{FileStore, MemoryStore, Space, StorageKey};
-use std::fs;
+use crate::{Space, StorageKey};
 
 fn key(byte: u8) -> StorageKeyWithSpace {
     StorageKeyWithSpace {
@@ -75,39 +74,49 @@ fn delete_all_prefix_hides_snapshot_values() {
 
 #[test]
 fn manager_persists_latest_state() {
-    let path =
-        std::env::temp_dir().join(format!("cfx-minimal-mpt-test-{}.bin", std::process::id()));
-    let _ = fs::remove_file(&path);
+    // Persist a committed state via the streaming writer, read it back, and
+    // assert the observable (the value under key(2)) and the full persisted
+    // image round-trip identically.
+    let mut state = State::new();
+    state.set(key(2), Box::from([7u8])).unwrap();
+    state.commit().unwrap();
 
-    {
-        let mut manager = StateManager::new(FileStore::new(&path)).unwrap();
-        manager.set(key(2), Box::from([7u8])).unwrap();
-        manager.commit().unwrap();
-    }
+    let mut bytes = Vec::new();
+    state.write_streaming(&mut bytes).unwrap();
+    let restored = State::from_reader(&mut bytes.as_slice()).unwrap();
 
-    let manager = StateManager::new(FileStore::new(&path)).unwrap();
-    assert_eq!(manager.get(key(2)).unwrap().unwrap().as_ref(), &[7u8]);
-    let _ = fs::remove_file(&path);
+    assert_eq!(restored.get(key(2)).unwrap().unwrap().as_ref(), &[7u8]);
+    assert_eq!(restored.persisted(), state.persisted());
 }
 
 #[test]
-fn memory_store_manager_uses_latest_only() {
-    let mut manager = StateManager::new(MemoryStore::new()).unwrap();
-    manager.set(key(3), Box::from([8u8])).unwrap();
-    let root = manager.commit().unwrap();
+fn commit_produces_nonnull_delta_root() {
+    let mut state = State::new();
+    state.set(key(3), Box::from([8u8])).unwrap();
+    let root = state.commit().unwrap();
     assert_ne!(root.delta_root, MERKLE_NULL_NODE);
 }
 
 #[test]
 fn write_streaming_roundtrips_persisted_state() {
-    let mut snapshot = BTreeMap::new();
-    snapshot.insert(key(1).to_key_bytes().unwrap(), Box::from([1u8, 2]));
-    snapshot.insert(key(2).to_key_bytes().unwrap(), Box::from([3u8, 4]));
+    // `snapshot_epoch_count(1)` rotates on every commit, so committed data
+    // migrates into the intermediate (and then snapshot) layer naturally — no
+    // `put_intermediate_raw` needed. Two commits leave a populated snapshot and
+    // a populated intermediate; a final uncommitted set populates the delta.
+    let mut state = State::with_snapshot_epoch_count(1);
+    state.set(key(1), Box::from([1u8, 2])).unwrap();
+    state.commit().unwrap(); // key(1) -> intermediate
+    state.set(key(2), Box::from([3u8, 4])).unwrap();
+    state.commit().unwrap(); // key(1) -> snapshot, key(2) -> intermediate
+    state.set(key(3), Box::from([6u8, 7, 8])).unwrap(); // key(3) stays in delta
 
-    let mut state = State::from_snapshot(snapshot);
-    state.put_intermediate_raw(vec![0x10, 0x20], MptValue::Some(Box::from([5u8])));
-    state.set(key(3), Box::from([6u8, 7, 8])).unwrap();
-    state.commit().unwrap();
+    let before = state.persisted();
+    assert!(!before.snapshot.is_empty(), "snapshot layer must be exercised");
+    assert!(
+        !before.intermediate.is_empty(),
+        "intermediate layer must be exercised"
+    );
+    assert!(!before.delta.is_empty(), "delta layer must be exercised");
 
     let mut bytes = Vec::new();
     state.write_streaming(&mut bytes).unwrap();

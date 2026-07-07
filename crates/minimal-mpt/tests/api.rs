@@ -1,8 +1,7 @@
 use cfx_minimal_mpt::{
-    DeltaMptKeyPadding, FileStore, MemoryStore, MptValue, PersistedState, Space, StateManager,
-    StateTrait, StorageKey, StorageKeyWithSpace, H256, MERKLE_NULL_NODE,
+    DeltaMptKeyPadding, MptValue, PersistedState, Space, State, StateTrait, StorageKey,
+    StorageKeyWithSpace, H256, MERKLE_NULL_NODE,
 };
-use std::fs;
 
 fn account(byte: u8, space: Space) -> StorageKeyWithSpace {
     StorageKeyWithSpace {
@@ -63,7 +62,7 @@ fn all_key_shapes(byte: u8, space: Space) -> Vec<StorageKeyWithSpace> {
 
 #[test]
 fn public_api_roundtrip_native_and_ethereum() {
-    let mut manager = StateManager::new(MemoryStore::new()).unwrap();
+    let mut manager = State::new();
     manager
         .set(account(1, Space::Native), Box::from([10u8]))
         .unwrap();
@@ -93,36 +92,29 @@ fn public_api_roundtrip_native_and_ethereum() {
 }
 
 #[test]
-fn file_store_recovers_latest_only() {
-    let path = std::env::temp_dir().join(format!(
-        "cfx-minimal-mpt-api-test-{}.bin",
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&path);
+fn streaming_roundtrip_recovers_latest_only() {
+    let mut state = State::new();
+    state
+        .set(account(5, Space::Native), Box::from([1u8, 2, 3]))
+        .unwrap();
+    state.commit().unwrap();
 
-    {
-        let mut manager = StateManager::new(FileStore::new(&path)).unwrap();
-        manager
-            .set(account(5, Space::Native), Box::from([1u8, 2, 3]))
-            .unwrap();
-        manager.commit().unwrap();
-    }
-
-    let manager = StateManager::new(FileStore::new(&path)).unwrap();
+    let mut bytes = Vec::new();
+    state.write_streaming(&mut bytes).unwrap();
+    let restored = State::from_reader(&mut bytes.as_slice()).unwrap();
     assert_eq!(
-        manager
+        restored
             .get(account(5, Space::Native))
             .unwrap()
             .unwrap()
             .as_ref(),
         &[1u8, 2, 3]
     );
-    let _ = fs::remove_file(&path);
 }
 
 #[test]
 fn all_key_shapes_roundtrip_in_both_spaces() {
-    let mut manager = StateManager::new(MemoryStore::new()).unwrap();
+    let mut manager = State::new();
     let mut expected = Vec::new();
 
     for space in [Space::Native, Space::Ethereum] {
@@ -228,19 +220,14 @@ fn types_format_errors_and_roots() {
 }
 
 #[test]
-fn file_store_reports_corrupt_state() {
-    let path = std::env::temp_dir().join(format!(
-        "cfx-minimal-mpt-corrupt-test-{}.bin",
-        std::process::id()
-    ));
-    fs::write(&path, b"not bincode").unwrap();
-    assert!(StateManager::new(FileStore::new(&path)).is_err());
-    let _ = fs::remove_file(&path);
+fn from_reader_reports_corrupt_state() {
+    let mut corrupt = &b"not a valid streamed state image"[..];
+    assert!(State::from_reader(&mut corrupt).is_err());
 }
 
 #[test]
 fn empty_prefix_exposes_delta_values_because_bug_prefix_is_empty() {
-    let mut manager = StateManager::new(MemoryStore::new()).unwrap();
+    let mut manager = State::new();
     manager
         .set(account(1, Space::Native), Box::from([1u8]))
         .unwrap();
@@ -278,7 +265,7 @@ fn storage_prefix_delete_matches_snapshot_but_misses_delta_storage_keys() {
     assert_eq!(deleted.len(), 1);
     assert!(state.get(storage_key.clone()).unwrap().is_none());
 
-    let mut manager = StateManager::new(MemoryStore::new()).unwrap();
+    let mut manager = State::new();
     manager.set(storage_key.clone(), Box::from([2u8])).unwrap();
     assert!(manager
         .get_all_by_prefix(prefix_key.clone())
@@ -291,8 +278,8 @@ fn storage_prefix_delete_matches_snapshot_but_misses_delta_storage_keys() {
 #[test]
 fn set_order_does_not_change_committed_root() {
     let keys: Vec<_> = (0u8..32).map(|id| account(id, Space::Native)).collect();
-    let mut forward = StateManager::new(MemoryStore::new()).unwrap();
-    let mut reverse = StateManager::new(MemoryStore::new()).unwrap();
+    let mut forward = State::new();
+    let mut reverse = State::new();
 
     for (idx, key) in keys.iter().cloned().enumerate() {
         forward
@@ -341,7 +328,7 @@ fn layered_precedence_matches_delta_intermediate_snapshot_order() {
 fn commit_rolls_delta_to_intermediate_then_snapshot() {
     let key_a = account(0x21, Space::Native);
     let key_b = account(0x22, Space::Native);
-    let mut manager = StateManager::with_snapshot_epoch_count(MemoryStore::new(), 2).unwrap();
+    let mut manager = State::with_snapshot_epoch_count(2);
 
     manager.set(key_a.clone(), Box::from([0xa1])).unwrap();
     let root_1 = manager.commit().unwrap();
@@ -353,7 +340,7 @@ fn commit_rolls_delta_to_intermediate_then_snapshot() {
     assert_eq!(root_2.snapshot_root, MERKLE_NULL_NODE);
     assert_eq!(root_2.intermediate_delta_root, MERKLE_NULL_NODE);
     assert_eq!(root_2.delta_root, root_1.delta_root);
-    assert_eq!(manager.state().height(), 2);
+    assert_eq!(manager.height(), 2);
 
     let root_3 = manager.commit().unwrap();
     assert_eq!(root_3.snapshot_root, MERKLE_NULL_NODE);
