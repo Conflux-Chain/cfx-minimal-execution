@@ -46,3 +46,28 @@ pub(crate) trait TrieReader {
     /// cold rebuild consumes this; the value type stays behind the trait.
     fn iter_merkle(&self) -> impl Iterator<Item = (Nibbles<'_>, &[u8])>;
 }
+
+/// The mutating side of an entry store, used by [`super::AuthenticatedTrie`] to
+/// keep store and [`super::root::RootEngine`] in lock-step ("a write marks
+/// dirty"). The stored value type is an associated type so the combinator can
+/// forward writes without the *engine* ever naming `V` — only the combinator
+/// (which owns both halves) does. Every method mirrors, byte-for-byte in
+/// semantics, the concrete store method it abstracts. The sole implementor today
+/// is the two-level store ([`super::store::two_level::Entries`]).
+pub(crate) trait TrieStore: TrieReader {
+    /// The stored value type.
+    type Value;
+
+    /// Insert / overwrite the value for `key` (the canonical byte mpt key).
+    fn insert(&mut self, key: &[u8], value: Self::Value);
+
+    /// Remove `key` (canonical byte form) from the store.
+    fn remove(&mut self, key: &[u8]);
+
+    /// Drop all entries.
+    fn clear(&mut self);
+
+    /// Feed an **ascending, sorted** batch (keys all greater than any already
+    /// present) straight in — a dense build (see the two-level store).
+    fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, Self::Value)>);
+}

@@ -9,7 +9,6 @@ mod trie;
 use std::{fmt, io};
 
 pub(crate) use trie::nibbles;
-pub(crate) use trie::root as incremental;
 pub(crate) use trie::store::two_level as entries;
 
 pub use keys::{DeltaMptKeyPadding, StorageKey, StorageKeyWithSpace};
@@ -19,10 +18,13 @@ pub use primitives::{MptKeyValue, Space, H256, MERKLE_NULL_NODE};
 pub use state::{CommitRoot, State, StateTrait};
 pub use trie::MptValue;
 
-#[cfg(fuzzing)]
-pub use incremental::IncrementalTrie;
+// The fuzz targets drive the trie directly. `IncrementalTrie` is a value-clean
+// newtype over the generic combinator, so its public methods surface no
+// crate-internal store/trait types — the normal public API is unchanged.
 #[cfg(fuzzing)]
 pub use trie::trie_root;
+#[cfg(fuzzing)]
+pub use trie::IncrementalTrie;
 
 #[derive(Debug)]
 pub enum Error {

@@ -1,10 +1,9 @@
 use crate::state::layers::snapshot::SnapshotTrie;
 use crate::{
-    incremental::CachePolicy,
     keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
     persist::format::PersistedState,
     primitives::{MptKeyValue, H256, MERKLE_NULL_NODE},
-    trie::{trie_root, MptValue},
+    trie::{trie_root, IncrementalTrie, MptValue},
     Result,
 };
 use serde::{Deserialize, Serialize};
@@ -83,9 +82,9 @@ pub struct State {
     last_root: Option<CommitRoot>,
     // Memoized delta-trie root: writers mark dirty keys here so `commit` only
     // re-hashes changed subtrees instead of the whole delta (see
-    // `crate::incremental`). Holds its own copy of the delta entries (a second,
+    // `crate::trie`). Holds its own copy of the delta entries (a second,
     // two-level store) alongside the cached subtree hashes.
-    delta_inc: crate::incremental::IncrementalTrie,
+    delta_inc: IncrementalTrie,
     /// Per-period caches of `new_account_key` derivations (the hot keccak in
     /// `to_delta_mpt_key_bytes`), one per active padding. `RefCell` so `get` can
     /// fill them behind `&self`; padding-stamped so they self-invalidate, and
@@ -114,7 +113,7 @@ impl State {
             height: 0,
             snapshot_epoch_count: DEFAULT_SNAPSHOT_EPOCH_COUNT,
             last_root: None,
-            delta_inc: crate::incremental::IncrementalTrie::default(),
+            delta_inc: IncrementalTrie::default(),
             delta_account_cache: Default::default(),
             intermediate_account_cache: Default::default(),
         }
@@ -129,7 +128,7 @@ impl State {
 
     pub fn from_snapshot(snapshot: BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
         let mut snapshot_inc = SnapshotTrie::from_snapshot(&snapshot);
-        let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
+        let snapshot_root = snapshot_inc.root();
         let delta_padding = DeltaMptKeyPadding::from_roots(snapshot_root, MERKLE_NULL_NODE);
         Self {
             snapshot: snapshot_inc,
@@ -158,7 +157,7 @@ impl State {
             );
         }
         let t = std::time::Instant::now();
-        let snapshot_root = snapshot_inc.root_with_policy(CachePolicy::SkipSingleton);
+        let snapshot_root = snapshot_inc.root();
         if recover_timing {
             eprintln!(
                 "[recover] snapshot_root entries={} elapsed={}ms",
@@ -180,7 +179,7 @@ impl State {
         // Seed the incremental trie with the loaded delta (one nibble pass);
         // built before `delta` is moved into the struct.
         let t = std::time::Instant::now();
-        let delta_inc = crate::incremental::IncrementalTrie::from_delta(&delta);
+        let delta_inc = IncrementalTrie::from_delta(&delta);
         if recover_timing {
             eprintln!(
                 "[recover] delta_inc_build entries={} elapsed={}ms",
@@ -232,11 +231,11 @@ impl State {
         snapshot_epoch_count: u32,
         last_root: Option<CommitRoot>,
     ) -> Self {
-        let snapshot_root = snapshot.root_with_policy(CachePolicy::SkipSingleton);
+        let snapshot_root = snapshot.root();
         let intermediate_root = trie_root(&intermediate);
         let intermediate_padding = DeltaMptKeyPadding(intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(delta_mpt_key_padding);
-        let delta_inc = crate::incremental::IncrementalTrie::from_delta(&delta);
+        let delta_inc = IncrementalTrie::from_delta(&delta);
 
         Self {
             snapshot,

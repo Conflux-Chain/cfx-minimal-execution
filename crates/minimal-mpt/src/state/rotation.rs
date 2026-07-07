@@ -7,7 +7,6 @@
 
 use super::State;
 use crate::{
-    incremental::CachePolicy,
     keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
     primitives::H256,
     Result,
@@ -36,7 +35,7 @@ impl State {
         self.snapshot.apply_updates(snapshot_updates);
         let apply_ms = t0.elapsed().as_millis();
         let t1 = std::time::Instant::now();
-        self.snapshot_root = self.snapshot.root_with_policy(CachePolicy::SkipSingleton);
+        self.snapshot_root = self.snapshot.root();
         let hash_ms = t1.elapsed().as_millis();
         if timing {
             eprintln!(

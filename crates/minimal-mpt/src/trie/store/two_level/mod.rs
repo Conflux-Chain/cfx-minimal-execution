@@ -27,7 +27,7 @@
 //! this module.
 
 use crate::nibbles::{NibbleRef, Nibbles};
-use crate::trie::reader::TrieReader;
+use crate::trie::reader::{TrieReader, TrieStore};
 use crate::trie::TrieValue;
 use smallvec::SmallVec;
 use std::collections::{btree_map, BTreeMap};
@@ -274,12 +274,18 @@ impl<V> Entries<V> {
         }
     }
 
+    // Inherent `len`/`is_empty`: the trie/engine reach these through the
+    // `TrieReader` impl below (which needs `V: TrieValue`); the inherent forms
+    // stay for tests over non-`TrieValue` stores (e.g. `Entries<u32>`), so they
+    // read dead in the lib build alone.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -532,6 +538,33 @@ impl<V: TrieValue> TrieReader for Entries<V> {
 
     fn iter_merkle(&self) -> impl Iterator<Item = (Nibbles<'_>, &[u8])> {
         self.iter().map(|(n, v)| (n, v.merkle_value()))
+    }
+}
+
+/// The two-level store's write side: each method forwards to the inherent method
+/// it abstracts (inherent methods win name resolution, so `self.insert(..)` calls
+/// the concrete one, not this trait method).
+impl<V: TrieValue> TrieStore for Entries<V> {
+    type Value = V;
+
+    #[inline]
+    fn insert(&mut self, key: &[u8], value: V) {
+        self.insert(key, value);
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &[u8]) {
+        self.remove(key);
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.clear();
+    }
+
+    #[inline]
+    fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, V)>) {
+        self.bulk_extend_sorted(batch);
     }
 }
 

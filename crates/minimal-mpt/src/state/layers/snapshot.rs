@@ -1,4 +1,6 @@
-use crate::{incremental::CachePolicy, primitives::H256, trie::MptValue};
+use crate::nibbles::{pack_nibbles, NibbleRef, Nibbles};
+use crate::trie::{IncrementalTrie, MptValue, TrieValue};
+use crate::primitives::H256;
 use std::collections::BTreeMap;
 
 /// The snapshot's value type. The snapshot never stores a tombstone (deletes are
@@ -24,15 +26,27 @@ impl crate::trie::TrieValue for SnapshotValue {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct SnapshotTrie {
-    inner: crate::incremental::IncrementalTrie<SnapshotValue>,
+    inner: IncrementalTrie<SnapshotValue>,
+}
+
+/// The snapshot trie is always built with the `SkipSingleton` cache policy (its
+/// millions of singleton subtrees are rarely reused). Every constructor —
+/// including this `Default` — pins that policy; the delta's `Full` default must
+/// never leak in here.
+impl Default for SnapshotTrie {
+    fn default() -> Self {
+        Self {
+            inner: IncrementalTrie::empty_snapshot(),
+        }
+    }
 }
 
 impl SnapshotTrie {
     pub(crate) fn from_snapshot(snapshot: &BTreeMap<Vec<u8>, Box<[u8]>>) -> Self {
         Self {
-            inner: crate::incremental::IncrementalTrie::from_snapshot(snapshot),
+            inner: IncrementalTrie::from_snapshot(snapshot),
         }
     }
 
@@ -78,35 +92,75 @@ impl SnapshotTrie {
         }
     }
 
-    pub(crate) fn root_with_policy(&mut self, cache_policy: CachePolicy) -> H256 {
-        self.inner.root_with_policy(cache_policy)
+    /// Incremental snapshot root. The `SkipSingleton` policy is fixed at
+    /// construction (see [`SnapshotTrie::default`]), so this takes no argument.
+    pub(crate) fn root(&mut self) -> H256 {
+        self.inner.root()
     }
 
+    // --- Value-typed reads: operate directly on the store. These live on the
+    // snapshot layer, not on the (value-agnostic) trie / engine. ---
+
+    /// Point lookup by canonical byte key. Returns the live value bytes owned, or
+    /// `None` if absent.
     pub(crate) fn snapshot_get_owned(&self, canonical: &[u8]) -> Option<Box<[u8]>> {
-        self.inner.snapshot_get(canonical).map(Box::from)
+        self.inner
+            .store()
+            .get(canonical)
+            .and_then(|v| v.visible_value())
+            .map(Box::from)
     }
 
+    /// All `(canonical key, value)` pairs whose canonical key starts with
+    /// `canonical_prefix`.
     pub(crate) fn snapshot_scan_prefix(
         &self,
         canonical_prefix: &[u8],
     ) -> Vec<(Vec<u8>, Box<[u8]>)> {
-        self.inner.snapshot_scan_prefix(canonical_prefix)
+        let buf = pack_nibbles(Nibbles::from_bytes(canonical_prefix));
+        self.inner
+            .store()
+            .prefix_range(NibbleRef::new(&buf))
+            .filter_map(|(n, value)| {
+                value
+                    .visible_value()
+                    .map(|v| (n.to_canonical_bytes(), Box::from(v)))
+            })
+            .collect()
     }
 
+    /// Flatten to a canonical byte-keyed map (for checkpoint persistence).
     pub(crate) fn to_canonical_map(&self) -> BTreeMap<Vec<u8>, Box<[u8]>> {
-        self.inner.to_canonical_map()
+        self.inner
+            .store()
+            .iter()
+            .filter_map(|(n, value)| {
+                value
+                    .visible_value()
+                    .map(|v| (n.to_canonical_bytes(), Box::from(v)))
+            })
+            .collect()
     }
 
+    /// Number of live (non-tombstone) entries.
     pub(crate) fn live_entry_count(&self) -> usize {
-        self.inner.live_entry_count()
+        self.inner
+            .store()
+            .iter()
+            .filter(|(_, v)| v.visible_value().is_some())
+            .count()
     }
 
+    /// Visit each live entry as `(canonical byte key, value bytes)` in sorted
+    /// order. Each key is reassembled from its `head ++ tail` on the fly.
     pub(crate) fn for_each_canonical(
         &self,
         mut f: impl FnMut(Vec<u8>, &[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        for (key, value) in self.inner.iter_canonical() {
-            f(key, value)?;
+        for (n, value) in self.inner.store().iter() {
+            if let Some(v) = value.visible_value() {
+                f(n.to_canonical_bytes(), v)?;
+            }
         }
         Ok(())
     }

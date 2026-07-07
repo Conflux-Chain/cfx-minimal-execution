@@ -24,7 +24,7 @@ impl MptValue {
     }
 }
 
-/// A value stored in an [`crate::incremental::IncrementalTrie`] node, abstracted
+/// A value stored in an [`crate::trie::IncrementalTrie`] node, abstracted
 /// so the (dominant) snapshot trie can use a compact inline representation while
 /// the delta keeps the tombstone-carrying [`MptValue`]. The snapshot never holds
 /// a tombstone (deletes are applied as removals), so its value type can drop the
