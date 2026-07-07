@@ -1,70 +1,10 @@
+use crate::merkle::rules::{compute_node_merkle, compute_path_merkle, CHILDREN};
+use crate::trie::MptValue;
 use crate::types::{H256, MERKLE_NULL_NODE};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use tiny_keccak::{Hasher, Keccak};
 
-pub(crate) const CHILDREN: usize = 16;
 const PARALLEL_HASH_THRESHOLD: usize = 4096;
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MptValue {
-    Some(Box<[u8]>),
-    Tombstone,
-}
-
-impl MptValue {
-    pub fn visible_value(&self) -> Option<&[u8]> {
-        match self {
-            Self::Some(v) => Some(v),
-            Self::Tombstone => None,
-        }
-    }
-
-    pub(crate) fn merkle_value(&self) -> &[u8] {
-        match self {
-            Self::Some(v) => v,
-            Self::Tombstone => &[],
-        }
-    }
-
-    pub fn is_tombstone(&self) -> bool {
-        matches!(self, Self::Tombstone)
-    }
-}
-
-/// A value stored in an [`crate::incremental::IncrementalTrie`] node, abstracted
-/// so the (dominant) snapshot trie can use a compact inline representation while
-/// the delta keeps the tombstone-carrying [`MptValue`]. The snapshot never holds
-/// a tombstone (deletes are applied as removals), so its value type can drop the
-/// tombstone variant entirely — see the snapshot module.
-pub trait TrieValue {
-    /// Bytes hashed for a key terminating at this node (empty for a tombstone).
-    fn merkle_value(&self) -> &[u8];
-    /// Live value bytes, or `None` for a tombstone (logically absent).
-    fn visible_value(&self) -> Option<&[u8]>;
-    /// Build from raw value bytes — always a present/live value.
-    fn from_value_bytes(bytes: &[u8]) -> Self;
-}
-
-impl TrieValue for MptValue {
-    fn merkle_value(&self) -> &[u8] {
-        MptValue::merkle_value(self)
-    }
-    fn visible_value(&self) -> Option<&[u8]> {
-        MptValue::visible_value(self)
-    }
-    fn from_value_bytes(bytes: &[u8]) -> Self {
-        MptValue::Some(Box::from(bytes))
-    }
-}
-
-pub fn keccak(data: &[u8]) -> H256 {
-    let mut out = [0u8; 32];
-    let mut hasher = Keccak::v256();
-    hasher.update(data);
-    hasher.finalize(&mut out);
-    H256(out)
-}
 
 pub fn trie_root(kv: &BTreeMap<Vec<u8>, MptValue>) -> H256 {
     if kv.is_empty() {
@@ -149,67 +89,11 @@ fn common_prefix_len(entries: &[(Vec<u8>, &MptValue)], depth: usize) -> usize {
     }
 }
 
-pub(crate) fn compute_node_merkle(
-    children_merkles: Option<&[H256; CHILDREN]>,
-    maybe_value: Option<&[u8]>,
-) -> H256 {
-    let mut buffer = Vec::with_capacity(1 + 32 * CHILDREN + maybe_value.map_or(0, |v| 1 + v.len()));
-    buffer.push(b'n');
-    let empty = [MERKLE_NULL_NODE; CHILDREN];
-    let children = children_merkles.unwrap_or(&empty);
-    for child in children {
-        buffer.extend_from_slice(child.as_bytes());
-    }
-    if let Some(value) = maybe_value {
-        buffer.push(b'v');
-        buffer.extend_from_slice(value);
-    }
-    keccak(&buffer)
-}
-
-pub(crate) fn compute_path_merkle(
-    path_nibbles: &[u8],
-    start_depth: usize,
-    node_merkle: H256,
-) -> H256 {
-    if path_nibbles.is_empty() {
-        return node_merkle;
-    }
-    let without_first_nibble = start_depth % 2 == 1;
-    let compressed = compress_nibbles(path_nibbles, without_first_nibble);
-    let path_info = 128u8 + 64u8 * (without_first_nibble as u8) + (path_nibbles.len() as u8 % 63);
-    let mut buffer = Vec::with_capacity(1 + compressed.len() + 32);
-    buffer.push(path_info);
-    buffer.extend_from_slice(&compressed);
-    buffer.extend_from_slice(node_merkle.as_bytes());
-    keccak(&buffer)
-}
-
 pub(crate) fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push(b >> 4);
         out.push(b & 0x0f);
-    }
-    out
-}
-
-fn compress_nibbles(nibbles: &[u8], without_first_nibble: bool) -> Vec<u8> {
-    let (first, rest) = if without_first_nibble {
-        let (first, rest) = nibbles.split_first().expect("non-empty path");
-        (Some(*first), rest)
-    } else {
-        (None, nibbles)
-    };
-
-    let mut out = Vec::with_capacity(first.map_or(0, |_| 1) + rest.len().div_ceil(2));
-    if let Some(first) = first {
-        out.push(first);
-    }
-    for pair in rest.chunks(2) {
-        let hi = pair[0] << 4;
-        let lo = pair.get(1).copied().unwrap_or(0);
-        out.push(hi | lo);
     }
     out
 }

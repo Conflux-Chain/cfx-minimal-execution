@@ -54,7 +54,8 @@ pub struct State {
     last_root: Option<CommitRoot>,
     // Memoized delta-trie root: writers mark dirty keys here so `commit` only
     // re-hashes changed subtrees instead of the whole delta (see
-    // `crate::incremental`). Holds no data, just cached subtree hashes.
+    // `crate::incremental`). Holds its own copy of the delta entries (a second,
+    // two-level store) alongside the cached subtree hashes.
     delta_inc: crate::incremental::IncrementalTrie,
     /// Per-period caches of `new_account_key` derivations (the hot keccak in
     /// `to_delta_mpt_key_bytes`), one per active padding. `RefCell` so `get` can

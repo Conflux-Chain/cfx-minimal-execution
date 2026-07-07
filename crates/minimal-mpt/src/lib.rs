@@ -1,13 +1,15 @@
 mod codec;
-mod entries;
-mod incremental;
 mod key_codec;
-mod nibbles;
+mod merkle;
 mod snapshot;
 mod state;
 mod store;
 mod trie;
 mod types;
+
+pub(crate) use trie::nibbles;
+pub(crate) use trie::root as incremental;
+pub(crate) use trie::store::two_level as entries;
 
 pub use key_codec::{DeltaMptKeyPadding, StorageKey, StorageKeyWithSpace};
 pub use state::{State, StateTrait};
