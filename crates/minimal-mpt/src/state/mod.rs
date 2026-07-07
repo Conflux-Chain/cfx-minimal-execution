@@ -217,12 +217,11 @@ impl State {
     }
 
     /// Reconstruct a `State` by streaming the serialized `PersistedState`
-    /// fields directly from `reader`, in the exact field order bincode uses for
-    /// `PersistedState` (snapshot, intermediate, delta, paddings, height,
-    /// snapshot_epoch_count, last_root). The snapshot is streamed into its
-    /// backing store (nibble map or LMDB) without ever materializing the
-    /// byte-keyed `BTreeMap`; the remaining (small) fields are read via bincode.
-    /// This is the load-side counterpart to the executor's `save_streaming`.
+    /// fields directly from `reader`. The wire layout (field order + framing) is
+    /// defined once in [`crate::persist::format`] — this reader must follow it.
+    /// The snapshot is streamed into its backing store without ever materializing
+    /// the byte-keyed `BTreeMap`; the remaining (small) fields are read via
+    /// bincode. This is the load-side counterpart to `write_streaming`.
     pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
         let bin = |e: bincode::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
         let timing = crate::diag::recover_timing();
@@ -278,9 +277,9 @@ impl State {
         })
     }
 
-    /// Stream this state in the exact `PersistedState` field order that
-    /// `from_reader` consumes: snapshot, intermediate, delta, paddings, height,
-    /// snapshot_epoch_count, last_root.
+    /// Stream this state in the on-disk wire layout defined once in
+    /// [`crate::persist::format`] (field order + snapshot framing), which
+    /// `from_reader` consumes.
     pub fn write_streaming(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         use crate::persist::wire::{write_len_prefixed, write_u64_le};
 
