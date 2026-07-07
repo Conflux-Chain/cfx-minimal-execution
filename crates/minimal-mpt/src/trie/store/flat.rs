@@ -11,15 +11,15 @@
 //! `incremental_trie` differential fuzz, which drives both stores through the same
 //! engine and asserts equal roots).
 //!
-//! This store is the delta layer's future backing (a delta is small and hot, so
-//! the two-level prefix factoring buys nothing there); it has no production user
-//! in this commit and is exercised only by tests / fuzz.
+//! This store is the delta layer's backing (a delta is small and hot, so the
+//! two-level prefix factoring buys nothing there): [`crate::state::layers::delta`]
+//! and [`crate::state::layers::intermediate`] are both `FlatStore<MptValue>`,
+//! collapsing the historical `State.delta` `BTreeMap` + `delta_inc` two-level
+//! duplicate into this one store.
 //!
 //! Keys are surfaced to the walk as a [`Nibbles`] view over the stored byte key
 //! ([`Nibbles::from_bytes`]) — semantically identical to the two-level store's
 //! `head ++ tail` composite view, since both express the same canonical key.
-
-#![allow(dead_code)] // no production user until the delta layer wires it (c14)
 
 use crate::nibbles::{NibbleRef, Nibbles};
 use crate::trie::reader::{TrieReader, TrieStore};
@@ -117,6 +117,62 @@ impl<V> FlatStore<V> {
         let lo = prefix.packed();
         let hi = prefix_upper(lo, prefix.is_even());
         (Bound::Included(lo), hi)
+    }
+
+    // --- Value-typed access used by the delta / intermediate state layers. These
+    // operate on the raw canonical byte key (for the delta layers that key is the
+    // delta-mpt-padded key) and never touch the nibble-routing machinery above. ---
+
+    /// Number of stored entries.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Point lookup by exact byte key.
+    #[inline]
+    pub(crate) fn get(&self, key: &[u8]) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    /// The inner map, for direct (bincode) serialization of the layer — a
+    /// `BTreeMap<Box<[u8]>, V>` serializes byte-for-byte identically to the
+    /// historical `BTreeMap<Vec<u8>, V>` (same sort order, same `[u8]` seq
+    /// encoding of each key), so the checkpoint bytes are unchanged.
+    #[inline]
+    pub(crate) fn raw_entries(&self) -> &BTreeMap<Box<[u8]>, V> {
+        &self.map
+    }
+
+    /// Consume the store, yielding its inner map (used to MOVE a finished delta's
+    /// store into the intermediate layer at rotation, with no re-materialization).
+    #[inline]
+    pub(crate) fn into_entries(self) -> BTreeMap<Box<[u8]>, V> {
+        self.map
+    }
+
+    /// Ascending byte-**prefix** scan: every entry whose full byte key starts with
+    /// `prefix`. This is the state-level (delta-mpt-padded) prefix scan — a plain
+    /// byte `starts_with`, byte-for-byte identical to the historical
+    /// `BTreeMap::range(prefix..).take_while(|k| k.starts_with(prefix))`; it is NOT
+    /// the nibble-prefix routing the trie walk uses ([`TrieReader::prefix_first`]).
+    pub(crate) fn scan_byte_prefix<'a>(
+        &'a self,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a [u8], &'a V)> {
+        self.map
+            .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(move |(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (&k[..], v))
+    }
+
+    /// Materialize a `BTreeMap<Vec<u8>, V>` copy of the store (for the checkpoint
+    /// `PersistedState` image and the `verify-incremental` oracle cross-check).
+    pub(crate) fn to_value_map(&self) -> BTreeMap<Vec<u8>, V>
+    where
+        V: Clone,
+    {
+        self.map.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect()
     }
 }
 

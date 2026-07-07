@@ -12,7 +12,7 @@ use crate::{
     trie::MptValue,
     Result,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 impl State {
     pub(super) fn read_prefix(&self, prefix: StorageKeyWithSpace) -> Result<Vec<MptKeyValue>> {
@@ -25,28 +25,21 @@ impl State {
         let mut result = Vec::new();
         let mut seen = HashSet::new();
 
-        for (raw_key, value) in scan_prefix(&self.delta, &delta_prefix) {
-            let canonical = StorageKeyWithSpace::from_delta_mpt_key(raw_key)?.to_key_bytes()?;
-            if address_prefix.is_some_and(|prefix| !canonical.starts_with(prefix)) {
-                continue;
-            }
-            seen.insert(canonical.clone());
-            if let Some(value) = value.visible_value() {
-                result.push((canonical, Box::from(value)));
-            }
-        }
-
-        for (raw_key, value) in scan_prefix(&self.intermediate, &intermediate_prefix) {
-            let canonical = StorageKeyWithSpace::from_delta_mpt_key(raw_key)?.to_key_bytes()?;
-            if address_prefix.is_some_and(|prefix| !canonical.starts_with(prefix)) {
-                continue;
-            }
-            if seen.insert(canonical.clone()) {
-                if let Some(value) = value.visible_value() {
-                    result.push((canonical, Box::from(value)));
-                }
-            }
-        }
+        // Delta then intermediate: same (delta-mpt-padded, `FlatStore`-backed)
+        // representation, so one parameterized pass each with delta-over-
+        // intermediate precedence (first layer to claim a canonical key wins).
+        collect_layer_prefix(
+            self.delta.scan_prefix(&delta_prefix),
+            address_prefix,
+            &mut seen,
+            &mut result,
+        )?;
+        collect_layer_prefix(
+            self.intermediate.scan_prefix(&intermediate_prefix),
+            address_prefix,
+            &mut seen,
+            &mut result,
+        )?;
 
         for (key, value) in self.snapshot.snapshot_scan_prefix(&canonical_prefix) {
             if seen.insert(key.clone()) {
@@ -67,19 +60,22 @@ impl State {
             prefix.to_delta_mpt_key_bytes(&self.intermediate_padding, None)?;
         let address_prefix = address_prefix_filter(&prefix).map(Vec::from);
 
-        let delta_keys: Vec<_> = scan_prefix(&self.delta, &delta_prefix)
-            .map(|(raw_key, _)| raw_key.clone())
+        // Collect the matching delta entries (key + value) first, then remove them
+        // — every scanned key is present, so this is the old "remove, push if it
+        // was there" with the presence check already discharged by the scan.
+        let delta_kvs: Vec<(Vec<u8>, MptValue)> = self
+            .delta
+            .scan_prefix(&delta_prefix)
+            .map(|(raw_key, value)| (raw_key.to_vec(), value.clone()))
             .collect();
-        let mut delta_kvs = Vec::with_capacity(delta_keys.len());
-        for raw_key in delta_keys {
-            if let Some(value) = self.delta.remove(&raw_key) {
-                self.delta_inc.remove(&raw_key);
-                delta_kvs.push((raw_key, value));
-            }
+        for (raw_key, _) in &delta_kvs {
+            self.delta.remove(raw_key);
         }
 
-        let intermediate_kvs: Vec<_> = scan_prefix(&self.intermediate, &intermediate_prefix)
-            .map(|(raw_key, value)| (raw_key.clone(), value.clone()))
+        let intermediate_kvs: Vec<(Vec<u8>, MptValue)> = self
+            .intermediate
+            .scan_prefix(&intermediate_prefix)
+            .map(|(raw_key, value)| (raw_key.to_vec(), value.clone()))
             .collect();
         let snapshot_kvs: Vec<_> = self.snapshot.snapshot_scan_prefix(&canonical_prefix);
 
@@ -131,12 +127,30 @@ impl State {
     }
 }
 
-fn scan_prefix<'a>(
-    map: &'a BTreeMap<Vec<u8>, MptValue>,
-    prefix: &'a [u8],
-) -> impl Iterator<Item = (&'a Vec<u8>, &'a MptValue)> {
-    map.range(prefix.to_vec()..)
-        .take_while(move |(key, _)| key.starts_with(prefix))
+/// One delta-mpt layer's contribution to a prefix read: convert each scanned raw
+/// key back to canonical, apply the optional address-prefix re-filter, and record
+/// the first layer to claim each canonical key (a tombstone still claims the key,
+/// hiding lower layers, but contributes no value). Parameterized over the layer's
+/// scan iterator so delta and intermediate — now the same representation — share
+/// this one path.
+fn collect_layer_prefix<'a>(
+    entries: impl Iterator<Item = (&'a [u8], &'a MptValue)>,
+    address_prefix: Option<&[u8]>,
+    seen: &mut HashSet<Vec<u8>>,
+    result: &mut Vec<MptKeyValue>,
+) -> Result<()> {
+    for (raw_key, value) in entries {
+        let canonical = StorageKeyWithSpace::from_delta_mpt_key(raw_key)?.to_key_bytes()?;
+        if address_prefix.is_some_and(|prefix| !canonical.starts_with(prefix)) {
+            continue;
+        }
+        if seen.insert(canonical.clone()) {
+            if let Some(value) = value.visible_value() {
+                result.push((canonical, Box::from(value)));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn address_prefix_filter(prefix: &StorageKeyWithSpace) -> Option<&[u8]> {

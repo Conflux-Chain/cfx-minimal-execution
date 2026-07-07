@@ -1,9 +1,11 @@
+use crate::state::layers::delta::DeltaLayer;
+use crate::state::layers::intermediate::IntermediateLayer;
 use crate::state::layers::snapshot::SnapshotTrie;
 use crate::{
     keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
     persist::format::PersistedState,
     primitives::{MptKeyValue, H256, MERKLE_NULL_NODE},
-    trie::{trie_root, IncrementalTrie, MptValue},
+    trie::{trie_root, MptValue},
     Result,
 };
 use serde::{Deserialize, Serialize};
@@ -71,20 +73,19 @@ pub struct State {
     /// `advance_after_commit` mutates it, at boundaries. No clone, no double
     /// buffer: the incremental root is cheap enough to do synchronously.
     snapshot: SnapshotTrie,
-    intermediate: BTreeMap<Vec<u8>, MptValue>,
-    delta: BTreeMap<Vec<u8>, MptValue>,
+    /// The frozen intermediate layer: a `FlatStore` plus its remembered
+    /// intermediate-delta root (see [`IntermediateLayer`]).
+    intermediate: IntermediateLayer,
+    /// The in-flight delta layer: a single `AuthenticatedTrie<FlatStore>` that is
+    /// *both* the point-read/prefix store and the incremental delta root — one
+    /// copy, not the old `BTreeMap` + `delta_inc` pair (see [`DeltaLayer`]).
+    delta: DeltaLayer,
     snapshot_root: H256,
-    intermediate_root: H256,
     intermediate_padding: DeltaMptKeyPadding,
     delta_padding: DeltaMptKeyPadding,
     height: u64,
     snapshot_epoch_count: u32,
     last_root: Option<CommitRoot>,
-    // Memoized delta-trie root: writers mark dirty keys here so `commit` only
-    // re-hashes changed subtrees instead of the whole delta (see
-    // `crate::trie`). Holds its own copy of the delta entries (a second,
-    // two-level store) alongside the cached subtree hashes.
-    delta_inc: IncrementalTrie,
     /// Per-period caches of `new_account_key` derivations (the hot keccak in
     /// `to_delta_mpt_key_bytes`), one per active padding. `RefCell` so `get` can
     /// fill them behind `&self`; padding-stamped so they self-invalidate, and
@@ -104,16 +105,14 @@ impl State {
     pub fn new() -> Self {
         Self {
             snapshot: SnapshotTrie::default(),
-            intermediate: BTreeMap::new(),
-            delta: BTreeMap::new(),
+            intermediate: IntermediateLayer::default(),
+            delta: DeltaLayer::default(),
             snapshot_root: MERKLE_NULL_NODE,
-            intermediate_root: MERKLE_NULL_NODE,
             intermediate_padding: DeltaMptKeyPadding::genesis(),
             delta_padding: DeltaMptKeyPadding::genesis(),
             height: 0,
             snapshot_epoch_count: DEFAULT_SNAPSHOT_EPOCH_COUNT,
             last_root: None,
-            delta_inc: IncrementalTrie::default(),
             delta_account_cache: Default::default(),
             intermediate_account_cache: Default::default(),
         }
@@ -145,8 +144,8 @@ impl State {
         let intermediate_entries = state.intermediate.len();
         let delta_entries = state.delta.len();
 
-        let intermediate = state.intermediate;
-        let delta = state.delta;
+        let intermediate_map = state.intermediate;
+        let delta_map = state.delta;
         let t = std::time::Instant::now();
         let mut snapshot_inc = SnapshotTrie::from_snapshot(&state.snapshot);
         if recover_timing {
@@ -166,7 +165,7 @@ impl State {
             );
         }
         let t = std::time::Instant::now();
-        let intermediate_root = trie_root(&intermediate);
+        let intermediate_root = trie_root(&intermediate_map);
         if recover_timing {
             eprintln!(
                 "[recover] intermediate_root entries={} elapsed={}ms",
@@ -174,15 +173,16 @@ impl State {
                 t.elapsed().as_millis()
             );
         }
+        let intermediate = IntermediateLayer::from_map(&intermediate_map, intermediate_root);
         let intermediate_padding = DeltaMptKeyPadding(state.intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(state.delta_mpt_key_padding);
-        // Seed the incremental trie with the loaded delta (one nibble pass);
-        // built before `delta` is moved into the struct.
+        // Build the single delta store from the loaded delta (one flat pass; the
+        // first `root` warms the cache).
         let t = std::time::Instant::now();
-        let delta_inc = IncrementalTrie::from_delta(&delta);
+        let delta = DeltaLayer::from_map(&delta_map);
         if recover_timing {
             eprintln!(
-                "[recover] delta_inc_build entries={} elapsed={}ms",
+                "[recover] delta_build entries={} elapsed={}ms",
                 delta_entries,
                 t.elapsed().as_millis()
             );
@@ -199,7 +199,6 @@ impl State {
             intermediate,
             delta,
             snapshot_root,
-            intermediate_root,
             intermediate_padding,
             delta_padding,
             last_root: state.last_root,
@@ -209,7 +208,6 @@ impl State {
             } else {
                 state.snapshot_epoch_count
             },
-            delta_inc,
             delta_account_cache: Default::default(),
             intermediate_account_cache: Default::default(),
         }
@@ -233,16 +231,16 @@ impl State {
     ) -> Self {
         let snapshot_root = snapshot.root();
         let intermediate_root = trie_root(&intermediate);
+        let intermediate = IntermediateLayer::from_map(&intermediate, intermediate_root);
+        let delta = DeltaLayer::from_map(&delta);
         let intermediate_padding = DeltaMptKeyPadding(intermediate_mpt_key_padding);
         let delta_padding = DeltaMptKeyPadding(delta_mpt_key_padding);
-        let delta_inc = IncrementalTrie::from_delta(&delta);
 
         Self {
             snapshot,
             intermediate,
             delta,
             snapshot_root,
-            intermediate_root,
             intermediate_padding,
             delta_padding,
             last_root,
@@ -252,7 +250,6 @@ impl State {
             } else {
                 snapshot_epoch_count
             },
-            delta_inc,
             delta_account_cache: Default::default(),
             intermediate_account_cache: Default::default(),
         }
@@ -291,12 +288,12 @@ impl State {
         self.snapshot.for_each_canonical(f)
     }
 
-    pub(crate) fn intermediate_entries(&self) -> &BTreeMap<Vec<u8>, MptValue> {
-        &self.intermediate
+    pub(crate) fn intermediate_entries(&self) -> &BTreeMap<Box<[u8]>, MptValue> {
+        self.intermediate.raw_entries()
     }
 
-    pub(crate) fn delta_entries(&self) -> &BTreeMap<Vec<u8>, MptValue> {
-        &self.delta
+    pub(crate) fn delta_entries(&self) -> &BTreeMap<Box<[u8]>, MptValue> {
+        self.delta.raw_entries()
     }
 
     pub(crate) fn intermediate_padding_bytes(&self) -> [u8; 32] {
@@ -314,8 +311,8 @@ impl State {
     pub fn persisted(&self) -> PersistedState {
         PersistedState {
             snapshot: self.snapshot.to_canonical_map(),
-            intermediate: self.intermediate.clone(),
-            delta: self.delta.clone(),
+            intermediate: self.intermediate.to_btreemap(),
+            delta: self.delta.to_btreemap(),
             intermediate_mpt_key_padding: self.intermediate_padding.0,
             delta_mpt_key_padding: self.delta_padding.0,
             height: self.height,
@@ -362,8 +359,7 @@ impl StateTrait for State {
         } else {
             MptValue::Some(value)
         };
-        self.delta_inc.insert(&raw, value.clone());
-        self.delta.insert(raw, value);
+        self.delta.insert(&raw, value);
         Ok(())
     }
 
@@ -384,7 +380,7 @@ impl StateTrait for State {
         let delta_root = if crate::diag::delta_timing() {
             use std::sync::atomic::Ordering::Relaxed;
             let t = std::time::Instant::now();
-            let r = self.delta_inc.root();
+            let r = self.delta.root();
             let ns = t.elapsed().as_nanos() as u64;
             let sum = DELTA_ROOT_NS.fetch_add(ns, Relaxed) + ns;
             let cnt = DELTA_ROOT_CNT.fetch_add(1, Relaxed) + 1;
@@ -399,7 +395,7 @@ impl StateTrait for State {
             }
             r
         } else {
-            self.delta_inc.root()
+            self.delta.root()
         };
         // Cross-check against the stateless oracle, but only under tests / the
         // `verify-incremental` feature (fuzzing). NOT `debug_assert!`: this
@@ -409,12 +405,12 @@ impl StateTrait for State {
         #[cfg(any(test, feature = "verify-incremental"))]
         assert_eq!(
             delta_root,
-            trie_root(&self.delta),
+            trie_root(&self.delta.to_btreemap()),
             "incremental delta root diverged from stateless trie_root"
         );
         let root = CommitRoot::new(
             self.snapshot_root,
-            self.intermediate_root,
+            self.intermediate.root(),
             delta_root,
             self.delta_padding.0,
         );

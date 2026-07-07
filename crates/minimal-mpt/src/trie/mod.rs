@@ -44,6 +44,26 @@ impl<S> AuthenticatedTrie<S> {
     pub(crate) fn store(&self) -> &S {
         &self.store
     }
+
+    /// Consume the trie, yielding its store (dropping the cache/dirty engine). The
+    /// delta layer uses this to MOVE its finished store into the intermediate layer
+    /// at a period boundary — no re-materialization of the entries.
+    #[inline]
+    pub(crate) fn into_store(self) -> S {
+        self.store
+    }
+
+    /// Wrap an already-populated store with a fresh `Full`-policy engine (empty
+    /// dirty set; the first `root` is a full recompute that warms the cache).
+    /// Matches `from_delta`'s "build the store, don't mark each key dirty"
+    /// semantics for any store backend — the delta layer's load path.
+    #[inline]
+    pub(crate) fn from_store(store: S) -> Self {
+        Self {
+            store,
+            engine: RootEngine::new(CachePolicy::Full),
+        }
+    }
 }
 
 impl<S: Default> AuthenticatedTrie<S> {

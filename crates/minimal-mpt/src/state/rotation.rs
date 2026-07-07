@@ -9,6 +9,7 @@ use super::State;
 use crate::{
     keys::{DeltaMptKeyPadding, StorageKeyWithSpace},
     primitives::H256,
+    state::layers::intermediate::IntermediateLayer,
     Result,
 };
 
@@ -27,8 +28,9 @@ impl State {
         // the snapshot can be mutated without aliasing it.
         let timing = crate::diag::merge_timing();
         let t0 = std::time::Instant::now();
-        let mut snapshot_updates = Vec::with_capacity(self.intermediate.len());
-        for (raw_key, value) in std::mem::take(&mut self.intermediate) {
+        let old_intermediate = std::mem::take(&mut self.intermediate);
+        let mut snapshot_updates = Vec::with_capacity(old_intermediate.len());
+        for (raw_key, value) in old_intermediate.into_entries() {
             let canonical = StorageKeyWithSpace::from_delta_mpt_key(&raw_key)?.to_key_bytes()?;
             snapshot_updates.push((canonical, value));
         }
@@ -48,15 +50,16 @@ impl State {
             );
         }
 
-        // Rotate: the just-finished delta becomes the new intermediate. Delta is
-        // now empty (and the padding below changes the key space), so the cached
-        // delta subtree hashes no longer apply.
-        self.intermediate = std::mem::take(&mut self.delta);
-        self.delta_inc.clear();
-        self.intermediate_root = delta_root;
+        // Rotate: the just-finished delta becomes the new intermediate. Its store
+        // is MOVED in as-is (no re-materialization) and the remembered delta root
+        // becomes the intermediate root; the delta restarts empty (with a fresh
+        // engine — the padding below changes the key space, so the old cached delta
+        // subtree hashes could not apply anyway).
+        let finished_delta = std::mem::take(&mut self.delta);
+        self.intermediate = IntermediateLayer::from_store(finished_delta.into_store(), delta_root);
         self.intermediate_padding = self.delta_padding.clone();
         self.delta_padding =
-            DeltaMptKeyPadding::from_roots(self.snapshot_root, self.intermediate_root);
+            DeltaMptKeyPadding::from_roots(self.snapshot_root, self.intermediate.root());
         // Rotate the account-key caches to match the padding rotation above: the
         // new intermediate padding equals the old delta padding, so the old delta
         // cache is exactly valid as the new intermediate cache (and the padding
