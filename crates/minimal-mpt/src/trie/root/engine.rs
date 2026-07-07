@@ -71,6 +71,9 @@ impl RootEngine {
     }
 
     /// Drop all cached hashes and pending dirty keys (e.g. on a delta reset).
+    // Reached only through `AuthenticatedTrie::clear`, whose sole caller is the
+    // `empty_after_clear_is_null` test — reads dead in the lib build alone.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.cache.clear();
         self.dirty.clear();

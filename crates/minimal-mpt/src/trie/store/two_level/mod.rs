@@ -185,6 +185,9 @@ impl<V> Entries<V> {
         self.len == 0
     }
 
+    // Reached only through the `TrieStore::clear` impl → `AuthenticatedTrie::clear`
+    // (test-only path); reads dead in the lib build alone.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.len = 0;

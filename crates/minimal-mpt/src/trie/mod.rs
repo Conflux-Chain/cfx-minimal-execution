@@ -100,6 +100,9 @@ impl<S: TrieStore> AuthenticatedTrie<S> {
 
     /// Drop all entries, cached hashes and pending dirty keys (e.g. on a delta
     /// reset at snapshot rotation).
+    // Exercised only by the `empty_after_clear_is_null` test; reads dead in the
+    // lib build alone.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.store.clear();
         self.engine.clear();
@@ -157,6 +160,9 @@ impl AuthenticatedTrie<Entries<MptValue>> {
     /// state); `Full` policy. The cache starts empty, so the first `root` is a
     /// full (correct) recompute that populates it. Delta-only, so it keeps
     /// `MptValue` (tombstones are meaningful in the delta).
+    // Exercised only by the `from_delta_matches_oracle` test; reads dead in the
+    // lib build alone.
+    #[allow(dead_code)]
     pub(crate) fn from_delta(delta: &BTreeMap<Vec<u8>, MptValue>) -> Self {
         let mut store = Entries::new();
         for (k, v) in delta {
@@ -205,6 +211,9 @@ impl<V: TrieValue> IncrementalTrie<V> {
     }
 
     /// Drop all entries, cached hashes and pending dirty keys.
+    // Public under `fuzzing`; in the lib build it is only reached by the
+    // `empty_after_clear_is_null` test, so it reads dead there.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.0.clear();
     }
@@ -242,6 +251,9 @@ impl<V: TrieValue> IncrementalTrie<V> {
 
 impl IncrementalTrie<MptValue> {
     /// Build a **delta** trie from an existing byte-keyed delta (`Full` policy).
+    // Public under `fuzzing`; in the lib build it is only reached by the
+    // `from_delta_matches_oracle` test, so it reads dead there.
+    #[allow(dead_code)]
     pub fn from_delta(delta: &BTreeMap<Vec<u8>, MptValue>) -> Self {
         Self(AuthenticatedTrie::from_delta(delta))
     }

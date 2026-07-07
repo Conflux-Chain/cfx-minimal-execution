@@ -65,6 +65,9 @@ pub(crate) trait TrieStore: TrieReader {
     fn remove(&mut self, key: &[u8]);
 
     /// Drop all entries.
+    // Reached only through `AuthenticatedTrie::clear` (test-only path); reads
+    // dead in the lib build alone.
+    #[allow(dead_code)]
     fn clear(&mut self);
 
     /// Feed an **ascending, sorted** batch (keys all greater than any already

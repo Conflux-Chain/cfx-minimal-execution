@@ -14,7 +14,7 @@ pub(crate) use trie::store::two_level as entries;
 pub use keys::{DeltaMptKeyPadding, StorageKey, StorageKeyWithSpace};
 pub use persist::format::PersistedState;
 pub use persist::{load_state, save_state};
-pub use primitives::{MptKeyValue, Space, H256, MERKLE_NULL_NODE};
+pub use primitives::{Space, H256, MERKLE_NULL_NODE};
 pub use state::{CommitRoot, State, StateTrait};
 pub use trie::MptValue;
 
@@ -29,6 +29,11 @@ pub use trie::IncrementalTrie;
 // to prove the engine is store-independent (same root over either backend).
 #[cfg(fuzzing)]
 pub use trie::FlatTrie;
+// `MptKeyValue` (the `(key, value)` pair the prefix-scan APIs yield) is named only
+// by the `layered_state_ops` fuzz harness. The `StateTrait` methods that return it
+// stay callable off the public tuple type; downstream crates use their own alias.
+#[cfg(fuzzing)]
+pub use primitives::MptKeyValue;
 
 #[derive(Debug)]
 pub enum Error {
