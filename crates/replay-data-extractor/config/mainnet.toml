@@ -2,7 +2,9 @@
 #
 # Authoritative values from conflux-rust v3.0.3-fix
 # (crates/config/src/configuration.rs defaults + crates/parameters/src/lib.rs).
-# Pass to `cfx-replay-data-extractor extract-packed --config <this file>`.
+# Embedded at compile time as the extractor's default chain config
+# (`ChainParams::mainnet`); editing it requires a rebuild to take effect.
+# `--config <file>` overrides with another TOML at runtime.
 
 # espace flag: a pivot block at `height % ratio == 0` carries eSpace txs.
 evm_transaction_block_ratio = 5

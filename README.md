@@ -37,8 +37,7 @@ cfx-replay-data-extractor extract-packed \
     --output-dir ./data/packed-full \
     --start-epoch 1 --epoch-count 150000000 \
     --shard-epochs 2000 --jobs 24 \
-    --target-bytes 104857600 --prefix epochs \
-    --config crates/replay-data-extractor/mainnet.toml
+    --target-bytes 104857600 --prefix epochs
 ```
 
 | 参数 | 说明 |
@@ -49,11 +48,11 @@ cfx-replay-data-extractor extract-packed \
 | `--jobs` | 并行提取线程数（建议 CPU 核数） |
 | `--target-bytes` | 单个容器文件的目标大小（默认 100 MiB） |
 | `--prefix` | 输出文件名前缀 |
-| `--config` | 链参数配置（含 `pos_reference_enable_height` 等 CIP 激活高度） |
+| `--config` | 链参数配置（含 `pos_reference_enable_height` 等 CIP 激活高度）。省略或传 `mainnet` 时使用编译期内置的 `crates/replay-data-extractor/config/mainnet.toml`；传文件路径可覆盖 |
 
 产出的 `.cfxpack` 文件按 epoch 范围命名（如 `epochs_1_574000.cfxpack`），每个文件约 100 MiB，内部索引支持任意 2000-epoch 组的随机定位。全量提取（~1.5 亿 epoch，24 jobs）约需一天。
 
-> **注意**：`--config` 必须传入正确的链参数。PoS 激活高度（mainnet 37400000）之后的区块携带 `pos_view` 字段，需要配置文件中的 `pos_reference_enable_height` 来正确编解码。Pre-PoS 区间不受影响（新旧 encoder 输出逐字节一致）。
+> **注意**：链参数必须正确。PoS 激活高度（mainnet 37400000）之后的区块携带 `pos_view` 字段，需要 `pos_reference_enable_height` 来正确编解码；Pre-PoS 区间不受影响（新旧 encoder 输出逐字节一致）。默认的内置 mainnet 参数对主网数据即为正确值，只有提取非主网数据时才需要自备配置文件。
 
 **重放与验证**：
 
@@ -94,17 +93,15 @@ replay progress t=2562s height=23694000 groups=... state_match=4580000/4580000 l
 
 ### 提取器 `cfx-replay-data-extractor`
 
-主要入口是 `extract-packed`，其余子命令用于调试和数据维护：
+主要入口是 `extract-packed`，其余子命令用于调试：
 
 | 子命令 | 用途 |
 |--------|------|
 | `extract-packed` | 批量提取并打包为 `.cfxpack`（生产入口） |
-| `extract-shards` | 按 epoch 分片提取（中间格式，供调试） |
-| `extract` | 提取单个 packet（调试） |
 | `verify` | 校验 packet 编码完整性 |
 | `roundtrip` | 解码再编码，验证可逆性 |
-| `bench-decode` | 解码吞吐基准 |
-| `add-total-reward-flag` | 补丁工具：为旧格式数据补充 reward=0 标记 |
+
+一次性 / 排查工具是独立 bin（`src/bin/`）：`bench_decode`（解码吞吐基准）、`add_total_reward_flag`（为旧归档补 reward=0 标记，新提取的数据已在提取时写入该标记）、`dump_epoch`、`dump_pos_reward`（直接扫节点 DB 的对拍工具）。
 
 ### Feature flags
 

@@ -16,7 +16,6 @@ use std::{
 mod db;
 mod flagpatch;
 mod pack;
-mod shards;
 mod tables;
 
 pub use flagpatch::{add_total_reward_flag, FlagPatchSummary};
@@ -27,7 +26,6 @@ use db::{
 };
 use pack::run_packed;
 pub use pack::{PackSummary, DEFAULT_PACK_TARGET_BYTES};
-use shards::run_shards;
 use tables::build_tables;
 
 #[derive(Debug, Clone)]
@@ -73,6 +71,14 @@ impl ChainParams {
             .with_context(|| format!("read chain config {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parse chain config {}", path.display()))
     }
+
+    /// Mainnet parameters: the crate's `mainnet.toml` embedded at compile time
+    /// and parsed through the same TOML path as `from_toml_file`, so the file
+    /// stays the single source of truth. Validity is covered by a unit test.
+    pub fn mainnet() -> Self {
+        toml::from_str(include_str!("../../config/mainnet.toml"))
+            .expect("embedded mainnet.toml must parse as ChainParams")
+    }
 }
 
 impl Default for ExtractConfig {
@@ -106,31 +112,6 @@ pub struct ExtractTiming {
     pub encode_ms: u128,
     pub verify_ms: u128,
     pub write_ms: u128,
-}
-
-pub fn extract_to_file(config: &ExtractConfig, output: impl AsRef<Path>) -> Result<ExtractReport> {
-    Databases::open(config)?.to_file(config, output)
-}
-
-pub fn extract_shards_to_dir(
-    config: &ExtractConfig,
-    output_dir: impl AsRef<Path>,
-    shard_epochs: u64,
-    jobs: usize,
-) -> Result<Vec<ExtractReport>> {
-    ensure!(config.epoch_count > 0, "epoch_count must be positive");
-    ensure!(shard_epochs > 0, "shard_epochs must be positive");
-    ensure!(jobs > 0, "jobs must be positive");
-    let _ = CIP112_TRANSITION_HEIGHT.set(config.chain.cip112_transition_height);
-
-    let output_dir = output_dir.as_ref().to_path_buf();
-    std::fs::create_dir_all(&output_dir)
-        .with_context(|| format!("create {}", output_dir.display()))?;
-    let dbs = Databases::open(config)?;
-
-    let mut reports = run_shards(config, &output_dir, shard_epochs, jobs, &dbs)?;
-    reports.sort_by_key(|report| report.start_epoch);
-    Ok(reports)
 }
 
 /// Extract `config.epoch_count` epochs as 2000-epoch groups (unchanged spec),
@@ -167,16 +148,6 @@ pub fn extract_packed_to_dir(
     )
 }
 
-pub fn extract_packet(config: &ExtractConfig) -> Result<Vec<u8>> {
-    let (packet, _) = Databases::open(config)?.encoded(config)?;
-    Ok(packet)
-}
-
-pub fn extract_raw_data(config: &ExtractConfig) -> Result<Packet> {
-    let (raw, _) = Databases::open(config)?.raw(config)?;
-    Ok(raw)
-}
-
 /// The node's PoW + PoS databases, opened once and reused across an extraction.
 /// Holding them in a handle keeps the entry points free of the "open vs. inject
 /// the databases" distinction that used to leak into helper names.
@@ -189,22 +160,6 @@ impl Databases {
     pub(super) fn open(config: &ExtractConfig) -> Result<Self> {
         let (pow, pos) = open_databases(config)?;
         Ok(Self { pow, pos })
-    }
-
-    /// Extract one 2000-epoch group and write its packet to `output`.
-    pub(super) fn to_file(
-        &self,
-        config: &ExtractConfig,
-        output: impl AsRef<Path>,
-    ) -> Result<ExtractReport> {
-        let (packet, mut report) = self.encoded(config)?;
-        let output = output.as_ref().to_path_buf();
-        let started = Instant::now();
-        std::fs::write(&output, &packet)
-            .with_context(|| format!("write packet {}", output.display()))?;
-        report.timing.write_ms = started.elapsed().as_millis();
-        report.output = output;
-        Ok(report)
     }
 
     /// Extract one 2000-epoch group, returning the encoded packet bytes and a
@@ -647,4 +602,19 @@ fn collect_unlock_events(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChainParams;
+
+    /// `ChainParams::mainnet` panics if the embedded `mainnet.toml` doesn't
+    /// parse; this pins that failure to test time instead of a CLI run.
+    #[test]
+    fn embedded_mainnet_toml_parses() {
+        let params = ChainParams::mainnet();
+        assert!(params.pos_reference_enable_height < u64::MAX);
+        assert!(params.cip112_transition_height < u64::MAX);
+        assert!(params.evm_transaction_block_ratio > 0);
+    }
 }
