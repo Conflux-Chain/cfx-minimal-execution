@@ -30,6 +30,33 @@ pub(super) fn memo_node<S: TrieReader>(
     cache: &mut Cache,
     cache_policy: CachePolicy,
 ) -> H256 {
+    memo_node_via(
+        store,
+        rp,
+        allow_path_compression,
+        cache,
+        cache_policy,
+        &|s, child, c| memo_node(s, child, true, c, cache_policy),
+    )
+}
+
+/// [`memo_node`] with the child recursion abstracted into `recurse`, so the
+/// sharded cold rebuild ([`super::rebuild::memo_node_sharded`]) reuses this
+/// entire node walk verbatim while diverting each child through its
+/// materialize-below-cap escape. Generic over the closure — static dispatch,
+/// same codegen as the direct self-recursion it replaces.
+pub(super) fn memo_node_via<S, F>(
+    store: &S,
+    rp: PrefixRef,
+    allow_path_compression: bool,
+    cache: &mut Cache,
+    cache_policy: CachePolicy,
+    recurse: &F,
+) -> H256
+where
+    S: TrieReader,
+    F: Fn(&S, PrefixRef<'_>, &mut Cache) -> H256,
+{
     if let Some(hash) = cache.get(rp.as_bytes()) {
         return *hash;
     }
@@ -77,7 +104,7 @@ pub(super) fn memo_node<S: TrieReader>(
         }
         let child = PrefixRef::new(&child_buf);
         if store.prefix_exists(child) {
-            memo_node(store, child, true, cache, cache_policy)
+            recurse(store, child, cache)
         } else {
             MERKLE_NULL_NODE
         }

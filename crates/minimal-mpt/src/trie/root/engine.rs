@@ -10,7 +10,7 @@
 //! varies per call, replacing the old per-call `root_with_policy` argument.
 
 use super::memo::memo_node;
-use super::rebuild::{memo_node_rebuild, EntryRef};
+use super::rebuild::memo_node_sharded;
 use super::PARALLEL_REBUILD_THRESHOLD;
 use crate::nibbles::{empty_prefix_buf, push_nibble, PrefixKey, PrefixRef};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
@@ -106,37 +106,15 @@ impl RootEngine {
         self.dirty.clear();
 
         let result = if self.cache.is_empty() && store.len() >= PARALLEL_REBUILD_THRESHOLD {
-            let entries: Vec<EntryRef<'_>> = store
-                .iter_merkle()
-                .map(|(key, value)| {
-                    // Store the full key as its two bare segments (48 B/entry;
-                    // see `EntryRef`) — the store always surfaces full views.
-                    let (key_head, key_tail) = key
-                        .full_view_segments()
-                        .expect("store surfaces full-key views");
-                    EntryRef {
-                        key_head,
-                        key_tail,
-                        value, // precomputed merkle bytes (value type stays behind the trait)
-                    }
-                })
-                .collect();
-
-            let t = crate::diag::event("rebuild.hash");
-            let (root, cache_entries) =
-                memo_node_rebuild(&entries, PrefixRef::empty(), false, cache_policy);
-            t.finish(format_args!("cache_entries={}", cache_entries.len()));
-
-            // Free the whole-store entry vec (48 B × every entry) before the
-            // cache map allocates its table below: at checkpoint scale the two
-            // together set the process load peak (measured ~6 GiB apart).
-            drop(entries);
-
-            let t = crate::diag::event("rebuild.cache_extend");
-            self.cache.reserve(cache_entries.len());
-            self.cache.extend(cache_entries);
+            let t = crate::diag::event("rebuild.sharded");
+            let root = memo_node_sharded(
+                store,
+                PrefixRef::empty(),
+                false,
+                &mut self.cache,
+                cache_policy,
+            );
             t.finish(format_args!("cache_len={}", self.cache.len()));
-
             root
         } else {
             memo_node(
@@ -161,7 +139,7 @@ impl RootEngine {
             // surfaced merkle bytes as `Some(..)` reproduces the identical oracle
             // root — the value type stays entirely behind the trait here too.
             let oracle_owned: Vec<(Vec<u8>, crate::trie::MptValue)> = store
-                .iter_merkle()
+                .iter_merkle_prefix(PrefixRef::empty())
                 .map(|(n, merkle)| {
                     let nibbles = crate::trie::bytes_to_nibbles(&n.to_canonical_bytes());
                     (nibbles, crate::trie::MptValue::Some(Box::from(merkle)))

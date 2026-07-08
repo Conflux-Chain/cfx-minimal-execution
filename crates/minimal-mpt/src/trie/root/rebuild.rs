@@ -5,12 +5,90 @@
 //! across cores by subtree. Extracted verbatim from the old `incremental` module;
 //! the partitioning and hashing are identical to the serial [`super::memo`] path.
 
-use super::engine::CachePolicy;
-use super::PARALLEL_REBUILD_THRESHOLD;
+use super::engine::{Cache, CachePolicy};
+use super::memo::memo_node_via;
+use super::{PARALLEL_REBUILD_THRESHOLD, SHARD_CAP};
 use crate::nibbles::{pack_nibbles, push_nibble, NibbleCursor, PrefixKey, PrefixRef};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
+use crate::trie::reader::TrieReader;
 use crate::trie::{compute_node_merkle, compute_path_merkle, CHILDREN};
 use rayon::prelude::*;
+
+/// Cold-cache rebuild of a whole subtree, bounded to [`SHARD_CAP`] transient
+/// entries: a subtree that fits is materialized once and handed to the parallel
+/// [`memo_node_rebuild`] (its cache entries go straight into `cache` and both
+/// buffers die before the next shard starts); a bigger subtree is dispatched
+/// child-by-child through the ordinary [`memo_node_via`] walk, recursing back
+/// here. So the peak holds ONE shard's entry slice (~192 MiB) instead of the
+/// whole store's (~11 GiB at checkpoint scale), and the cache-entry vec is
+/// per-shard instead of store-wide.
+///
+/// The dispatch nodes above the shards are exactly the nodes `memo_node` would
+/// visit, with identical hashing/caching (the walk body is shared, not
+/// mirrored); a probe of `cap + 1` entries decides fits-vs-dispatch, so the
+/// wasted iteration is bounded by `cap × dispatch nodes` (a handful of nodes).
+pub(super) fn memo_node_sharded<S: TrieReader>(
+    store: &S,
+    rp: PrefixRef,
+    allow_path_compression: bool,
+    cache: &mut Cache,
+    cache_policy: CachePolicy,
+) -> H256 {
+    memo_node_sharded_capped(
+        store,
+        rp,
+        allow_path_compression,
+        cache,
+        cache_policy,
+        SHARD_CAP,
+    )
+}
+
+fn memo_node_sharded_capped<S: TrieReader>(
+    store: &S,
+    rp: PrefixRef,
+    allow_path_compression: bool,
+    cache: &mut Cache,
+    cache_policy: CachePolicy,
+    cap: usize,
+) -> H256 {
+    let entries: Vec<EntryRef<'_>> = store
+        .iter_merkle_prefix(rp)
+        .take(cap.saturating_add(1))
+        .map(|(key, value)| {
+            // The full key as its two bare segments (48 B/entry; see
+            // `EntryRef`) — the store always surfaces full-key views.
+            let (key_head, key_tail) = key
+                .full_view_segments()
+                .expect("store surfaces full-key views");
+            EntryRef {
+                key_head,
+                key_tail,
+                value,
+            }
+        })
+        .collect();
+    debug_assert!(!entries.is_empty(), "descended into an empty subtree");
+
+    if entries.len() <= cap {
+        let (hash, cache_entries) =
+            memo_node_rebuild(&entries, rp, allow_path_compression, cache_policy);
+        drop(entries);
+        cache.reserve(cache_entries.len());
+        cache.extend(cache_entries);
+        return hash;
+    }
+    drop(entries);
+
+    memo_node_via(
+        store,
+        rp,
+        allow_path_compression,
+        cache,
+        cache_policy,
+        &|s, child, c| memo_node_sharded_capped(s, child, true, c, cache_policy, cap),
+    )
+}
 
 /// One entry fed to the cold [`memo_node_rebuild`]: the full key as its two
 /// backing byte segments (from [`NibbleCursor::full_view_segments`]) plus its
@@ -18,10 +96,10 @@ use rayon::prelude::*;
 /// needs the merkle bytes, so the store's
 /// [`TrieReader`](crate::trie::reader::TrieReader) impl flattens its value type
 /// up front — keeping the rebuild independent of it. Nibble routing rebuilds
-/// the [`NibbleCursor`] view on demand ([`Self::nibbles`], zero cost): this array is
-/// materialized for the WHOLE store (hundreds of millions of entries) during
-/// checkpoint recovery, so the entry stays three bare slices (48 B) — a stored
-/// cursor's redundant offsets would put ~6 GiB back on the load peak.
+/// the [`NibbleCursor`] view on demand ([`Self::nibbles`], zero cost): shards of
+/// up to [`SHARD_CAP`] of these are materialized back-to-back during checkpoint
+/// recovery, so the entry stays three bare slices (48 B) — a stored cursor's
+/// redundant offsets would inflate every shard slice by half.
 #[derive(Clone, Copy)]
 pub(super) struct EntryRef<'a> {
     pub(super) key_head: &'a [u8],
@@ -114,6 +192,91 @@ pub(super) fn memo_node_rebuild(
         cache_entries.push((PrefixKey::from_bytes(rp.as_bytes()), hash));
     }
     (hash, cache_entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::memo::memo_node;
+    use super::*;
+    use crate::trie::reader::TrieStore;
+    use crate::trie::store::btree::BTreeStore;
+    use crate::trie::store::two_level::TwoLevelStore;
+    use crate::trie::{snapshot_value, MptValue};
+
+    /// For every shard cap — from "dispatch all the way to singletons" (1)
+    /// through "one shot, no dispatch" (MAX) — the sharded rebuild must produce
+    /// the same root AND the byte-identical cache as the serial `memo_node`
+    /// walk, under both cache policies.
+    fn assert_sharded_matches_memo<S: TrieReader>(store: &S) {
+        for policy in [CachePolicy::Full, CachePolicy::SkipSingleton] {
+            let mut want_cache = Cache::default();
+            let want_root = memo_node(store, PrefixRef::empty(), false, &mut want_cache, policy);
+            for cap in [1, 7, 313, usize::MAX] {
+                let mut cache = Cache::default();
+                let root = memo_node_sharded_capped(
+                    store,
+                    PrefixRef::empty(),
+                    false,
+                    &mut cache,
+                    policy,
+                    cap,
+                );
+                assert_eq!(
+                    root, want_root,
+                    "root diverged at cap={cap} policy={policy:?}"
+                );
+                assert_eq!(
+                    cache, want_cache,
+                    "cache diverged at cap={cap} policy={policy:?}"
+                );
+            }
+        }
+    }
+
+    /// Flat store: short keys with shared prefixes, tombstones and empty-`Some`
+    /// values interleaved (the terminal-value / tombstone-collapse edge cases).
+    #[test]
+    fn sharded_matches_memo_flat() {
+        let mut store = BTreeStore::new();
+        for i in 0u32..3000 {
+            let key = vec![(i & 0xff) as u8, (i >> 8) as u8, ((i >> 3) & 0xff) as u8];
+            let v = match i % 5 {
+                0 => MptValue::Tombstone,
+                1 => MptValue::Some(Box::from([])),
+                _ => MptValue::Some(Box::from([(i as u8) | 1])),
+            };
+            TrieStore::insert(&mut store, &key, v);
+        }
+        // A key ending exactly at an interior dispatch node (terminal value).
+        TrieStore::insert(&mut store, &[], MptValue::Some(Box::from([9])));
+        TrieStore::insert(&mut store, &[7], MptValue::Some(Box::from([9])));
+        assert_sharded_matches_memo(&store);
+    }
+
+    /// Two-level store: realistic 57-byte keys with a whale group sharing a
+    /// >23-byte prefix, so small caps force the dispatch to descend past the
+    /// level-1 head (deep `iter_merkle_prefix` ranges) and through the whale's
+    /// compressed path in one common-prefix jump.
+    #[test]
+    fn sharded_matches_memo_two_level() {
+        let mut seed: u64 = 0xabcdef12345678;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 24) as u8
+        };
+        let mut store = TwoLevelStore::new();
+        let whale: Vec<u8> = (0..20).map(|_| next()).collect();
+        for _ in 0..2000 {
+            let mut key = whale.clone();
+            key.extend((0..37).map(|_| next()));
+            store.insert(&key, snapshot_value(&[next(), next()]));
+        }
+        for _ in 0..500 {
+            let key: Vec<u8> = (0..(1 + (next() % 30) as usize)).map(|_| next()).collect();
+            store.insert(&key, snapshot_value(&[next()]));
+        }
+        assert_sharded_matches_memo(&store);
+    }
 }
 
 /// Partition a sorted node block into `(child nibble, start, end)` runs, one per

@@ -71,15 +71,18 @@ prerefactor 36.1 → c07 36.4 → c08 35.5 → c09 36.6 → c10 36.3 → c11 36.
 | current | 69.0 | 45.8 | 157.1s |
 | fixed | 69.6 | 46.3 | 127.2s |
 | fixed+slim | 65.5 | 46.2 | 124.1s |
-| **fixed+slim+drop** | **62.1** | 46.2 | **123.1s** |
+| fixed+slim+drop | 62.1 | 46.2 | 123.1s |
+| **fixed+shard** | **47.3** | **46.0** | 132.4s |
 
 fixed+slim = fixed 之上再加 `EntryRef` 瘦身(72→48 B,见"遗留问题 1"),峰值 −4.1 GiB 回到 prerefactor
-水位;+drop = 冷启动 rebuild 返回后、cache 入表前先 `drop(entries)`(两者不再同刻存活),再 −3.4 GiB,
-低于 prerefactor 3.3 GiB。订正:本表 fixed 行初版误引了 W=16M 的日志(68.2/45.2/109.1s)——W=16M 使 load 各列普遍快
+水位;+drop = 冷启动 rebuild 返回后、cache 入表前先 `drop(entries)`(两者不再同刻存活),再 −3.4 GiB;
++shard = 冷启动 rebuild 改为分片派发(遗留问题 1 的终局修复),全店物化消失,峰值 ≈ 稳态 + 1.3 GiB。
+订正:本表 fixed 行初版误引了 W=16M 的日志(68.2/45.2/109.1s)——W=16M 使 load 各列普遍快
 ~15s(批更大、flush 更少)且峰值/稳态略低,与计时列同为口径伪影,已换为 W=1M 实测。
 
-load 时长的构成(250M 条,fixed+slim):stream_read 78.5s + snapshot_root 45.6s(其中冷启动并行
-rebuild.hash 33.6s、cache_extend 6.8s、物化/杂项 ~5s),其余阶段 ~0。
+load 时长的构成(250M 条):stream_read ~78s(读盘/解码/bulk 建 store,各列同)+ snapshot_root
+(冷启动建 root 与 99.2M 条 cache:drop 列 45.7s = 物化 5.2 + 并行哈希 33.8 + 入表 6.7;shard 列
+53.4s,逐片物化→哈希→入表交错,+7.7s 是片间串行间隙与 CAP+1 探测的代价),其余阶段 ~0。
 
 ## 本轮修复(`570b037 fix several performance issues`)
 
@@ -100,13 +103,13 @@ c08 的流式加载引入批级双重物化。修复(热路径写法同步按"�
 | **ckpt save** | 28.6 → **6.9s(−76%)** | 上一报告火焰图第一大项(44.9%)清除;优于 baseline 的 8.6s |
 | **恢复 stream_read(250M)** | 100.0 → **78.8s(−21%)** | c08 回退清零,回到 prerefactor/bulk 水位(78.0s);仍高于 baseline 的 64.8s(bulk 段既有交换);load 总时长 157→127s(slim 后 124s)|
 | exec | 33.8 → **33.1/33.4** | twolevel 之后最优;delta_root 36→34 |
-| 加载峰值 | 69.0 → 69.6 GiB(持平)| 计时修复不动峰值;削峰由后续 EntryRef 瘦身 + drop(entries) 完成(→65.5→62.1,见"遗留问题 1")|
+| 加载峰值 | 69.0 → 69.6 GiB(持平)| 计时修复不动峰值;削峰由后续三刀完成:EntryRef 瘦身 →65.5、drop(entries) →62.1、分片派发 →47.3(见"遗留问题 1")|
 | 稳态 | 45.8 → 46.3 GiB(持平)| |
 
 ## 结论:全程账本(baseline → fixed,生产口径)
 
-**时间 +2.0~2.3s/+7%(31.1→33.1/33.4),换稳态内存 −23.4 GiB/−34%(69.7→46.3)、加载峰值 −22.9 GiB
-(85.0→62.1,含 EntryRef 瘦身与 drop(entries)):**
+**时间 +2.0~2.3s/+7%(31.1→33.1/33.4),换稳态内存 −23.4 GiB/−34%(69.7→46.3)、加载峰值 −37.7 GiB
+(85.0→47.3,含 EntryRef 瘦身、drop(entries) 与分片派发):**
 
 | 段 | Δexec | Δ稳态内存 | 判定 |
 |---|---|---|---|
@@ -142,9 +145,13 @@ c08 的流式加载引入批级双重物化。修复(热路径写法同步按"�
    两者在 rebuild 返回/入表时同时存活;最终 cache 哈希表本身属稳态而非瞬态。
    据此追加第二刀:cache 入表(`reserve`/`extend`)前先 `drop(entries)`,峰值再降
    65.5 → **62.1 GiB(−3.4)**,其余指标持平(exec 32.4 / save 7.0 / load 123.1s)。
-   剩余瞬态即 entries Vec 本身(~11 GiB),消除需把任务分发改为分片/interval 派发
-   (分发层不物化、片内复用现有并行 rebuild、逐片入表释放),方案已议、未实施。
-   进一步削峰(去掉整个 250M×48 B ≈ 11 GiB 物化)需改任务分发为 interval 派发,方案讨论中、未实施;
+   第三刀(终局):冷启动 rebuild 改为**分片派发**(`memo_node_sharded`)——任务是前缀区间,
+   自己经 `TrieReader::iter_merkle_prefix` 从 store 取数;> CAP(4M 条)不物化、按子节点递归分
+   (沿公共前缀一跳切进鲸鱼合约内部),≤ CAP 整片物化走原并行 `memo_node_rebuild`、cache 逐片
+   入表随手释放。分发节点复用 `memo_node` 原函数体(子递归抽为闭包参数 `memo_node_via`,单态化
+   零开销;等价性测试断言各 cap 下 root 与 cache 逐条等于串行 memo_node)。实测峰值
+   62.1 → **47.3 GiB**,瞬态仅 +1.3 GiB;代价 load +9s(123→132s,片间串行间隙),热路径经
+   3 rep 验证无回退(exec 32.9–35.2 覆盖 fixed 区间,delta_root 33–35 在噪声带内);
 2. bulk 的 +1.3s:snap_get 持平、read/write 变慢 → 指向全局堆布局效应而非 store 内查找;未证实,
    决定性实验为同二进制 W=1/1M/16M 三档 A/B;
 3. cleanup(a41988c)的 +0.7s 近噪声边界,未复测;

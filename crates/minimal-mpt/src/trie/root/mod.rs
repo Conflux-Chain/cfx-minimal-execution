@@ -65,3 +65,10 @@ pub(crate) use engine::{CachePolicy, RootEngine};
 /// Entry-count threshold at/above which the cold cache rebuild fans out across
 /// cores (and, in the serial walk, gates whether a full rebuild is used at all).
 pub(crate) const PARALLEL_REBUILD_THRESHOLD: usize = 4096;
+
+/// Largest subtree the cold rebuild materializes as one entry slice; bigger
+/// subtrees are dispatched child-by-child instead (see
+/// [`rebuild::memo_node_sharded`]). Bounds the rebuild's transient memory to
+/// ~`SHARD_CAP × 48 B` (≈192 MiB) regardless of store size, while keeping each
+/// shard large enough to saturate the rayon pool.
+const SHARD_CAP: usize = 4 << 20;

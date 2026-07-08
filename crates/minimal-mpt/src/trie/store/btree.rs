@@ -170,7 +170,7 @@ impl BTreeStore {
 /// same merkle bytes, same prefix/singleton behaviour — which is what lets the
 /// engine produce identical roots regardless of backend. The value is flattened
 /// to merkle bytes at the two value-touching points (`get_merkle`,
-/// `iter_merkle`), so the engine never names the value type.
+/// `iter_merkle_prefix`), so the engine never names the value type.
 impl TrieReader for BTreeStore {
     #[inline]
     fn len(&self) -> usize {
@@ -212,9 +212,20 @@ impl TrieReader for BTreeStore {
             .map(|(k, _)| NibbleCursor::from_bytes(&k[..]))
     }
 
-    fn iter_merkle(&self) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])> {
+    fn iter_merkle_prefix<'p>(
+        &self,
+        prefix: PrefixRef<'p>,
+    ) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])> {
+        // Owned bounds (cold-path only, a handful of calls per rebuild), so the
+        // returned iterator borrows nothing but the map.
+        let lo = Bound::Included(Box::<[u8]>::from(prefix.packed()));
+        let hi = match prefix_upper(prefix.packed(), prefix.is_even()) {
+            Bound::Included(v) => Bound::Included(v.into_boxed_slice()),
+            Bound::Excluded(v) => Bound::Excluded(v.into_boxed_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
         self.map
-            .iter()
+            .range::<Box<[u8]>, _>((lo, hi))
             .map(|(k, v)| (NibbleCursor::from_bytes(&k[..]), v.merkle_value()))
     }
 }
