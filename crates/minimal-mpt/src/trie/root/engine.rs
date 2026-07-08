@@ -127,6 +127,11 @@ impl RootEngine {
                 memo_node_rebuild(&entries, PrefixRef::empty(), false, cache_policy);
             t.finish(format_args!("cache_entries={}", cache_entries.len()));
 
+            // Free the whole-store entry vec (48 B × every entry) before the
+            // cache map allocates its table below: at checkpoint scale the two
+            // together set the process load peak (measured ~6 GiB apart).
+            drop(entries);
+
             let t = crate::diag::event("rebuild.cache_extend");
             self.cache.reserve(cache_entries.len());
             self.cache.extend(cache_entries);
