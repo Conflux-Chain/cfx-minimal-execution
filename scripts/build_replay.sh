@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ORACLE="$REPO_ROOT/oracle/conflux-rust"
+TAG="${TAG:-v3.0.3}"
+PROD="$REPO_ROOT/oracle/merge-only-conflux-$TAG"
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: TAG=v3.0.3 $0 <output-path> [cargo flags...]  # e.g. --no-default-features --features backend-minimal-mpt" >&2
+  exit 2
+fi
+
+OUTPUT="$1"; shift
+
+if ! git -C "$ORACLE" diff --quiet || ! git -C "$ORACLE" diff --cached --quiet; then
+  echo "oracle/conflux-rust has uncommitted changes, aborting" >&2
+  exit 1
+fi
+ORACLE_HEAD="$(git -C "$ORACLE" rev-parse HEAD)"
+
+mkdir -p $PROD
+
+if [[ ! -e "$PROD/.git" ]]; then
+  git -C "$ORACLE" worktree prune
+  git -C "$ORACLE" worktree add --detach "$PROD" "$ORACLE_HEAD"
+fi
+
+# Merge oracle HEAD with TAG; auto-resolve conflicts that are outside the
+# replay execution path (checkout ours). Cargo.lock gets ours + cargo check
+# to incrementally add missing entries without re-resolving existing versions.
+git -C "$PROD" merge --abort 2>/dev/null || true
+git -C "$PROD" checkout --detach --force "$ORACLE_HEAD"
+if ! git -C "$PROD" merge --no-edit "$TAG"; then
+  git -C "$PROD" diff --name-only --diff-filter=U | while read -r f; do
+    git -C "$PROD" checkout --ours "$f"
+    git -C "$PROD" add "$f"
+  done
+  ( cd "$PROD" && cargo check --release -p cfx-replay-data-executor )
+  git -C "$PROD" add Cargo.lock
+  git -C "$PROD" -c core.editor=true merge --continue
+fi
+
+( cd "$PROD/crates/replay-data-executor" &&
+  cargo build --release "$@" --bin cfx-replay-exec )
+
+mkdir -p "$(dirname "$OUTPUT")"
+cp -f "$PROD/target/release/cfx-replay-exec" "$OUTPUT"
+echo "$OUTPUT"

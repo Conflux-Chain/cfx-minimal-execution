@@ -80,7 +80,7 @@ impl Checkpoint {
     }
 
     /// Full bincode save (materializes entire trie in the serialization buffer).
-    pub(crate) fn save(&self, path: &Path) -> Result<()> {
+    pub(crate) fn save_full_bincode(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("create checkpoint dir {}", parent.display())
@@ -159,8 +159,8 @@ impl Checkpoint {
     /// Streaming save from the owned `mmpt` — clones it into a live `State`
     /// then delegates to [`CheckpointRef::save_streaming`]. Used by
     /// [`verify_roundtrip`](crate::verify_roundtrip) to prove the streaming
-    /// output is byte-identical to [`save`](Self::save).
-    pub(crate) fn save_streaming_self(&self, path: &Path) -> Result<()> {
+    /// output is byte-identical to [`save_full_bincode`](Self::save_full_bincode).
+    pub(crate) fn rebuild_and_save_streaming_for_verify(&self, path: &Path) -> Result<()> {
         let state = MmptState::from_persisted(self.mmpt.clone());
         let commitments: BTreeMap<u64, EpochCommitment> =
             self.commitments.iter().map(|(h, c)| (*h, *c)).collect();

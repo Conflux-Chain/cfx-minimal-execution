@@ -4,4 +4,6 @@
 /crates/*/fuzz/artifacts
 /crates/*/fuzz/coverage
 /crates/*/fuzz/corpus
-/data
+/data/*
+!/data/conflux-rust-config
+/oracle/merge-only-conflux-*

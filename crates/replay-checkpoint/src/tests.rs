@@ -59,7 +59,7 @@ fn checkpoint_roundtrips_through_disk() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ckpt.bin");
-    ckpt.save(&path).unwrap();
+    ckpt.save_full_bincode(&path).unwrap();
     let loaded = Checkpoint::load(&path).unwrap().unwrap();
     let data = loaded.into_data().unwrap();
 
@@ -102,7 +102,7 @@ fn checkpoint_roundtrips_with_nonempty_intermediate() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ckpt.bin");
-    ckpt.save(&path).unwrap();
+    ckpt.save_full_bincode(&path).unwrap();
     let loaded = Checkpoint::load(&path).unwrap().unwrap();
     let data = loaded.into_data().unwrap();
     let mmpt2 = data.state.persisted();

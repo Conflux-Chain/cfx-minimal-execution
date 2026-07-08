@@ -5,7 +5,7 @@ use crate::legacy::Checkpoint;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Verify that `load` → `save` and `load` → `save_streaming_self` both produce
+/// Verify that `load` → `save_full_bincode` and `load` → `rebuild_and_save_streaming_for_verify` both produce
 /// byte-identical output to the original file. Returns `(full_ok, stream_ok)`.
 pub fn verify_roundtrip(path: &Path) -> Result<(bool, bool)> {
     let original = std::fs::read(path)
@@ -20,7 +20,7 @@ pub fn verify_roundtrip(path: &Path) -> Result<(bool, bool)> {
 
     // Full save round-trip
     let full_path = dir.path().join("full.bin");
-    ckpt.save(&full_path).context("save full")?;
+    ckpt.save_full_bincode(&full_path).context("save full")?;
     let resaved_full = std::fs::read(&full_path).context("read resaved full")?;
     eprintln!("resaved (full): {} bytes", resaved_full.len());
 
@@ -41,7 +41,7 @@ pub fn verify_roundtrip(path: &Path) -> Result<(bool, bool)> {
 
     // Streaming save round-trip
     let stream_path = dir.path().join("stream.bin");
-    ckpt.save_streaming_self(&stream_path).context("save streaming")?;
+    ckpt.rebuild_and_save_streaming_for_verify(&stream_path).context("save streaming")?;
     let resaved_stream = std::fs::read(&stream_path).context("read resaved stream")?;
     eprintln!("resaved (streaming): {} bytes", resaved_stream.len());
 
