@@ -1,50 +1,40 @@
-//! Cold-cache parallel root/cache rebuild.
+//! Cold-cache root/cache rebuild, in two tiers:
 //!
-//! When the cache is empty and the store is large, [`memo_node_rebuild`] rebuilds
-//! the whole root (and cache) from a single sorted entry slice, fanning out
-//! across cores by subtree. Extracted verbatim from the old `incremental` module;
-//! the partitioning and hashing are identical to the serial [`super::memo`] path.
+//! * [`memo_node_sharded`] — the entry point. A task is a nibble-prefix
+//!   interval fetched from the store itself; a subtree over the shard cap is
+//!   **dispatched** child-by-child without materializing anything (reusing the
+//!   serial walk body via [`memo_node_with`]), one that fits is materialized
+//!   once and handed to the slice tier. Transient memory is one shard, not the
+//!   store.
+//! * [`memo_node_slice`] — the shard interior: the same node partitioning over
+//!   a contiguous sorted entry slice, fanning out across cores by subtree.
+//!
+//! Both tiers hash and cache exactly what the serial [`super::memo`] walk
+//! would; the sharded/slice split only changes where the entries live.
 
 use super::engine::{Cache, CachePolicy};
-use super::memo::memo_node_via;
-use super::{PARALLEL_REBUILD_THRESHOLD, SHARD_CAP};
+use super::memo::memo_node_with;
+use super::PARALLEL_REBUILD_THRESHOLD;
 use crate::nibbles::{pack_nibbles, push_nibble, NibbleCursor, PrefixKey, PrefixRef};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
 use crate::trie::reader::TrieReader;
 use crate::trie::{compute_node_merkle, compute_path_merkle, CHILDREN};
 use rayon::prelude::*;
 
-/// Cold-cache rebuild of a whole subtree, bounded to [`SHARD_CAP`] transient
-/// entries: a subtree that fits is materialized once and handed to the parallel
-/// [`memo_node_rebuild`] (its cache entries go straight into `cache` and both
-/// buffers die before the next shard starts); a bigger subtree is dispatched
-/// child-by-child through the ordinary [`memo_node_via`] walk, recursing back
-/// here. So the peak holds ONE shard's entry slice (~192 MiB) instead of the
-/// whole store's (~11 GiB at checkpoint scale), and the cache-entry vec is
-/// per-shard instead of store-wide.
+/// Cold-cache rebuild of a whole subtree, bounded to `cap` transient entries
+/// (the engine passes [`super::SHARD_CAP`]): a subtree that fits is
+/// materialized once and handed to the parallel [`memo_node_slice`] (its cache
+/// entries go straight into `cache` and both buffers die before the next shard
+/// starts); a bigger subtree is dispatched child-by-child through the ordinary
+/// [`memo_node_with`] walk, recursing back here. So the peak holds ONE shard's
+/// entry slice (~192 MiB) instead of the whole store's (~11 GiB at checkpoint
+/// scale), and the cache-entry vec is per-shard instead of store-wide.
 ///
 /// The dispatch nodes above the shards are exactly the nodes `memo_node` would
 /// visit, with identical hashing/caching (the walk body is shared, not
 /// mirrored); a probe of `cap + 1` entries decides fits-vs-dispatch, so the
 /// wasted iteration is bounded by `cap × dispatch nodes` (a handful of nodes).
 pub(super) fn memo_node_sharded<S: TrieReader>(
-    store: &S,
-    rp: PrefixRef,
-    allow_path_compression: bool,
-    cache: &mut Cache,
-    cache_policy: CachePolicy,
-) -> H256 {
-    memo_node_sharded_capped(
-        store,
-        rp,
-        allow_path_compression,
-        cache,
-        cache_policy,
-        SHARD_CAP,
-    )
-}
-
-fn memo_node_sharded_capped<S: TrieReader>(
     store: &S,
     rp: PrefixRef,
     allow_path_compression: bool,
@@ -72,7 +62,7 @@ fn memo_node_sharded_capped<S: TrieReader>(
 
     if entries.len() <= cap {
         let (hash, cache_entries) =
-            memo_node_rebuild(&entries, rp, allow_path_compression, cache_policy);
+            memo_node_slice(&entries, rp, allow_path_compression, cache_policy);
         drop(entries);
         cache.reserve(cache_entries.len());
         cache.extend(cache_entries);
@@ -80,17 +70,17 @@ fn memo_node_sharded_capped<S: TrieReader>(
     }
     drop(entries);
 
-    memo_node_via(
+    memo_node_with(
         store,
         rp,
         allow_path_compression,
         cache,
         cache_policy,
-        &|s, child, c| memo_node_sharded_capped(s, child, true, c, cache_policy, cap),
+        &|s, child, c| memo_node_sharded(s, child, true, c, cache_policy, cap),
     )
 }
 
-/// One entry fed to the cold [`memo_node_rebuild`]: the full key as its two
+/// One entry fed to the cold [`memo_node_slice`]: the full key as its two
 /// backing byte segments (from [`NibbleCursor::full_view_segments`]) plus its
 /// precomputed **merkle bytes** (empty for a tombstone). The rebuild only ever
 /// needs the merkle bytes, so the store's
@@ -124,7 +114,7 @@ impl<'a> EntryRef<'a> {
 /// BTreeMap range probes. Because the caller only uses it when the cache is
 /// empty, children return cache entries as vectors; the caller builds the real
 /// hash map once after all parallel work joins.
-pub(super) fn memo_node_rebuild(
+pub(super) fn memo_node_slice(
     entries: &[EntryRef<'_>],
     rp: PrefixRef,
     allow_path_compression: bool,
@@ -154,7 +144,7 @@ pub(super) fn memo_node_rebuild(
     let recurse = |&(child, start, end): &(usize, usize, usize)| {
         let mut child_buf = full_buf.clone();
         push_nibble(&mut child_buf, child as u8);
-        let (hash, cache_entries) = memo_node_rebuild(
+        let (hash, cache_entries) = memo_node_slice(
             &entries[start..end],
             PrefixRef::new(&child_buf),
             true,
@@ -213,14 +203,8 @@ mod tests {
             let want_root = memo_node(store, PrefixRef::empty(), false, &mut want_cache, policy);
             for cap in [1, 7, 313, usize::MAX] {
                 let mut cache = Cache::default();
-                let root = memo_node_sharded_capped(
-                    store,
-                    PrefixRef::empty(),
-                    false,
-                    &mut cache,
-                    policy,
-                    cap,
-                );
+                let root =
+                    memo_node_sharded(store, PrefixRef::empty(), false, &mut cache, policy, cap);
                 assert_eq!(
                     root, want_root,
                     "root diverged at cap={cap} policy={policy:?}"

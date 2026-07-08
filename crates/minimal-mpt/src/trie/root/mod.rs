@@ -27,9 +27,12 @@
 //! * [`engine`] — [`RootEngine`]: the cache + dirty set + prefix eviction + root
 //!   entry point, with the [`CachePolicy`] fixed at construction. It borrows the
 //!   entries through a [`crate::trie::reader::TrieReader`] and never names `V`.
-//! * [`memo`] — the hot serial [`memo::memo_node`] walk (cache-driven).
-//! * [`rebuild`] — the cold parallel [`rebuild::memo_node_rebuild`] used to warm
-//!   an empty cache over a large store.
+//! * [`memo`] — the hot serial [`memo::memo_node`] walk (cache-driven), whose
+//!   body ([`memo::memo_node_with`]) is shared with the cold dispatch tier.
+//! * [`rebuild`] — the cold path warming an empty cache over a large store:
+//!   [`rebuild::memo_node_sharded`] dispatches prefix intervals and
+//!   materializes one shard at a time for the parallel
+//!   [`rebuild::memo_node_slice`].
 //!
 //! ## Key representation
 //!

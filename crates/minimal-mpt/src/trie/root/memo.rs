@@ -30,7 +30,7 @@ pub(super) fn memo_node<S: TrieReader>(
     cache: &mut Cache,
     cache_policy: CachePolicy,
 ) -> H256 {
-    memo_node_via(
+    memo_node_with(
         store,
         rp,
         allow_path_compression,
@@ -45,7 +45,7 @@ pub(super) fn memo_node<S: TrieReader>(
 /// entire node walk verbatim while diverting each child through its
 /// materialize-below-cap escape. Generic over the closure — static dispatch,
 /// same codegen as the direct self-recursion it replaces.
-pub(super) fn memo_node_via<S, F>(
+pub(super) fn memo_node_with<S, F>(
     store: &S,
     rp: PrefixRef,
     allow_path_compression: bool,

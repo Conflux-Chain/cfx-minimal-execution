@@ -11,7 +11,7 @@
 
 use super::memo::memo_node;
 use super::rebuild::memo_node_sharded;
-use super::PARALLEL_REBUILD_THRESHOLD;
+use super::{PARALLEL_REBUILD_THRESHOLD, SHARD_CAP};
 use crate::nibbles::{empty_prefix_buf, push_nibble, PrefixKey, PrefixRef};
 use crate::primitives::{H256, MERKLE_NULL_NODE};
 use crate::trie::reader::TrieReader;
@@ -113,6 +113,7 @@ impl RootEngine {
                 false,
                 &mut self.cache,
                 cache_policy,
+                SHARD_CAP,
             );
             t.finish(format_args!("cache_len={}", self.cache.len()));
             root
