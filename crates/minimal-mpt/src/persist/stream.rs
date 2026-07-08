@@ -9,7 +9,7 @@
 
 use crate::state::layers::snapshot::SnapshotTrie;
 use crate::state::{CommitRoot, State};
-use crate::trie::MptValue;
+use crate::trie::{snapshot_value, MptValue, SnapshotValue};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
@@ -25,7 +25,7 @@ pub fn save_state(state: &State, w: &mut impl Write) -> io::Result<()> {
     write_u64_le(w, expected_entries as u64)?;
     let mut entries_written = 0usize;
     state.for_each_snapshot_entry(|key, value| {
-        write_len_prefixed(w, &key)?;
+        write_len_prefixed(w, key)?;
         write_len_prefixed(w, value)?;
         entries_written += 1;
         Ok(())
@@ -64,17 +64,20 @@ pub fn load_state(reader: &mut impl Read) -> io::Result<State> {
     // On-disk keys are ascending, so build the store densely: read fixed-size
     // sorted batches of `W` and hand each to the snapshot's `bulk_extend_sorted`
     // (dense level-2 leaves) instead of monotonic per-entry `insert` (~half-full
-    // leaves). The snapshot store stays oblivious to the reader; peak transient
-    // is one batch. `W` is env-tunable for profiling.
+    // leaves). Each value converts to its inline form as it is read — the raw
+    // value buffer never outlives one iteration, so the batch holds keys plus
+    // inline values only (no second batch-wide buffer, no W raw values alive).
+    // The snapshot store stays oblivious to the reader; peak transient is one
+    // batch. `W` is env-tunable for profiling.
     let t = crate::diag::event("recover.stream_read_snapshot");
     let count = read_u64_le(reader)? as usize;
     let w = crate::diag::bulk_w();
     let mut snapshot = SnapshotTrie::default();
-    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(w.min(count));
+    let mut batch: Vec<(Vec<u8>, SnapshotValue)> = Vec::with_capacity(w.min(count));
     for _ in 0..count {
         let key = read_len_prefixed(reader)?;
         let value = read_len_prefixed(reader)?;
-        batch.push((key, value));
+        batch.push((key, snapshot_value(&value)));
         if batch.len() >= w {
             snapshot.bulk_extend_sorted(std::mem::replace(&mut batch, Vec::with_capacity(w)));
         }

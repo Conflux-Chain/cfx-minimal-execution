@@ -1,7 +1,7 @@
 use crate::nibbles::{pack_nibbles, NibbleCursor, PrefixRef};
 use crate::primitives::H256;
 use crate::trie::store::two_level::TwoLevelStore;
-use crate::trie::{snapshot_value, AuthenticatedTrie, MptValue};
+use crate::trie::{snapshot_value, AuthenticatedTrie, MptValue, SnapshotValue};
 use std::collections::BTreeMap;
 
 /// The snapshot layer: an [`AuthenticatedTrie`] over the two-level
@@ -35,18 +35,14 @@ impl SnapshotTrie {
         }
     }
 
-    /// Bulk-feed an **ascending** batch of `(canonical key, value bytes)` whose
+    /// Bulk-feed an **ascending** batch of `(canonical key, inline value)` whose
     /// keys are all greater than any already present (dense level-2 build).
     /// Pure memory: the checkpoint loader in [`crate::persist::stream`] reads
-    /// batches off disk and calls this — the snapshot layer never touches a
-    /// reader.
-    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, Vec<u8>)>) {
-        self.inner.bulk_extend_sorted(
-            batch
-                .into_iter()
-                .map(|(k, v)| (k, snapshot_value(&v)))
-                .collect(),
-        );
+    /// batches off disk, converts each value to [`SnapshotValue`] as it goes
+    /// (via [`snapshot_value`]) and calls this — the snapshot layer never
+    /// touches a reader, and no second batch-wide buffer is ever built.
+    pub(crate) fn bulk_extend_sorted(&mut self, batch: Vec<(Vec<u8>, SnapshotValue)>) {
+        self.inner.bulk_extend_sorted(batch);
     }
 
     /// Apply a delta value: a live value is stored, a tombstone is a removal —
@@ -111,13 +107,18 @@ impl SnapshotTrie {
     }
 
     /// Visit each entry as `(canonical byte key, value bytes)` in sorted order.
-    /// Each key is reassembled from its `head ++ tail` on the fly.
+    /// Each key is reassembled from its `head ++ tail` into one reused buffer —
+    /// the visitor borrows it per call, so the full-snapshot walk (checkpoint
+    /// save) does zero per-entry allocation.
     pub(crate) fn for_each_canonical(
         &self,
-        mut f: impl FnMut(Vec<u8>, &[u8]) -> std::io::Result<()>,
+        mut f: impl FnMut(&[u8], &[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
+        let mut key_buf = Vec::new();
         for (n, value) in self.inner.store().iter() {
-            f(n.to_canonical_bytes(), value)?;
+            key_buf.clear();
+            n.extend_canonical_into(&mut key_buf);
+            f(&key_buf, value)?;
         }
         Ok(())
     }

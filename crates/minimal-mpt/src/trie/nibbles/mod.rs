@@ -37,7 +37,7 @@ enum Backing<'a> {
     Two(&'a [u8], &'a [u8]),
 }
 
-impl Backing<'_> {
+impl<'a> Backing<'a> {
     #[inline]
     fn byte_at(&self, i: usize) -> u8 {
         match self {
@@ -48,6 +48,41 @@ impl Backing<'_> {
             },
         }
     }
+
+    /// The backing as two byte segments to be read as their concatenation
+    /// (`One` yields an empty second segment).
+    #[inline]
+    fn segments(&self) -> (&'a [u8], &'a [u8]) {
+        match self {
+            Backing::One(b) => (b, &[]),
+            Backing::Two(h, t) => (h, t),
+        }
+    }
+}
+
+/// Are the concatenations `x0 ++ x1` and `y0 ++ y1` equal, compared piecewise
+/// (no reassembly)? Slices from the same store often alias (two entries under
+/// one level-1 node share the identical `head` slice), which `==` short-circuits
+/// on pointer+length before falling back to memcmp.
+fn concat_eq(x0: &[u8], x1: &[u8], y0: &[u8], y1: &[u8]) -> bool {
+    if x0.len() + x1.len() != y0.len() + y1.len() {
+        return false;
+    }
+    // Same split — the common case (keys from one store share the head/tail
+    // cut): two whole-segment memcmps, nothing to realign.
+    if x0.len() == y0.len() {
+        return x0 == y0 && x1 == y1;
+    }
+    // Different splits: WLOG x cuts no later than y, then realign both to the
+    // three ranges [0, p), [p, q), [q, n) — whole-segment memcmp only.
+    let (x0, x1, y0, y1) = if x0.len() < y0.len() {
+        (x0, x1, y0, y1)
+    } else {
+        (y0, y1, x0, x1)
+    };
+    let (y0a, y0b) = y0.split_at(x0.len());
+    let (x1a, x1b) = x1.split_at(y0b.len());
+    x0 == y0a && x1a == y0b && x1b == y1
 }
 
 /// Borrowed nibble view over a (possibly split) byte buffer, spanning logical
@@ -108,6 +143,25 @@ impl<'a> NibbleCursor<'a> {
         }
     }
 
+    /// The backing bytes from byte index `bi` on, streamed across both segments.
+    /// Pure iterator advance — no per-byte bounds check or backing dispatch
+    /// (`skip` lands via the slice iterators' O(1) `nth`).
+    #[inline]
+    pub(in crate::trie::nibbles) fn bytes_from(self, bi: usize) -> impl Iterator<Item = u8> + 'a {
+        let (a, b) = self.bytes.segments();
+        a.iter().chain(b).copied().skip(bi)
+    }
+
+    /// The backing bytes from the view's start, when it is **byte-aligned**
+    /// (even `start`); `None` for odd-offset views. At byte alignment the
+    /// packed nibble pairs are the backing bytes themselves, so consumers
+    /// (e.g. [`super::prefix::pack_nibbles`]) copy bytes instead of re-deriving
+    /// the pairing nibble-by-nibble.
+    #[inline]
+    pub(in crate::trie::nibbles) fn aligned_bytes(self) -> Option<impl Iterator<Item = u8> + 'a> {
+        (self.start % 2 == 0).then(move || self.bytes_from(self.start / 2))
+    }
+
     /// NibbleCursor of this view from logical index `from` to the end, reading each
     /// backing byte **once** (splitting it into its two nibbles) rather than
     /// re-dispatching through `byte_at` per nibble. The batch primitive the
@@ -117,22 +171,53 @@ impl<'a> NibbleCursor<'a> {
         from: usize,
     ) -> impl Iterator<Item = u8> + 'a {
         let (s, e) = (self.start + from, self.end);
-        (s / 2..e.div_ceil(2))
-            .flat_map(move |bi| {
-                let b = self.bytes.byte_at(bi);
-                [b >> 4, b & 0x0f]
-            })
+        self.bytes_from(s / 2)
+            .flat_map(|b| [b >> 4, b & 0x0f])
             .skip(s % 2) // drop the leading half-nibble when `s` is odd
             .take(e - s)
     }
 
     /// Number of nibbles `self` and `other` share starting at index `depth`
-    /// (both compared from their own offset `depth`).
+    /// (both compared from their own offset `depth`). When both sides land at
+    /// the same byte parity (always: the walk compares keys anchored at one
+    /// node, same `start` and `depth`), the scan is whole-byte — one compare
+    /// per two nibbles, plus a half-byte fixup at each end; only mixed-parity
+    /// views walk nibbles.
     pub(crate) fn common_prefix_len_from(&self, other: &NibbleCursor<'_>, depth: usize) -> usize {
-        self.nibbles_from(depth)
-            .zip(other.nibbles_from(depth))
-            .take_while(|(a, b)| a == b)
-            .count()
+        let (s1, s2) = (self.start + depth, other.start + depth);
+        if s1 % 2 != s2 % 2 {
+            return self
+                .nibbles_from(depth)
+                .zip(other.nibbles_from(depth))
+                .take_while(|(a, b)| a == b)
+                .count();
+        }
+        let remaining = (self.len() - depth).min(other.len() - depth);
+        let mut n = 0;
+        // Odd anchor: settle the lone low nibble first, then bytes align.
+        if s1 % 2 == 1 {
+            if remaining == 0 || self.at(depth) != other.at(depth) {
+                return 0;
+            }
+            n = 1;
+        }
+        for (b1, b2) in self
+            .bytes_from((s1 + n) / 2)
+            .zip(other.bytes_from((s2 + n) / 2))
+        {
+            if n >= remaining {
+                break;
+            }
+            if b1 == b2 {
+                n += 2;
+            } else {
+                if b1 >> 4 == b2 >> 4 {
+                    n += 1;
+                }
+                break;
+            }
+        }
+        n.min(remaining)
     }
 
     /// Expand to a one-nibble-per-byte `Vec` (for the shared path-merkle hasher,
@@ -142,26 +227,60 @@ impl<'a> NibbleCursor<'a> {
         self.nibbles_from(0).collect()
     }
 
+    /// The backing byte segments, when the view spans the **whole backing**
+    /// (`start == 0`, `end` at the last nibble). Packed nibbles at byte
+    /// alignment *are* the canonical bytes (see module doc), so a full view
+    /// needs no nibble work at all — and full-key views (`from_bytes`/
+    /// `from_composite`, the only ones equality/reassembly run on) always
+    /// qualify. `None` for sub-views (routing prefixes), which genuinely need
+    /// nibble granularity. No slicing arithmetic: the segments are returned
+    /// as-is.
+    #[inline]
+    fn full_view_segments(&self) -> Option<(&'a [u8], &'a [u8])> {
+        let (a, b) = self.bytes.segments();
+        (self.start == 0 && self.end == (a.len() + b.len()) * 2).then_some((a, b))
+    }
+
     /// Repack an **even-length** nibble view into its canonical byte key. For an
     /// entry surfaced from the store as `head ++ tail` this reproduces the exact
     /// concatenation `[head, tail].concat()` (byte-aligned keys only), letting the
     /// snapshot read/persist paths reassemble the key from the nibble view without
     /// naming the store's internal split representation.
     pub(crate) fn to_canonical_bytes(&self) -> Vec<u8> {
-        use itertools::Itertools;
+        let mut out = Vec::with_capacity(self.len() / 2);
+        self.extend_canonical_into(&mut out);
+        out
+    }
+
+    /// [`Self::to_canonical_bytes`] into a caller-owned buffer, so bulk visitors
+    /// (the checkpoint save walks every snapshot entry) can reuse one allocation.
+    pub(crate) fn extend_canonical_into(&self, out: &mut Vec<u8>) {
         debug_assert!(self.len() % 2 == 0, "canonical key must be byte-aligned");
-        self.nibbles_from(0)
-            .tuples()
-            .map(|(hi, lo)| (hi << 4) | lo)
-            .collect()
+        if let Some((a, b)) = self.full_view_segments() {
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+        } else {
+            // Odd-offset view: genuinely repack nibble pairs. No production key
+            // path lands here (canonical keys are byte-aligned).
+            use itertools::Itertools;
+            out.extend(self.nibbles_from(0).tuples().map(|(hi, lo)| (hi << 4) | lo));
+        }
     }
 
     /// **Value** equality of the nibble path: `true` iff `self` and `other` yield
     /// the same nibble sequence (same length, same nibbles), independent of
     /// backing buffer or offset. Not representation identity — the singleton-node
-    /// check relies on this comparing the logical key, not the split.
+    /// check relies on this comparing the logical key, not the split. Full-key
+    /// views (the only callers) compare as bytes, piecewise over the backing
+    /// segments; only sub-views walk nibbles.
     pub(crate) fn logical_eq(&self, other: &NibbleCursor<'_>) -> bool {
-        self.len() == other.len() && self.nibbles_from(0).eq(other.nibbles_from(0))
+        if self.len() != other.len() {
+            return false;
+        }
+        match (self.full_view_segments(), other.full_view_segments()) {
+            (Some((a1, b1)), Some((a2, b2))) => concat_eq(a1, b1, a2, b2),
+            _ => self.nibbles_from(0).eq(other.nibbles_from(0)),
+        }
     }
 }
 
