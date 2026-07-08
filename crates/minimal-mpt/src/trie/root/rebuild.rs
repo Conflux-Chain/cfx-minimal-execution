@@ -60,6 +60,7 @@ pub(super) fn memo_node_sharded<S: TrieReader>(
         })
         .collect();
     debug_assert!(!entries.is_empty(), "descended into an empty subtree");
+
     t.finish(format_args!(
         "depth={} entries={} miss={}",
         rp.nibble_len(),

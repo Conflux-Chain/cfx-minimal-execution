@@ -60,11 +60,11 @@ pub(crate) fn event(name: &'static str) -> EventTimer {
 }
 
 /// Per-event timer for one materialization probe of the sharded cold rebuild
-/// (up to `SHARD_CAP + 1` entries each; `detail` carries depth / entry count /
-/// whether it overflowed into a dispatch). Same shape as [`event`] but gated
-/// by `MMPT_SHARD_TIMING=1` — noisier than the once-per-phase events (bounded
-/// by shards + dispatch nodes, ~100 lines per cold rebuild), so it gets its
-/// own switch.
+/// (up to `SHARD_CAP + 1` entries each). Only **overflow** probes finish it —
+/// each line is a `cap + 1` fill that got discarded into a dispatch, i.e. the
+/// scheme's pure waste (depth / entry count / fill time). Same shape as
+/// [`event`] but gated by `MMPT_SHARD_TIMING=1`: per-probe lines are noisier
+/// than the once-per-phase events, so they get their own switch.
 pub(crate) fn shard_probe() -> EventTimer {
     EventTimer {
         name: "shard.probe",
