@@ -4,6 +4,9 @@
 #
 #   run_experiment.sh worktree            [label] [reps]   # uncommitted state
 #   run_experiment.sh <commit-ish>        [label] [reps]   # e.g. 570b037, HEAD~2
+#   MEM_ONLY=1 run_experiment.sh ...                       # skip the executor
+#       build and the timing replay; just build the mem loader and measure the
+#       250M-entry load (peak/steady/load time), ~5 min end to end.
 #
 # Method (matches docs/opprof-full-sweep-2026-07-08.md, production width W=1M):
 #   1. snapshot the source tree (git archive for commits; file copy for the
@@ -70,33 +73,35 @@ cp "$SWEEP/overlay/ckpt_restore_rss.rs" "$SNAP/crates/replay-checkpoint/src/bin/
 retry_build "$SNAP" -q --release -p cfx-replay-checkpoint --bin ckpt-restore-rss
 cp -f "$SNAP/target/release/ckpt-restore-rss" "$SWEEP/membin_$LABEL"
 
-# --- 3. build the executor against the snapshot -----------------------------
-git -C "$PROD" checkout -- crates/replay-data-executor/Cargo.toml Cargo.lock
-sed -i \
-  -e "s#\.\./\.\./\.\./\.\./crates/minimal-mpt#$SNAP/crates/minimal-mpt#" \
-  -e "s#\.\./\.\./\.\./\.\./crates/replay-checkpoint#$SNAP/crates/replay-checkpoint#" \
-  -e "s#\.\./\.\./\.\./\.\./crates/cfxpack#$SNAP/crates/cfxpack#" \
-  "$TOML"
-retry_build "$PROD/crates/replay-data-executor" --release --no-default-features \
-  --features backend-minimal-mpt --bin cfx-replay-exec
-cp -f "$PROD/target/release/cfx-replay-exec" "$SWEEP/bin_$LABEL"
-git -C "$PROD" checkout -- crates/replay-data-executor/Cargo.toml Cargo.lock
+if [[ "${MEM_ONLY:-0}" != 1 ]]; then
+  # --- 3. build the executor against the snapshot ---------------------------
+  git -C "$PROD" checkout -- crates/replay-data-executor/Cargo.toml Cargo.lock
+  sed -i \
+    -e "s#\.\./\.\./\.\./\.\./crates/minimal-mpt#$SNAP/crates/minimal-mpt#" \
+    -e "s#\.\./\.\./\.\./\.\./crates/replay-checkpoint#$SNAP/crates/replay-checkpoint#" \
+    -e "s#\.\./\.\./\.\./\.\./crates/cfxpack#$SNAP/crates/cfxpack#" \
+    "$TOML"
+  retry_build "$PROD/crates/replay-data-executor" --release --no-default-features \
+    --features backend-minimal-mpt --bin cfx-replay-exec
+  cp -f "$PROD/target/release/cfx-replay-exec" "$SWEEP/bin_$LABEL"
+  git -C "$PROD" checkout -- crates/replay-data-executor/Cargo.toml Cargo.lock
 
-# --- 4. timing runs (结果一), production width ------------------------------
-stamp() { python3 -u -c 'import sys,time
+  # --- 4. timing runs (结果一), production width ----------------------------
+  stamp() { python3 -u -c 'import sys,time
 for line in sys.stdin:
     sys.stdout.write(f"{time.time():.3f} {line}")'; }
-CKC=$SWEEP/ck_scratch.bin
-trap 'rm -f "$CKC"' EXIT
-for rep in $(seq 1 "$REPS"); do
-  echo "== timing run $LABEL rep$rep"
-  cp -f "$CKPT_TIMING" "$CKC"
-  ( cd "$REPO" && env MMPT_PROFILE=1 MMPT_TIMING=1 MMPT_MERGE_TIMING=1 MMPT_RECOVER_TIMING=1 \
-      "$SWEEP/bin_$LABEL" --input data/packed-full --config data/conflux-rust-config/hydra-v303.toml \
-      --checkpoint "$CKC" --checkpoint-every-groups 1 --stop-after-checkpoint \
-      --max-mismatches 1000000000 --anomaly-streak 1000000000 2>&1 ) \
-    | stamp > "$SWEEP/results/prof_${LABEL}_$rep.log"
-done
+  CKC=$SWEEP/ck_scratch.bin
+  trap 'rm -f "$CKC"' EXIT
+  for rep in $(seq 1 "$REPS"); do
+    echo "== timing run $LABEL rep$rep"
+    cp -f "$CKPT_TIMING" "$CKC"
+    ( cd "$REPO" && env MMPT_PROFILE=1 MMPT_TIMING=1 MMPT_MERGE_TIMING=1 MMPT_RECOVER_TIMING=1 \
+        "$SWEEP/bin_$LABEL" --input data/packed-full --config data/conflux-rust-config/hydra-v303.toml \
+        --checkpoint "$CKC" --checkpoint-every-groups 1 --stop-after-checkpoint \
+        --max-mismatches 1000000000 --anomaly-streak 1000000000 2>&1 ) \
+      | stamp > "$SWEEP/results/prof_${LABEL}_$rep.log"
+  done
+fi
 
 # --- 5. memory run (结果三) --------------------------------------------------
 echo "== memory run $LABEL"
