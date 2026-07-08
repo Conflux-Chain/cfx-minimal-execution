@@ -234,9 +234,11 @@ impl<'a> NibbleCursor<'a> {
     /// `from_composite`, the only ones equality/reassembly run on) always
     /// qualify. `None` for sub-views (routing prefixes), which genuinely need
     /// nibble granularity. No slicing arithmetic: the segments are returned
-    /// as-is.
+    /// as-is. Crate-visible so bulk consumers (the cold rebuild's entry array)
+    /// can hold a full key as two bare slices — 48 B/entry instead of a 72 B
+    /// cursor — and rebuild the view on demand via [`Self::from_composite`].
     #[inline]
-    fn full_view_segments(&self) -> Option<(&'a [u8], &'a [u8])> {
+    pub(crate) fn full_view_segments(&self) -> Option<(&'a [u8], &'a [u8])> {
         let (a, b) = self.bytes.segments();
         (self.start == 0 && self.end == (a.len() + b.len()) * 2).then_some((a, b))
     }

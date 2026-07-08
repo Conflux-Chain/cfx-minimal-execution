@@ -108,9 +108,17 @@ impl RootEngine {
         let result = if self.cache.is_empty() && store.len() >= PARALLEL_REBUILD_THRESHOLD {
             let entries: Vec<EntryRef<'_>> = store
                 .iter_merkle()
-                .map(|(key, value)| EntryRef {
-                    key,   // NibbleCursor view surfaced by the store
-                    value, // precomputed merkle bytes (value type stays behind the trait)
+                .map(|(key, value)| {
+                    // Store the full key as its two bare segments (48 B/entry;
+                    // see `EntryRef`) — the store always surfaces full views.
+                    let (key_head, key_tail) = key
+                        .full_view_segments()
+                        .expect("store surfaces full-key views");
+                    EntryRef {
+                        key_head,
+                        key_tail,
+                        value, // precomputed merkle bytes (value type stays behind the trait)
+                    }
                 })
                 .collect();
 

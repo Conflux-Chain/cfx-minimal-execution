@@ -12,26 +12,31 @@ use crate::primitives::{H256, MERKLE_NULL_NODE};
 use crate::trie::{compute_node_merkle, compute_path_merkle, CHILDREN};
 use rayon::prelude::*;
 
-/// One entry fed to the cold [`memo_node_rebuild`]: the key as a [`NibbleCursor`] view
-/// (surfaced by the store) plus its precomputed **merkle bytes** (empty for a
-/// tombstone). The rebuild only ever needs the merkle bytes, so the store's
+/// One entry fed to the cold [`memo_node_rebuild`]: the full key as its two
+/// backing byte segments (from [`NibbleCursor::full_view_segments`]) plus its
+/// precomputed **merkle bytes** (empty for a tombstone). The rebuild only ever
+/// needs the merkle bytes, so the store's
 /// [`TrieReader`](crate::trie::reader::TrieReader) impl flattens its value type
-/// up front — keeping the rebuild independent of it. All nibble routing goes
-/// through the [`NibbleCursor`] view.
+/// up front — keeping the rebuild independent of it. Nibble routing rebuilds
+/// the [`NibbleCursor`] view on demand ([`Self::nibbles`], zero cost): this array is
+/// materialized for the WHOLE store (hundreds of millions of entries) during
+/// checkpoint recovery, so the entry stays three bare slices (48 B) — a stored
+/// cursor's redundant offsets would put ~6 GiB back on the load peak.
 #[derive(Clone, Copy)]
 pub(super) struct EntryRef<'a> {
-    pub(super) key: NibbleCursor<'a>,
+    pub(super) key_head: &'a [u8],
+    pub(super) key_tail: &'a [u8],
     pub(super) value: &'a [u8],
 }
 
 impl<'a> EntryRef<'a> {
     #[inline]
     fn nibbles(&self) -> NibbleCursor<'a> {
-        self.key
+        NibbleCursor::from_composite(self.key_head, self.key_tail)
     }
     #[inline]
     fn nibble_len(&self) -> usize {
-        self.key.len()
+        (self.key_head.len() + self.key_tail.len()) * 2
     }
 }
 
