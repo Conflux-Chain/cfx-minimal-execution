@@ -42,6 +42,7 @@ pub(super) fn memo_node_sharded<S: TrieReader>(
     cache_policy: CachePolicy,
     cap: usize,
 ) -> H256 {
+    let t = crate::diag::shard_probe();
     let entries: Vec<EntryRef<'_>> = store
         .iter_merkle_prefix(rp)
         .take(cap.saturating_add(1))
@@ -59,6 +60,12 @@ pub(super) fn memo_node_sharded<S: TrieReader>(
         })
         .collect();
     debug_assert!(!entries.is_empty(), "descended into an empty subtree");
+    t.finish(format_args!(
+        "depth={} entries={} miss={}",
+        rp.nibble_len(),
+        entries.len(),
+        entries.len() > cap
+    ));
 
     if entries.len() <= cap {
         let (hash, cache_entries) =
