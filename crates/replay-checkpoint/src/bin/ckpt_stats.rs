@@ -10,29 +10,57 @@ fn main() -> Result<()> {
         .expect("usage: ckpt-stats <checkpoint.bin>");
     let data = cfx_replay_checkpoint::CheckpointData::load(&path)?
         .with_context(|| format!("no checkpoint at {}", path.display()))?;
-    let mmpt = data.state.persisted();
 
-    let snap_count = mmpt.snapshot.len();
-    let inter_count = mmpt.intermediate.len();
-    let delta_count = mmpt.delta.len();
+    let height = data.state.height();
+    let snapshot_epoch_count = data.state.snapshot_epoch_count();
 
-    let snap_key_bytes: usize = mmpt.snapshot.keys().map(|k| k.len()).sum();
-    let snap_val_bytes: usize = mmpt.snapshot.values().map(|v| v.len()).sum();
-    let inter_key_bytes: usize = mmpt.intermediate.keys().map(|k| k.len()).sum();
-    let inter_val_bytes: usize = mmpt.intermediate.values().map(|v| match v {
+    // Snapshot: stream over the trie in place — no second BTreeMap.
+    let mut snap_count = 0usize;
+    let mut snap_key_bytes = 0usize;
+    let mut snap_val_bytes = 0usize;
+    let mut key_lens = std::collections::BTreeMap::<usize, usize>::new();
+    let mut val_buckets = [0usize; 8];
+    data.state.for_each_snapshot_entry(|key, value| {
+        snap_count += 1;
+        snap_key_bytes += key.len();
+        snap_val_bytes += value.len();
+        *key_lens.entry(key.len()).or_default() += 1;
+        let i = match value.len() {
+            0..=31 => 0,
+            32..=63 => 1,
+            64..=127 => 2,
+            128..=255 => 3,
+            256..=511 => 4,
+            512..=1023 => 5,
+            1024..=4095 => 6,
+            _ => 7,
+        };
+        val_buckets[i] += 1;
+        Ok(())
+    })?;
+
+    // Intermediate & delta: small BTreeMaps, borrow in place.
+    let inter = data.state.intermediate_entries();
+    let delta = data.state.delta_entries();
+
+    let inter_count = inter.len();
+    let inter_key_bytes: usize = inter.keys().map(|k| k.len()).sum();
+    let inter_val_bytes: usize = inter.values().map(|v| match v {
         MptValue::Some(b) => b.len(),
         MptValue::Tombstone => 0,
     }).sum();
-    let inter_tombstones = mmpt.intermediate.values().filter(|v| matches!(v, MptValue::Tombstone)).count();
-    let delta_key_bytes: usize = mmpt.delta.keys().map(|k| k.len()).sum();
-    let delta_val_bytes: usize = mmpt.delta.values().map(|v| match v {
+    let inter_tombstones = inter.values().filter(|v| matches!(v, MptValue::Tombstone)).count();
+
+    let delta_count = delta.len();
+    let delta_key_bytes: usize = delta.keys().map(|k| k.len()).sum();
+    let delta_val_bytes: usize = delta.values().map(|v| match v {
         MptValue::Some(b) => b.len(),
         MptValue::Tombstone => 0,
     }).sum();
-    let delta_tombstones = mmpt.delta.values().filter(|v| matches!(v, MptValue::Tombstone)).count();
+    let delta_tombstones = delta.values().filter(|v| matches!(v, MptValue::Tombstone)).count();
 
-    println!("height: {}", mmpt.height);
-    println!("snapshot_epoch_count: {}", mmpt.snapshot_epoch_count);
+    println!("height: {}", height);
+    println!("snapshot_epoch_count: {}", snapshot_epoch_count);
     println!();
     println!("=== KV counts ===");
     println!("snapshot:     {:>10} entries  keys={:.1}MB  vals={:.1}MB",
@@ -45,30 +73,12 @@ fn main() -> Result<()> {
     println!("total:        {:>10} entries", snap_count + inter_count + delta_count);
     println!();
 
-    let mut key_lens = std::collections::BTreeMap::<usize, usize>::new();
-    for k in mmpt.snapshot.keys() {
-        *key_lens.entry(k.len()).or_default() += 1;
-    }
     println!("=== snapshot key length distribution ===");
     for (len, count) in &key_lens {
         println!("  len={:<4} count={}", len, count);
     }
 
     let bucket_labels = ["0-31", "32-63", "64-127", "128-255", "256-511", "512-1023", "1024-4095", "4096+"];
-    let mut val_buckets = [0usize; 8];
-    for v in mmpt.snapshot.values() {
-        let i = match v.len() {
-            0..=31 => 0,
-            32..=63 => 1,
-            64..=127 => 2,
-            128..=255 => 3,
-            256..=511 => 4,
-            512..=1023 => 5,
-            1024..=4095 => 6,
-            _ => 7,
-        };
-        val_buckets[i] += 1;
-    }
     println!();
     println!("=== snapshot value size distribution ===");
     for (label, count) in bucket_labels.iter().zip(val_buckets.iter()) {

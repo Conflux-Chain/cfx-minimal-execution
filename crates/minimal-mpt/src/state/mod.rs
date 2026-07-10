@@ -267,18 +267,18 @@ impl State {
     /// Visit each live snapshot entry as `(canonical key, value bytes)` in
     /// ascending key order. The key slice is only valid for the duration of the
     /// call (it borrows a buffer the walk reuses).
-    pub(crate) fn for_each_snapshot_entry(
+    pub fn for_each_snapshot_entry(
         &self,
         f: impl FnMut(&[u8], &[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         self.snapshot.for_each_canonical(f)
     }
 
-    pub(crate) fn intermediate_entries(&self) -> &BTreeMap<Box<[u8]>, MptValue> {
+    pub fn intermediate_entries(&self) -> &BTreeMap<Box<[u8]>, MptValue> {
         self.intermediate.raw_entries()
     }
 
-    pub(crate) fn delta_entries(&self) -> &BTreeMap<Box<[u8]>, MptValue> {
+    pub fn delta_entries(&self) -> &BTreeMap<Box<[u8]>, MptValue> {
         self.delta.raw_entries()
     }
 
