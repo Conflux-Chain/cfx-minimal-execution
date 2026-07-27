@@ -56,6 +56,11 @@ struct Dbs {
 fn main() -> Result<()> {
     // Required before decoding any stored header (see block_header.rs).
     let _ = CIP112_TRANSITION_HEIGHT.set(CIP112_TRANSITION);
+    // Decide the RocksDB table-cache size from the process fd limit (read-only;
+    // we never modify OS limits). Two DBs are opened at once, each keeping SST
+    // files open. A too-small cap thrashes (constant reopen + index re-parse ->
+    // syscall storm), so prefer unlimited when the fd limit is generous.
+    let max_open = resolve_max_open();
     let args: Vec<String> = env::args().collect();
     let data_dir = args
         .get(1)
@@ -66,8 +71,8 @@ fn main() -> Result<()> {
     anyhow::ensure!(pos_path.is_dir(), "no pos-ledger-db at {}", pos_path.display());
     eprintln!("pow={} pos={}", pow_path.display(), pos_path.display());
     let dbs = Arc::new(Dbs {
-        pow: DbWrap(open_pow(pow_path.to_str().unwrap())?),
-        pos: DbWrap(open_pos(pos_path.to_str().unwrap())?),
+        pow: DbWrap(open_pow(pow_path.to_str().unwrap(), max_open)?),
+        pos: DbWrap(open_pos(pos_path.to_str().unwrap(), max_open)?),
     });
 
     let tip = find_tip(&dbs.pow.0)?;
@@ -369,11 +374,50 @@ fn read_opts() -> ReadOptions {
     o
 }
 
-fn open_pow(path: &str) -> Result<DB> {
-    open_cf(path, &["col0", "col1", "col2", "col3", "col4", "col5", "col6", "col7"])
+/// max_open_files to use, derived from the process fd soft limit (READ ONLY via
+/// getrlimit; no OS state is modified). `MAXOPEN` env overrides. -1 = unlimited.
+/// A generous limit -> unlimited (fast). A tight limit -> split across the two
+/// DBs with a reserve, and warn that performance is degraded.
+fn resolve_max_open() -> i32 {
+    if let Some(v) = std::env::var("MAXOPEN").ok().and_then(|s| s.parse::<i32>().ok()) {
+        eprintln!("max_open_files={v} (MAXOPEN override)");
+        return v;
+    }
+    let soft = fd_soft_limit();
+    // Reserve for stdio, MANIFEST/CURRENT/WAL/log per DB, thread-locals, etc.
+    const RESERVE: u64 = 256;
+    // Unlimited is fastest; only worth it when the fd budget comfortably exceeds
+    // what two full-chain DBs want.
+    if soft >= 100_000 {
+        eprintln!("fd soft limit={soft} -> max_open_files=-1 (unlimited)");
+        return -1;
+    }
+    let per_db = ((soft.saturating_sub(RESERVE)) / 2).clamp(64, i32::MAX as u64) as i32;
+    eprintln!(
+        "WARNING: fd soft limit={soft} is low; capping max_open_files={per_db}/db, which \
+         thrashes and is much slower. Raise it (e.g. `ulimit -n 65536`) for full speed."
+    );
+    per_db
 }
 
-fn open_pos(path: &str) -> Result<DB> {
+/// Current RLIMIT_NOFILE soft limit (read-only getrlimit). Falls back to a
+/// conservative 1024 if the query fails.
+fn fd_soft_limit() -> u64 {
+    #[cfg(unix)]
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            return lim.rlim_cur as u64;
+        }
+    }
+    1024
+}
+
+fn open_pow(path: &str, max_open: i32) -> Result<DB> {
+    open_cf(path, &["col0", "col1", "col2", "col3", "col4", "col5", "col6", "col7"], max_open)
+}
+
+fn open_pos(path: &str, max_open: i32) -> Result<DB> {
     open_cf(
         path,
         &[
@@ -384,19 +428,17 @@ fn open_pos(path: &str) -> Result<DB> {
             "pos_state", "reward_event", "committed_block", "committed_block_by_view",
             "ledger_info_by_voted_block", "block_by_epoch_and_round",
         ],
+        max_open,
     )
 }
 
-fn open_cf(path: &str, cf_names: &[&str]) -> Result<DB> {
+fn open_cf(path: &str, cf_names: &[&str], max_open: i32) -> Result<DB> {
     let cfs: Vec<_> = cf_names
         .iter()
         .map(|name| ColumnFamilyDescriptor::new(*name, ColumnFamilyOptions::default()))
         .collect();
     let mut opts = DBOptions::default();
     opts.create_if_missing(false);
-    // Cap the table cache so read-only open of a full-chain DB (thousands of
-    // SSTs) does not blow past the process file-descriptor limit ("Too many
-    // open files"). Two DBs are opened at once, so keep this modest.
-    opts.set_max_open_files(256);
+    opts.set_max_open_files(max_open);
     DB::open_cf_for_read_only(opts, path, cfs, false).map_err(|e| anyhow!("open {path}: {e}"))
 }

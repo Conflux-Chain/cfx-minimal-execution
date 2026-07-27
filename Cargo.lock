@@ -533,6 +533,7 @@ dependencies = [
  "diem-crypto",
  "diem-types",
  "hex",
+ "libc",
  "primitives",
  "rlp",
  "rocksdb",
