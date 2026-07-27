@@ -71,19 +71,30 @@ impl<'a> PrefixRef<'a> {
 }
 
 /// A fresh stack [`PrefixBuf`] holding a nibble view in `[parity ++ packed]`
-/// layout (padding a trailing lone nibble with `0`). No per-nibble `at`:
-/// `nibbles_from` reads each backing byte once, `tuples` pairs the stream.
+/// layout (padding a trailing lone nibble with `0`). A byte-aligned view —
+/// every hot caller: keys and their `sub(0, d)` prefixes anchor at 0 — copies
+/// the backing bytes as-is (packed pairs at byte alignment *are* those bytes),
+/// plus one padded byte for a trailing lone nibble; only odd-offset views
+/// re-derive the pairing from the nibble stream.
 pub(crate) fn pack_nibbles(n: NibbleCursor<'_>) -> PrefixBuf {
-    use itertools::Itertools;
     let l = n.len();
-    std::iter::once((l % 2) as u8)
-        .chain(
+    let mut buf = PrefixBuf::new();
+    buf.push((l % 2) as u8);
+    if let Some(mut bytes) = n.aligned_bytes() {
+        buf.extend(bytes.by_ref().take(l / 2));
+        if l % 2 == 1 {
+            buf.push(bytes.next().unwrap_or(0) & 0xf0);
+        }
+    } else {
+        use itertools::Itertools;
+        buf.extend(
             n.nibbles_from(0)
                 .chain(std::iter::repeat(0u8).take(l % 2))
                 .tuples()
                 .map(|(hi, lo)| (hi << 4) | lo),
-        )
-        .collect()
+        );
+    }
+    buf
 }
 
 /// A fresh empty [`PrefixBuf`] (the trie root: just the parity byte).
@@ -97,15 +108,15 @@ pub(crate) fn empty_prefix_buf() -> PrefixBuf {
 /// per-nibble step of the trie walk / dirty-eviction, with no allocation.
 pub(crate) fn push_nibble(buf: &mut PrefixBuf, c: u8) {
     let c = c & 0x0f;
-    if buf[0] == 1 {
+    let (parity, packed) = buf.split_first_mut().expect("prefix buf has a parity byte");
+    if *parity == 1 {
         // Odd → fill the padding low nibble of the last byte; becomes even.
-        let last = buf.len() - 1;
-        buf[last] |= c;
-        buf[0] = 0;
+        *packed.last_mut().expect("odd prefix has a packed byte") |= c;
+        *parity = 0;
     } else {
         // Even → start a new byte with `c` in its high half; becomes odd.
+        *parity = 1;
         buf.push(c << 4);
-        buf[0] = 1;
     }
 }
 

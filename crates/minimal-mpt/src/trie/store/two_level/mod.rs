@@ -392,7 +392,7 @@ impl TwoLevelStore {
 
 /// The two-level store as seen by the root/memo traversal: each method forwards
 /// to the inherent method it abstracts, flattening the value to merkle bytes at
-/// the two value-touching points (`get_merkle`, `iter_merkle`) so the engine
+/// the two value-touching points (`get_merkle`, `iter_merkle_prefix`) so the engine
 /// never names the value type. A [`SnapshotValue`]'s merkle bytes are simply its
 /// bytes (it is always live — no tombstone variant).
 impl TrieReader for TwoLevelStore {
@@ -424,8 +424,11 @@ impl TrieReader for TwoLevelStore {
         TwoLevelStore::prefix_last(self, prefix)
     }
 
-    fn iter_merkle(&self) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])> {
-        self.iter().map(|(n, v)| (n, v.as_slice()))
+    fn iter_merkle_prefix<'p>(
+        &self,
+        prefix: PrefixRef<'p>,
+    ) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])> {
+        self.prefix_range(prefix).map(|(n, v)| (n, v.as_slice()))
     }
 }
 

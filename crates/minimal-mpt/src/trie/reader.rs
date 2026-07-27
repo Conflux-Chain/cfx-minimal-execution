@@ -44,9 +44,14 @@ pub(crate) trait TrieReader {
     /// Last (largest) stored key carrying `prefix`, as a nibble view.
     fn prefix_last(&self, prefix: PrefixRef) -> Option<NibbleCursor<'_>>;
 
-    /// All entries in sorted key order as `(key nibbles, merkle bytes)`. The
-    /// cold rebuild consumes this; the value type stays behind the trait.
-    fn iter_merkle(&self) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])>;
+    /// All entries carrying the nibble `prefix`, in sorted key order, as
+    /// `(key nibbles, merkle bytes)`. The sharded cold rebuild materializes one
+    /// subtree at a time through this instead of holding the whole store's
+    /// entries at once; the empty prefix iterates the whole store.
+    fn iter_merkle_prefix<'p>(
+        &self,
+        prefix: PrefixRef<'p>,
+    ) -> impl Iterator<Item = (NibbleCursor<'_>, &[u8])>;
 }
 
 /// The mutating side of an entry store, used by [`super::AuthenticatedTrie`] to

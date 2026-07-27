@@ -30,6 +30,13 @@ fn timing() -> bool {
     cached_flag(&ON, "MMPT_TIMING")
 }
 
+/// `MMPT_SHARD_TIMING=1`: print the sharded cold rebuild's per-probe lines
+/// (see [`shard_probe`]). Cached (read once).
+fn shard_timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    cached_flag(&ON, "MMPT_SHARD_TIMING")
+}
+
 /// `MMPT_BULK_W`: batch width `W` for the dense snapshot bulk-load. Read fresh
 /// and parsed as a positive `usize`; defaults to 1_000_000 when unset, empty,
 /// unparseable, or zero.
@@ -48,20 +55,38 @@ pub(crate) fn event(name: &'static str) -> EventTimer {
     EventTimer {
         name,
         start: Instant::now(),
+        on: timing(),
+    }
+}
+
+/// Per-event timer for one materialization probe of the sharded cold rebuild
+/// (up to `SHARD_CAP + 1` entries each). Only **overflow** probes finish it —
+/// each line is a `cap + 1` fill that got discarded into a dispatch, i.e. the
+/// scheme's pure waste (depth / entry count / fill time). Same shape as
+/// [`event`] but gated by `MMPT_SHARD_TIMING=1`: per-probe lines are noisier
+/// than the once-per-phase events, so they get their own switch.
+pub(crate) fn shard_probe() -> EventTimer {
+    EventTimer {
+        name: "shard.probe",
+        start: Instant::now(),
+        on: shard_timing(),
     }
 }
 
 pub(crate) struct EventTimer {
     name: &'static str,
     start: Instant,
+    /// Whether this event's switch was on at construction; `finish` prints
+    /// only when set. Decided by the constructor ([`event`] / [`shard_probe`]).
+    on: bool,
 }
 
 impl EventTimer {
-    /// Finish the event: under `MMPT_TIMING=1` print
+    /// Finish the event: if its switch is on, print
     /// `[mmpt] <name> <detail> elapsed=<ms>ms`, where `detail` carries the
     /// event's `key=value` fields.
     pub(crate) fn finish(self, detail: std::fmt::Arguments<'_>) {
-        if timing() {
+        if self.on {
             eprintln!(
                 "[mmpt] {} {} elapsed={}ms",
                 self.name,
