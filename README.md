@@ -75,6 +75,10 @@ replay progress t=2562s height=23694000 groups=... state_match=4580000/4580000 l
 
 结束时会打印验证摘要。`longest_mismatch_run` 持续大于 0 说明存在实现分歧，孤立的 1-2 个 mismatch 通常是链上被 blame 的区块（其 deferred root 被网络拒绝，正确的重放本应与之不同）。
 
+## 云上分段并行（`cfxrun/`）
+
+若要把全链按 checkpoint 切段、多机并行重放，见 [`cfxrun/README.md`](cfxrun/README.md)。编排脚本会开腾讯云按量实例、拉取 S3 数据包并回收日志；中间 checkpoint 可按时间窗口写回输出 bucket。
+
 ## 运行参数
 
 ### 执行器 `cfx-replay-exec`
