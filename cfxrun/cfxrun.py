@@ -9,7 +9,7 @@
 
 运行目录 runs/<run>/：plan.json、state.json、logs/、watch.log。
 """
-import argparse, json, math, os, re, shlex, subprocess, sys, time
+import argparse, json, math, os, re, shlex, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -21,15 +21,19 @@ ROOT = Path(__file__).resolve().parent
 SOURCE_BUCKET = "s3://cfx-minimal-execution"
 OUTPUT_BUCKET = "conflux-replay-txs"
 OUTPUT_PREFIX = "checkpoints"
-OUTPUT_PROFILE = "songbozhi-s3"
-AWS_REGION = "ap-east-1"
+# Local secrets / machine paths stay out of the repo: set via env (or AWS default chain).
+OUTPUT_PROFILE = os.environ.get("CFXRUN_AWS_PROFILE") or None
+AWS_REGION = os.environ.get("CFXRUN_AWS_REGION", "ap-east-1")
 S3_PART_SIZE = 256 * 1024 * 1024
+# Cloud resource IDs are environment config (not credentials). Override with CFXRUN_TC_JSON if needed.
 TC = dict(region="ap-hongkong", zone="ap-hongkong-2", image="img-mmytdhbn",
           vpc="vpc-qpt11awo", subnet="subnet-hpuerpcf", sg="sg-2rkmj46v", key_id="skey-9tzohzq7")
-SSH_KEY = os.path.expanduser("~/.ssh/skey_da.pem")
+if os.environ.get("CFXRUN_TC_JSON"):
+    TC.update(json.loads(os.environ["CFXRUN_TC_JSON"]))
+SSH_KEY = os.path.expanduser(os.environ.get("CFXRUN_SSH_KEY", "~/.ssh/id_rsa"))
 SSH = ["-i", SSH_KEY, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
        "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15"]
-TCCLI = os.path.expanduser("~/Library/Python/3.11/bin/tccli")
+TCCLI = os.environ.get("CFXRUN_TCCLI") or shutil.which("tccli") or "tccli"
 TIERS = [(8, "SA9.MEDIUM8"), (16, "MA9.MEDIUM16"), (32, "MA9.LARGE32"), (64, "MA9.2XLARGE64")]
 GROUP = 2000
 # 连续多少秒高度不前进 → 判定卡住（加载/写 ckpt 除外；status 带 DECOMPRESSING 不告警）
@@ -147,7 +151,9 @@ def presign(key):
 
 
 def output_s3():
-    return boto3.Session(profile_name=OUTPUT_PROFILE, region_name=AWS_REGION).client(
+    session = boto3.Session(profile_name=OUTPUT_PROFILE, region_name=AWS_REGION) if OUTPUT_PROFILE \
+        else boto3.Session(region_name=AWS_REGION)
+    return session.client(
         "s3", endpoint_url=f"https://s3.{AWS_REGION}.amazonaws.com", config=Config(
             retries={"total_max_attempts": 3, "mode": "standard"},
             connect_timeout=5, read_timeout=30))

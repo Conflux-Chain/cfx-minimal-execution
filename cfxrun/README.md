@@ -5,22 +5,33 @@
 ## 依赖
 
 - Python 3.11+：`boto3`、`botocore`
-- `aws` CLI（读输入包 / 签预签名 URL；输出上传用 profile）
-- `tccli`（开关腾讯云 CVM）
+- `aws` CLI（读输入包 / 签预签名 URL）
+- `tccli`（开关腾讯云 CVM，需在 `PATH` 中或设 `CFXRUN_TCCLI`）
 - SSH 私钥（与开机用的密钥对一致）
 - 已构建的 Linux `cfx-replay-exec` 与对应 `hydra.toml`
 
-云 VPC / 镜像 / 密钥、S3 bucket 与 profile 等写在 `cfxrun.py` 顶部常量，按环境修改。
+## 本地密钥 / 路径（勿提交）
+
+通过环境变量注入，**不要把私钥或 AWS access key 写进仓库**：
+
+| 变量 | 含义 | 默认 |
+|---|---|---|
+| `CFXRUN_SSH_KEY` | SSH 私钥路径 | `~/.ssh/id_rsa` |
+| `CFXRUN_AWS_PROFILE` | 输出 S3 用的 AWS named profile | 空（走默认 credential chain） |
+| `CFXRUN_AWS_REGION` | AWS region | `ap-east-1` |
+| `CFXRUN_TCCLI` | `tccli` 可执行文件路径 | `PATH` 中的 `tccli` |
+| `CFXRUN_TC_JSON` | 覆盖腾讯云资源字段的 JSON | 不设则用脚本内默认 VPC/镜像等 |
+
+腾讯云 VPC / 子网 / 安全组 / 镜像 / 密钥 ID，以及 S3 bucket 名，属于可分享的环境配置，默认写在 `cfxrun.py` 顶部，也可用 `CFXRUN_TC_JSON` 覆盖。
 
 ## 用法
 
 ```bash
-# 切段计划（可只选部分段）
+export CFXRUN_SSH_KEY=~/.ssh/your_key.pem
+export CFXRUN_AWS_PROFILE=your-s3-profile   # 可选
+
 python3 cfxrun/cfxrun.py plan <run> [--prefix mainnet] [--only T5,T17] [--window-hours 20]
-
-# 开机部署（需再次确认后再跑全量）
 python3 cfxrun/cfxrun.py up <run> --bin /path/to/cfx-replay-exec --config /path/to/hydra.toml
-
 python3 cfxrun/cfxrun.py status <run>
 python3 cfxrun/cfxrun.py watch <run> [--interval 600]
 python3 cfxrun/cfxrun.py down <run> [--all]
