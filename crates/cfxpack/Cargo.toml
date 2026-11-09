@@ -6,9 +6,11 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"], optional = true }
 rayon = { workspace = true }
 rlp = { workspace = true }
 rustc-hash = { workspace = true }
+ruzstd = { version = "0.7", optional = true }
 serde = { workspace = true }
 snap = { workspace = true }
 
@@ -18,3 +20,11 @@ primitives = { workspace = true }
 [[bin]]
 name = "patch_pos_reward"
 path = "src/bin/patch_pos_reward.rs"
+
+[[bin]]
+name = "label_blame"
+path = "src/bin/label_blame.rs"
+required-features = ["label-blame"]
+
+[features]
+label-blame = ["dep:clap", "dep:ruzstd"]
