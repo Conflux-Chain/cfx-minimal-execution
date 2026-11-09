@@ -65,6 +65,8 @@ cfx-replay-exec \
     --checkpoint-every-seconds 600
 ```
 
+测试网的 `--config` 用 `data/conflux-rust-config/testnet-v303.toml`，它取自 v3.0.3-testnet tag 的 `run/testnet.toml`；不要从合并后的代码树复制。
+
 如果 `--checkpoint` 指定的文件已存在，自动从中恢复继续；不存在则从创世块开始。checkpoint 在 2000-epoch 组边界写入，触发条件是"经过 N 个组"或"经过 T 秒"任一先到。如果只想快进到某个高度然后停下，加 `--stop-after-checkpoint`，写完第一次 checkpoint 即退出。
 
 运行过程中每分钟输出进度：
@@ -248,7 +250,7 @@ cfx-replay-exec \
 replay progress t=2562s height=23694000 ... state_match=4580000/4580000 longest_mismatch_run=0
 ```
 
-`state_match=N/N` 且 `longest_mismatch_run=0` 即全部通过。如果 `longest_mismatch_run` 持续大于 0，说明存在实现分歧。孤立的少量 mismatch 通常是链上被 blame 的区块——其 deferred root 被网络拒绝，正确的重放与之不同是预期行为。
+`state_match=N/N` 且 `longest_mismatch_run=0` 即全部通过。如果 `longest_mismatch_run` 持续大于 0，说明存在实现分歧；但若 receipts、logs 全部匹配而 state root 从某处起永不恢复，先核对配置的 `chain_id` / `evm_chain_id`。孤立的少量 mismatch 通常是链上被 blame 的区块——其 deferred root 被网络拒绝，正确的重放与之不同是预期行为。
 
 ### 改了什么，跑什么
 
