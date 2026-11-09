@@ -215,10 +215,8 @@ fn validate_input(input: &Packet) -> Result<()> {
                 block.index == expected_index,
                 "block index is not sequential"
             );
-            ensure!(
-                block.flags & 0b1000_0000 == 0,
-                "reserved block flag bit (bit 7) must be zero"
-            );
+            // bit 7 (FLAG_BLAMED) is allowed: set by label_blame on
+            // state-invalid pivots, preserved through decode→re-encode.
             ensure!(
                 block.epoch == epoch,
                 "block epoch must match its pivot block height"

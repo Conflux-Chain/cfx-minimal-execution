@@ -205,7 +205,7 @@ Header 位于数据包起始位置（offset 0），由固定字段区和偏移�
 | 4  | `tx_compressed` | 交易数据块是否经过压缩 |
 | 5  | `skipped_execution` | 是否跳过执行（一个 epoch 中区块太多会被跳过） |
 | 6  | `zero_total_reward` | 该区块的 `total_reward`（完整结算奖励，区别于 `base_reward`）为 0。corner case 标记 |
-| 7  | （reserved） | 保留，置 0 |
+| 7  | `blamed` | 该 pivot 的 header 承诺被网络判定 state-invalid（由 `label_blame` 离线补标）。`.cfxpackb` 后缀表示容器已完成补标 |
 
 > `zero_total_reward`（位 6）取自源 DB 的 `BlockRewardResult`（RLP 布局 `[total_reward, base_reward, tx_fee]`，取 `total_reward`）。提取时该值为 0 即置位；对已生成的归档可用 `add-total-reward-flag` 子命令原地补打（仅翻转该 bit，不改任何长度/偏移）。
 

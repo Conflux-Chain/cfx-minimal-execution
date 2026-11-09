@@ -20,8 +20,12 @@ pub const FLAG_HAS_TRANSACTIONS: u8 = 1 << 3;
 pub const FLAG_TX_COMPRESSED: u8 = 1 << 4;
 pub const FLAG_SKIPPED_EXECUTION: u8 = 1 << 5;
 /// Set when the block's `total_reward` (the full settled reward — distinct from
-/// `base_reward`) is zero. A corner-case marker; bit 7 stays reserved.
+/// `base_reward`) is zero. A corner-case marker.
 pub const FLAG_ZERO_TOTAL_REWARD: u8 = 1 << 6;
+/// Set (by `label_blame`) on pivot blocks whose header commitment was
+/// network-judged state-invalid — the deferred roots are garbage and must not
+/// be compared against the executor's recomputed commitment.
+pub const FLAG_BLAMED: u8 = 1 << 7;
 
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -373,6 +377,54 @@ mod tests {
         assert_eq!(decoded.blocks[0].unlock_events[1].unlocked, 50);
 
         let reencoded = encode_packet(&decoded).expect("reencode unlock packet");
+        assert_eq!(reencoded, packet);
+    }
+
+    #[test]
+    fn flag_blamed_survives_roundtrip() {
+        let author = Address::from_low_u64_be(1);
+        let raw = Packet {
+            prev_last_hash: H256::from_low_u64_be(9),
+            prev_last_deferred_state_root: H256::from_low_u64_be(10),
+            first_block_number: 100,
+            min_timestamp: 1_700_000_000,
+            min_height: 42,
+            min_pos_height: 0,
+            addresses: vec![author],
+            pos_entries: Vec::new(),
+            difficulties: vec![U256::from(1000)],
+            sender_base_nonces: Vec::new(),
+            gas_prices: Vec::new(),
+            blocks: vec![Block {
+                epoch: 42,
+                index: 0,
+                hash: H256::from_low_u64_be(11),
+                deferred_state_root: H256::from_low_u64_be(12),
+                deferred_receipts_root: H256::from_low_u64_be(13),
+                deferred_logs_bloom_hash: H256::from_low_u64_be(14),
+                flags: FLAG_PIVOT | FLAG_BLAMED,
+                author,
+                timestamp: 1_700_000_000,
+                difficulty: U256::from(1000),
+                gas_limit: U256::from(30_000_000),
+                base_price_core: U256::zero(),
+                base_price_espace: U256::zero(),
+                height: 42,
+                blame: 0,
+                finalized_epoch: 0,
+                base_reward: U256::from(1),
+                transactions: Vec::new(),
+                transaction_refs: Vec::new(),
+                pos_rewards: Vec::new(),
+                unlock_events: Vec::new(),
+                pos_view: None,
+            }],
+        };
+
+        let packet = encode_packet(&raw).expect("encode blamed packet");
+        let decoded = decode_packet(&packet).expect("decode blamed packet");
+        assert_eq!(decoded.blocks[0].flags & FLAG_BLAMED, FLAG_BLAMED);
+        let reencoded = encode_packet(&decoded).expect("reencode blamed packet");
         assert_eq!(reencoded, packet);
     }
 }

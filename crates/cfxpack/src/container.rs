@@ -13,9 +13,10 @@ pub const HEADER_LEN: u64 = 24;
 /// start_epoch(8) + epoch_count(8) + offset(8) + length(8)
 pub const DIR_ENTRY_LEN: u64 = 32;
 
-/// All `.cfxpack` (or `.cfxpack.zst`) files in `dir`, sorted by start epoch.
-/// When both compressed and uncompressed variants exist for the same epoch
-/// range, the `.zst` file wins.
+/// All `.cfxpack[b]` (or `.cfxpack[b].zst`) files in `dir`, sorted by start
+/// epoch. When both compressed and uncompressed variants exist for the same
+/// epoch range, the `.zst` file wins; `.cfxpackb` (blame-labelled) wins over
+/// `.cfxpack` at equal compression level.
 pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>> {
     use std::collections::BTreeMap;
     let mut by_start: BTreeMap<u64, PathBuf> = BTreeMap::new();
@@ -27,8 +28,7 @@ pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let Some(start) = start_epoch(&path) else { continue };
-        let prefer_new = is_compressed(&path)
-            || !by_start.get(&start).is_some_and(|old| is_compressed(old));
+        let prefer_new = file_priority(&path) > by_start.get(&start).map_or(0, |old| file_priority(old));
         if prefer_new {
             by_start.insert(start, path);
         }
@@ -36,6 +36,14 @@ pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let files: Vec<PathBuf> = by_start.into_values().collect();
     anyhow::ensure!(!files.is_empty(), "no .cfxpack files in {}", dir.display());
     Ok(files)
+}
+
+/// Higher = preferred when two files cover the same start epoch.
+/// labelled (.cfxpackb) > unlabelled (.cfxpack); compressed (.zst) > raw.
+fn file_priority(path: &Path) -> u8 {
+    let labelled = is_labelled(path) as u8;
+    let compressed = is_compressed(path) as u8;
+    (labelled << 1) | compressed
 }
 
 /// Enforce that groups arrive as one contiguous, gap-free epoch sequence, and
@@ -83,27 +91,31 @@ pub fn parse_directory(data: &[u8]) -> Result<Vec<(u64, u64, usize, usize)>> {
     Ok(entries)
 }
 
-/// Whether `path` names a `.cfxpack` or `.cfxpack.zst` file.
+/// Whether `path` names a `.cfxpack[b]` or `.cfxpack[b].zst` file.
 pub fn is_cfxpack(path: &Path) -> bool {
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    name.ends_with(".cfxpack") || name.ends_with(".cfxpack.zst")
+    cfxpack_stem(path).is_some()
 }
 
-/// Whether `path` is a zstd-compressed container (`.cfxpack.zst`).
+/// Whether `path` is a zstd-compressed container.
 pub fn is_compressed(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".cfxpack.zst"))
+        .is_some_and(|n| n.ends_with(".cfxpack.zst") || n.ends_with(".cfxpackb.zst"))
 }
 
-/// Strip `.cfxpack` or `.cfxpack.zst` and return the base stem
-/// (`epochs_<start>_<end>`).
+/// Whether `path` is a blame-labelled container (`.cfxpackb[.zst]`).
+pub fn is_labelled(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".cfxpackb") || n.ends_with(".cfxpackb.zst"))
+}
+
+/// Strip the cfxpack extension and return the base stem.
 fn cfxpack_stem(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?;
-    name.strip_suffix(".cfxpack.zst")
+    name.strip_suffix(".cfxpackb.zst")
+        .or_else(|| name.strip_suffix(".cfxpack.zst"))
+        .or_else(|| name.strip_suffix(".cfxpackb"))
         .or_else(|| name.strip_suffix(".cfxpack"))
 }
 
