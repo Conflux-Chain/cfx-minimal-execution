@@ -22,12 +22,15 @@ git submodule update --init
 cargo build --release -p cfx-replay-data-extractor
 ```
 
-**构建执行器**（依赖 oracle workspace 内的 EVM 和共识参数 crate，必须在 oracle 路径下编译）：
+**构建执行器**（Linux x86_64；必须 merge `v3.0.3`，禁止在 `oracle/conflux-rust` 工作区裸编）：
 
 ```bash
-cd oracle/conflux-rust/crates/replay-data-executor
-cargo build --release --no-default-features --features backend-minimal-mpt
+TAG=v3.0.3 ./scripts/build_linux_bins.sh bin/
+# 或只编执行器：
+TAG=v3.0.3 ./scripts/build_replay.sh bin/cfx-replay-exec --no-default-features --features backend-minimal-mpt
 ```
+
+`build_linux_bins.sh` 同时编出 `label_blame`。云上重放完整路径见 `cfxrun/README.md`。
 
 **提取数据**：
 
@@ -75,7 +78,11 @@ cfx-replay-exec \
 replay progress t=2562s height=23694000 groups=... state_match=4580000/4580000 longest_mismatch_run=0
 ```
 
-结束时会打印验证摘要。`longest_mismatch_run` 持续大于 0 说明存在实现分歧，孤立的 1-2 个 mismatch 通常是链上被 blame 的区块（其 deferred root 被网络拒绝，正确的重放本应与之不同）。
+结束时会打印验证摘要。对已经 `label_blame` 打标的 `.cfxpackb`，被 blame 的 pivot 会跳过比对、正确 blaming 块走折叠根校验，默认 `--anomaly-streak 0`：任何剩余 mismatch 都是失败。未打标的 `.cfxpack` 仍可能出现孤立 mismatch，需要显式加大阈值。
+
+## 云上分段并行（`cfxrun/`）
+
+若要把全链按 checkpoint 切段、多机并行重放，见 [`cfxrun/README.md`](cfxrun/README.md)。编排脚本会开腾讯云按量实例、拉取 S3 数据包并回收日志；worker 按约 1 小时覆盖本地 `ckpt.bin`，失败机器留着排查。输入优先 `.cfxpackb`。
 
 ## 运行参数
 
@@ -83,13 +90,13 @@ replay progress t=2562s height=23694000 groups=... state_match=4580000/4580000 l
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `--input` | 必填 | `.cfxpack` 文件或目录 |
+| `--input` | 必填 | `.cfxpack` / `.cfxpackb` 文件或目录 |
 | `--config` | 必填 | 链配置（如 `hydra.toml`） |
 | `--checkpoint` | — | checkpoint 路径；存在则 resume |
 | `--checkpoint-every-groups` | 100 | 每 N×2000 epoch 写 checkpoint |
 | `--checkpoint-every-seconds` | — | 距上次写入超过 T 秒也触发 |
 | `--stop-after-checkpoint` | false | 写完第一次 checkpoint 后退出 |
-| `--anomaly-streak` | 20 | 连续 mismatch 达到此数中止运行 |
+| `--anomaly-streak` | 0 | 连续 mismatch 超过此数中止；打标数据默认 0 |
 | `--max-mismatches` | 20 | 结束时打印的 mismatch 详情上限 |
 | `--verbose-epochs` | false | 逐 epoch 打印校验结果 |
 
@@ -103,7 +110,7 @@ replay progress t=2562s height=23694000 groups=... state_match=4580000/4580000 l
 | `verify` | 校验 packet 编码完整性 |
 | `roundtrip` | 解码再编码，验证可逆性 |
 
-一次性 / 排查工具是独立 bin（`src/bin/`）：`bench_decode`（解码吞吐基准）、`add_total_reward_flag`（为旧归档补 reward=0 标记，新提取的数据已在提取时写入该标记）、`dump_epoch`、`dump_pos_reward`（直接扫节点 DB 的对拍工具）。
+一次性 / 排查工具是独立 bin（`src/bin/`）：`bench_decode`（解码吞吐基准）、`add_total_reward_flag`（为旧归档补 reward=0 标记，新提取的数据已在提取时写入该标记）、`dump_epoch`、`dump_pos_reward`（直接扫节点 DB 的对拍工具）。`label_blame`（`crates/cfxpack`）离线给 pack 打 `FLAG_BLAMED` 并改名为 `.cfxpackb`。
 
 ### Feature flags
 
@@ -217,8 +224,7 @@ cargo +nightly fuzz run raw_packet           # 原始 packet 解析鲁棒性
 构建时加 feature，在真实链数据上做逐 commit 对拍：
 
 ```bash
-cd oracle/conflux-rust/crates/replay-data-executor
-cargo build --release --no-default-features --features backend-minimal-mpt,verify-incremental
+TAG=v3.0.3 ./scripts/build_replay.sh bin/cfx-replay-exec --no-default-features --features backend-minimal-mpt,verify-incremental
 
 cfx-replay-exec \
     --input ./data/packed-full \
@@ -233,15 +239,15 @@ cfx-replay-exec \
 最终端到端验证。用正常构建（不加 verify-incremental）跑完一段或全部 `.cfxpack` 数据：
 
 ```bash
-cd oracle/conflux-rust/crates/replay-data-executor
-cargo build --release --no-default-features --features backend-minimal-mpt
-
-cfx-replay-exec \
+TAG=v3.0.3 ./scripts/build_linux_bins.sh bin/
+./bin/label_blame --input-dir ./data/packed-full
+./bin/cfx-replay-exec \
     --input ./data/packed-full \
-    --config oracle/conflux-rust/run/hydra.toml \
+    --config data/conflux-rust-config/hydra-v303.toml \
     --checkpoint ./ckpt.bin \
     --checkpoint-every-groups 100 \
-    --checkpoint-every-seconds 600
+    --checkpoint-every-seconds 600 \
+    --anomaly-streak 0
 ```
 
 每个 epoch 产出的组合状态根与链上 deferred state root 做 4 字节前缀对比。运行结束时输出验证摘要：
@@ -250,7 +256,7 @@ cfx-replay-exec \
 replay progress t=2562s height=23694000 ... state_match=4580000/4580000 longest_mismatch_run=0
 ```
 
-`state_match=N/N` 且 `longest_mismatch_run=0` 即全部通过。如果 `longest_mismatch_run` 持续大于 0，说明存在实现分歧；但若 receipts、logs 全部匹配而 state root 从某处起永不恢复，先核对配置的 `chain_id` / `evm_chain_id`。孤立的少量 mismatch 通常是链上被 blame 的区块——其 deferred root 被网络拒绝，正确的重放与之不同是预期行为。
+`state_match=N/N` 且 `longest_mismatch_run=0` 即全部通过。打标后的 `.cfxpackb` 上任何剩余连续 mismatch 都是实现分歧。未打标数据仍可能因被 blame 的头出现孤立 mismatch。若 receipts、logs 全部匹配而 state root 从某处起永不恢复，先核对配置的 `chain_id` / `evm_chain_id`。
 
 ### 改了什么，跑什么
 
