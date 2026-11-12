@@ -18,11 +18,32 @@ WINDOW_SECONDS=${WINDOW_SECONDS:-86400}
 LOCAL_CKPT_SECONDS=${LOCAL_CKPT_SECONDS:-3600}
 ANOMALY_STREAK=${ANOMALY_STREAK:-0}
 LABEL_WINDOW=${LABEL_WINDOW:-10000}
-echo $$ > worker.pid
-trap 'rm -f worker.pid' EXIT
 
 log() { echo "[$(date '+%F %T')] $*"; }
 st()  { echo "$*" > status; log "status=$*"; }
+
+# 重复部署安全：别让两个 worker / 两个执行器同时写 ckpt.bin。
+if [ -s worker.pid ]; then
+  old=$(cat worker.pid)
+  if [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null \
+     && tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null | grep -q 'worker\.sh'; then
+    log "已有 worker 在跑（pid $old），本实例退出"
+    exit 0
+  fi
+fi
+if [ -s exec.pid ]; then
+  old=$(cat exec.pid)
+  if kill -0 "$old" 2>/dev/null \
+     && tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null | grep -q 'cfx-replay-exec'; then
+    log "发现上轮遗留的执行器（pid $old），先终止再续跑"
+    kill -9 "$old" 2>/dev/null
+    for _ in $(seq 1 30); do kill -0 "$old" 2>/dev/null || break; sleep 1; done
+  fi
+  rm -f exec.pid
+fi
+
+echo $$ > worker.pid
+trap 'rm -f worker.pid' EXIT
 
 # run.log 末行进度里的当前高度（主要用于展示/续跑记录）
 current_height() {

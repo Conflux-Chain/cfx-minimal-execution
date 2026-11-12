@@ -151,6 +151,7 @@ def cmd_plan(a):
             disk_gb = max(disk_gb, 120)  # T20 一类大 pack 段
         segs.append(dict(seg=f"T{i}", start=s, end=e, groups=groups,
                          window_seconds=round(a.window_hours * 3600),
+                         local_ckpt_seconds=a.local_ckpt_seconds,
                          anomaly_streak=0 if labelled else 20,
                          ckpt=f"{a.prefix}/cfxckpt/{s_name}" if s_name else None,
                          packs=[f"{a.prefix}/cfxpack/{n}" for n in sel],
@@ -221,6 +222,7 @@ def deploy(run, x, ip, a):
     (stage / "seg.env").write_text(
         f"SEG={x['seg']}\nSTART={x['start']}\nEND={x['end']}\n"
         f"WINDOW_SECONDS={x['window_seconds']}\n"
+        f"LOCAL_CKPT_SECONDS={x.get('local_ckpt_seconds', 3600)}\n"
         f"ANOMALY_STREAK={x.get('anomaly_streak', 0)}\n"
         f"LABEL_WINDOW=10000\n")
     lines = [f"input/{Path(k).name} {presign(k)}" for k in x["packs"]]
@@ -774,7 +776,10 @@ def main():
             q.add_argument("--only", help="只跑这些段，如 T5,T17")
             q.add_argument("--window-hours", type=float, default=24,
                            help="中间 checkpoint 墙钟窗口（小时，默认 24）；"
-                                "超时则在 2000-epoch 边界归档并上传 S3")
+                                "超时则归档本地 ckpt 并上传 S3")
+            q.add_argument("--local-ckpt-seconds", type=int, default=3600,
+                           help="执行器覆盖本地 ckpt.bin 的间隔（秒，默认 3600）；"
+                                "只影响崩溃续跑粒度，不触发上传")
             q.add_argument("--chunks", type=int,
                            help="兼容旧参数，已忽略")
         if name == "up":
