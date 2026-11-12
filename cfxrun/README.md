@@ -1,9 +1,9 @@
 # cfxrun — 云上分段并行重放
 
 把主网（或测试网）按 S3 checkpoint 切段，每段一台腾讯云按量实例并行跑 `cfx-replay-exec`。
-墙钟超过 **24 小时**的段会在 2000-epoch 边界写出中间 checkpoint，压缩后由主控 multipart
-上传到 `s3://conflux-replay-txs/checkpoints/<run>/`。成功段拉日志并确认上传后销机；
-失败段留机，用盘上最近一份 ckpt 排查。
+本地约每 **1 小时**覆盖写 `ckpt.bin`（crash 可续跑）；墙钟累计超过 **24 小时**才把当前
+ckpt 压缩归档，由主控 multipart 上传到 `s3://conflux-replay-txs/checkpoints/<run>/`。
+成功段拉日志并确认上传后销机；失败段留机，用盘上最近一份 ckpt 排查。
 
 ## 完整路径（必须按这个走）
 
@@ -37,9 +37,10 @@ PoS 段裸编 oracle HEAD 会从第一个新执行 epoch 起 state 全错；未�
 3. **worker**：下载 `.cfxpack` → `label_blame` 写成 `.cfxpackb`（`FLAG_BLAMED`）→
    `--anomaly-streak 0` 重放。S3 上已是 `.cfxpackb` 则跳过打标。
 
-4. **24h 中间 ckpt**：某段墙钟达到 `--window-hours`（默认 24）时，在下一个 2000-epoch
-   边界写 `ckpt.bin`，压缩进 `archives/`，`watch`/`down` 用本地凭据签发 multipart URL，
-   worker 直传 `s3://conflux-replay-txs/checkpoints/<run>/<seg>/ckpt_<h>.bin.zst`。
+4. **本地 1h / 上传 24h**：worker 用 `--checkpoint-every-seconds 3600` + `--stop-after-checkpoint`
+   覆盖 `ckpt.bin`；仅当墙钟累计达到 `--window-hours`（默认 24）时才压缩进 `archives/`，
+   `watch`/`down` 用本地凭据签发 multipart URL，worker 直传
+   `s3://conflux-replay-txs/checkpoints/<run>/<seg>/ckpt_<h>.bin.zst`。
    未上传完**拒绝销机**（除非显式 `--discard-checkpoints`）。
 
 ### 切段数 vs 中间 ckpt（不要搞混）

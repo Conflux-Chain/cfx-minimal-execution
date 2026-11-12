@@ -8,9 +8,9 @@
   2. cfxrun.py plan / up --bin .../cfx-replay-exec-v303 --label-blame .../label_blame
      --config hydra-v303.toml
   3. worker 下载 .cfxpack 后先 label_blame 成 .cfxpackb，再 --anomaly-streak 0 重放
-  4. 墙钟超过 24h 的段在 2000-epoch 边界写中间 ckpt，压缩后由主控 multipart 上传到
-     s3://conflux-replay-txs/checkpoints/<run>/<seg>/（输入侧仍只用 cfx-minimal-execution
-     的作者 ckpt 切段；中间 ckpt 供以后更密并行，不自动增加本轮机器数）
+  4. worker 约每 1h 覆盖本地 ckpt.bin；墙钟超过 24h 才归档中间 ckpt，由主控 multipart
+     上传到 s3://conflux-replay-txs/checkpoints/<run>/<seg>/（输入侧仍只用
+     cfx-minimal-execution 的作者 ckpt 切段；中间 ckpt 供以后更密并行，不自动增加本轮机器数）
 
   cfxrun.py plan  <run> [--prefix mainnet] [--only T5,T17] [--window-hours 24]
   cfxrun.py up    <run>            开机并部署（可重复执行，只补缺的）

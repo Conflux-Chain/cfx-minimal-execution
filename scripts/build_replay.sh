@@ -8,7 +8,7 @@
 #   2) 顶层 workspace 编 label_blame（scripts/build_linux_bins.sh 一次做完）
 #   3) cfxrun up 把两个二进制拷到 worker；未打标的 .cfxpack 先 label_blame 成 .cfxpackb
 #   4) 打标成功则 --anomaly-streak 0
-#   5) 墙钟 ≥24h 的段归档中间 ckpt → s3://conflux-replay-txs/checkpoints/<run>/
+#   5) 本地约每 1h 覆盖 ckpt.bin；墙钟 ≥24h 才归档上传 → s3://conflux-replay-txs/checkpoints/<run>/
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

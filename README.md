@@ -82,7 +82,7 @@ replay progress t=2562s height=23694000 groups=... state_match=4580000/4580000 l
 
 ## 云上分段并行（`cfxrun/`）
 
-若要把全链按 checkpoint 切段、多机并行重放，见 [`cfxrun/README.md`](cfxrun/README.md)。编排脚本会开腾讯云按量实例、拉取 S3 数据包并回收日志；worker 按约 1 小时覆盖本地 `ckpt.bin`，失败机器留着排查。输入优先 `.cfxpackb`。
+若要把全链按 checkpoint 切段、多机并行重放，见 [`cfxrun/README.md`](cfxrun/README.md)。编排脚本会开腾讯云按量实例、拉取 S3 数据包并回收日志；worker 约每 1 小时覆盖本地 `ckpt.bin`，墙钟满 24h 才归档上传中间 ckpt；失败机器留着排查。输入优先 `.cfxpackb`。
 
 ## 运行参数
 

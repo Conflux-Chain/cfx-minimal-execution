@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# 在 worker 上运行：下载 →（必要时）label_blame → 按 24h 窗口重放到 END。
+# 在 worker 上运行：下载 →（必要时）label_blame → 重放到 END。
 # 由 cfxrun.py 上传并以 nohup 启动；重复启动安全，已有 height/ckpt.bin 则从中恢复。
 #
 # 完整路径：
 #   1) 执行器必须是 build_replay.sh（v3.0.3 merge）产物，禁止 oracle HEAD 裸编
 #   2) 未打标 .cfxpack 先 label_blame 成 .cfxpackb，再 --anomaly-streak 0
-#   3) 墙钟每 WINDOW_SECONDS（默认 24h）在 2000-epoch 边界写 ckpt；
-#      非段尾的中间 ckpt 压缩进 archives/，由主控 multipart 上传到
-#      s3://conflux-replay-txs/checkpoints/<run>/<seg>/
+#   3) 本地：每 LOCAL_CKPT_SECONDS（默认 1h）覆盖写 ckpt.bin（crash 可续跑）
+#   4) 上传：墙钟累计 WINDOW_SECONDS（默认 24h）才把当前 ckpt 压缩进 archives/，
+#      由主控 multipart 上传到 s3://conflux-replay-txs/checkpoints/<run>/<seg>/
 #   段尾 ckpt 只留本地，不上传（输入侧已有下一段起点）。
 set -uo pipefail
 cd "$(dirname "$0")"
 source seg.env # SEG START END WINDOW_SECONDS ANOMALY_STREAK
 WINDOW_SECONDS=${WINDOW_SECONDS:-86400}
+LOCAL_CKPT_SECONDS=${LOCAL_CKPT_SECONDS:-3600}
 ANOMALY_STREAK=${ANOMALY_STREAK:-0}
 LABEL_WINDOW=${LABEL_WINDOW:-10000}
 echo $$ > worker.pid
@@ -50,6 +51,7 @@ archive_checkpoint() {
   printf '%s\t%s\t%s\t%s\n' "$h" "$size" "$sha" "$file" >> "$tmp"
   mv "$tmp" archives/manifest.tsv
   rm -f pending_archive
+  date +%s > window_origin
   log "已归档 archives/$file size=$size sha256=$sha"
 }
 
@@ -101,18 +103,25 @@ if [ -f pending_archive ]; then
   pending=$(cat pending_archive)
   archive_checkpoint "$pending" || exit 1
 fi
+# 24h 上传窗口计时：跨重启保留；没有则从现在起算。
+if [ ! -f window_origin ]; then
+  date +%s > window_origin
+fi
+window_origin=$(cat window_origin)
 
-log "重放 $cur → $END，每 ${WINDOW_SECONDS}s（24h 边界）写中间 ckpt 并归档待上传"
+log "重放 $cur → $END；本地每 ${LOCAL_CKPT_SECONDS}s 覆盖 ckpt.bin；墙钟每 ${WINDOW_SECONDS}s 归档上传"
 crashes=0
 while [ "$cur" -lt "$END" ]; do
   left=$(( (END - cur) / 2000 ))
   [ "$left" -lt 1 ] && left=1
   pct=$(( (cur - START) * 100 / (END - START) ))
   st "RUNNING $cur ${pct}%"
-  log "窗口起点=$cur remaining_groups=$left 进度=${pct}%"
-  echo "=== window from $cur, groups=$left, window_seconds=$WINDOW_SECONDS, $(date -Is)" >> run.log
+  log "续跑起点=$cur remaining_groups=$left 进度=${pct}% local_ckpt=${LOCAL_CKPT_SECONDS}s archive_window=${WINDOW_SECONDS}s"
+  echo "=== resume from $cur, groups=$left, local_ckpt_seconds=$LOCAL_CKPT_SECONDS, window_seconds=$WINDOW_SECONDS, $(date -Is)" >> run.log
+  # 1h（LOCAL）触发写 ckpt.bin 后 stop；段尾由 groups 触发。
+  # 只有墙钟达到 WINDOW 才归档上传，避免每小时都传 S3。
   ./cfx-replay-exec --input input --config hydra.toml --checkpoint ckpt.bin \
-    --checkpoint-every-groups "$left" --checkpoint-every-seconds "$WINDOW_SECONDS" \
+    --checkpoint-every-groups "$left" --checkpoint-every-seconds "$LOCAL_CKPT_SECONDS" \
     --stop-after-checkpoint --anomaly-streak "$ANOMALY_STREAK" \
     >> run.log 2>&1
   rc=$?
@@ -124,11 +133,16 @@ while [ "$cur" -lt "$END" ]; do
     cur=$h
     echo "$cur" > height
     crashes=0
-    if [ "$cur" -lt "$END" ]; then
+    now=$(date +%s)
+    elapsed=$((now - window_origin))
+    if [ "$cur" -lt "$END" ] && [ "$elapsed" -ge "$WINDOW_SECONDS" ]; then
       echo "$cur" > pending_archive
       archive_checkpoint "$cur" || exit 1
+      window_origin=$(cat window_origin)
+      log "24h 窗口归档完成 → 高度=$cur elapsed=${elapsed}s"
+    else
+      log "本地 ckpt 已覆盖 → 高度=$cur（距上次归档 ${elapsed}s / ${WINDOW_SECONDS}s）"
     fi
-    log "窗口完成 → 高度=$cur"
   elif [ "$rc" -eq 0 ]; then
     st "FAILED stopped_at=$cur rc=0"
     log "FAILED：正常退出但未写出更高的 checkpoint，见 run.log 末尾"
