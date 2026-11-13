@@ -27,7 +27,7 @@ if [ -s worker.pid ]; then
   old=$(cat worker.pid)
   if [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null \
      && tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null | grep -q 'worker\.sh'; then
-    log "已有 worker 在跑（pid $old），本实例退出"
+    log "已有 worker 在跑（pid ${old}），本实例退出"
     exit 0
   fi
 fi
@@ -35,7 +35,7 @@ if [ -s exec.pid ]; then
   old=$(cat exec.pid)
   if kill -0 "$old" 2>/dev/null \
      && tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null | grep -q 'cfx-replay-exec'; then
-    log "发现上轮遗留的执行器（pid $old），先终止再续跑"
+    log "发现上轮遗留的执行器（pid ${old}），先终止再续跑"
     kill -9 "$old" 2>/dev/null
     for _ in $(seq 1 30); do kill -0 "$old" 2>/dev/null || break; sleep 1; done
   fi
@@ -51,9 +51,16 @@ current_height() {
     | grep -o 'height=[0-9]*' | grep -o '[0-9]*$'
 }
 
-# ckpt.bin 实际对应的高度：执行器每次写完会打印 [ckpt] height=<h>
+# ckpt.bin 实际对应的高度。执行器写成功后打
+#   wrote checkpoint ckpt.bin at height <h>
+# 随后无条件打 [ckpt] height=<h>（写失败时只多一行 warning）。所以只有
+# 最后一次 [ckpt] 能找到同高度的成功行时，才认这个高度，避免把旧内容按新高度归档。
 ckpt_height() {
-  grep -o '\[ckpt\] height=[0-9]*' run.log 2>/dev/null | tail -1 | grep -o '[0-9]*$'
+  local h ok
+  h=$(grep -o '\[ckpt\] height=[0-9]*' run.log 2>/dev/null | tail -1 | grep -o '[0-9]*$')
+  [ -z "$h" ] && return 0
+  ok=$(grep -o 'wrote checkpoint .* at height [0-9]*' run.log 2>/dev/null | tail -1 | grep -o '[0-9]*$')
+  [ "$ok" = "$h" ] && echo "$h"
 }
 
 last_height() {
@@ -84,7 +91,7 @@ snapshot_ckpt() {
     h2=$(ckpt_height)
     if [ "$h" = "$h2" ]; then
       SNAP_H=$h
-      log "已快照 ckpt.bin → archives/ckpt_${h}.bin（高度 $h）"
+      log "已快照 ckpt.bin → archives/ckpt_${h}.bin（高度 ${h}）"
       return 0
     fi
     rm -f "archives/ckpt_${h}.bin"
@@ -112,7 +119,7 @@ compress_snapshot() {
   awk -F '\t' -v h="$h" '$1 != h' archives/manifest.tsv 2>/dev/null > "$tmp" || true
   printf '%s\t%s\t%s\t%s\n' "$h" "$size" "$sha" "$file" >> "$tmp"
   mv "$tmp" archives/manifest.tsv
-  rm -f pending_archive
+  rm -f pending_archive archive_failed
   date +%s > window_origin
   echo "$h" > archive_high
   log "已归档 archives/$file size=$size sha256=$sha"
@@ -120,20 +127,23 @@ compress_snapshot() {
 
 # 到点才归档：直接拿现成 ckpt.bin，不回内存重写。
 archive_if_due() {
-  local h origin now elapsed last
+  local h origin now elapsed last failed
   h=$(ckpt_height)
   [ -z "$h" ] && return 0
   last=$(cat archive_high 2>/dev/null || echo 0)
   [ "$h" -le "$last" ] && return 0          # 这个高度已归档
   [ "$h" -ge "$END" ] && return 0           # 段尾不传
+  # 压缩失败过的高度别每 30s 重压一次，等本地 ckpt 前进后再试。
+  failed=$(cat archive_failed 2>/dev/null || echo 0)
+  [ "$h" -le "$failed" ] && return 0
   now=$(date +%s)
   origin=$(cat window_origin 2>/dev/null || echo "$now")
   elapsed=$((now - origin))
   [ "$elapsed" -lt "$WINDOW_SECONDS" ] && return 0
-  log "距上次归档 ${elapsed}s ≥ ${WINDOW_SECONDS}s：归档本地 ckpt（高度 $h）"
+  log "距上次归档 ${elapsed}s ≥ ${WINDOW_SECONDS}s：归档本地 ckpt（高度 ${h}）"
   snapshot_ckpt || { log "快照失败，下轮重试"; return 0; }
   echo "$SNAP_H" > pending_archive
-  compress_snapshot "$SNAP_H"
+  compress_snapshot "$SNAP_H" || echo "$h" > archive_failed
 }
 
 if [ ! -f .downloaded ]; then
@@ -189,13 +199,13 @@ if [ -f pending_archive ]; then
     rm -f pending_archive   # 快照没落成，等下一个本地 ckpt 再归档
   fi
 fi
-# 归档计时跨重启保留；archive_high 记录已归档到的 ckpt 高度。
+# 归档计时跨重启保留；archive_high 记录已归档到的 ckpt 高度，archive_failed 记录压缩失败过的高度。
 [ -f window_origin ] || date +%s > window_origin
 [ -f archive_high ] || echo 0 > archive_high
 TICK=${TICK:-30}
 window_origin=$(cat window_origin)
 
-log "重放 $cur → $END；执行器单进程跑到底，每 ${LOCAL_CKPT_SECONDS}s 覆盖 ckpt.bin，墙钟每 ${WINDOW_SECONDS}s 归档上传"
+log "重放 $cur → ${END}；执行器单进程跑到底，每 ${LOCAL_CKPT_SECONDS}s 覆盖 ckpt.bin，墙钟每 ${WINDOW_SECONDS}s 归档上传"
 crashes=0
 while :; do
   left=$(( (END - cur) / 2000 ))
@@ -224,7 +234,7 @@ while :; do
     echo "$cur" > height
     if [ "$cur" -lt "$END" ]; then
       st "FAILED stopped_at=$cur rc=0"
-      log "FAILED：正常退出但未到达 END=$END（ckpt 高度 $cur）"
+      log "FAILED：正常退出但未到达 END=${END}（ckpt 高度 ${cur}）"
       tail -30 run.log >> worker.out
       exit 1
     fi
@@ -240,7 +250,7 @@ while :; do
   crashes=$((crashes + 1))
   cur=$(last_height)
   echo "$cur" > height
-  log "执行器异常退出 rc=$rc（第 $crashes 次），ckpt.bin 高度=$cur"
+  log "执行器异常退出 rc=${rc}（第 $crashes 次），ckpt.bin 高度=$cur"
   [ "$crashes" -ge 2 ] && { st "FAILED crash rc=$rc at=$cur"; tail -30 run.log >> worker.out; exit 1; }
   log "将从 ckpt.bin 高度 $cur 重试一次"
 done

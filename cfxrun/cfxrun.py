@@ -757,7 +757,9 @@ def cmd_watch(a):
         log(a.run, f"仍在运行 {len(left)} 台，{a.interval}s 后下一轮")
         time.sleep(a.interval)
     report = {k: s.get("final") for k, s in load(a.run, "state.json").items()}
-    failed = {k: v for k, v in report.items() if not str(v).startswith("DONE")}
+    # DONE_WITH_MISMATCH 也以 DONE 开头，但它说明跑出了孤立不匹配，不能算验证通过。
+    failed = {k: v for k, v in report.items()
+              if not str(v).startswith("DONE") or str(v).startswith("DONE_WITH_MISMATCH")}
     log(a.run, "全部结束：" + json.dumps(report, ensure_ascii=False))
     if failed:
         log(a.run, f"ALERT 有失败或异常段：{failed}")
