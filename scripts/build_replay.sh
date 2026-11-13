@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# Linux x86_64 执行器：把 oracle HEAD merge 进 TAG（默认 v3.0.3）再编。
+# 不要在 oracle/conflux-rust 工作区里直接 cargo build —— 那是裸 HEAD，
+# PoS 段会从第一个新执行的 epoch 起 state 全错。
+#
+# 完整重放路径见 cfxrun/README.md：
+#   1) 本脚本出 cfx-replay-exec
+#   2) 顶层 workspace 编 label_blame（scripts/build_linux_bins.sh 一次做完）
+#   3) cfxrun up 把两个二进制拷到 worker；未打标的 .cfxpack 先 label_blame 成 .cfxpackb
+#   4) 打标成功则 --anomaly-streak 0
+#   5) 本地约每 1h 覆盖 ckpt.bin；墙钟 ≥24h 才归档上传 → s3://conflux-replay-txs/checkpoints/<run>/
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
